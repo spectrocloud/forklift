@@ -19,6 +19,11 @@ type Validator struct {
 }
 
 // NOOP
+func (r *Validator) UnSupportedDisks(vmRef ref.Ref) ([]string, error) {
+	// OCP does not support unsupported disks.
+	return []string{}, nil
+}
+
 func (r *Validator) SharedDisks(vmRef ref.Ref, client client.Client) (ok bool, s string, s2 string, err error) {
 	ok = true
 	return
