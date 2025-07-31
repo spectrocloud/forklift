@@ -42,6 +42,7 @@ metadata:
   namespace: ${NAMESPACE}
 spec:
   apiservicedefinitions: {}
+  replaces: forklift-operator.v${PREVIOUS_VERSION}
   customresourcedefinitions:
     owned:
     - description: VM migration controller

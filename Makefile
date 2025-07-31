@@ -20,7 +20,8 @@ REGISTRY ?= quay.io
 REGISTRY_ORG ?= kubev2v
 REGISTRY_TAG ?= devel
 
-VERSION ?= 2.7.0
+VERSION ?= 2.7.1
+PREVIOUS_VERSION ?= 2.7.0
 NAMESPACE ?= konveyor-forklift
 OPERATOR_NAME ?= forklift-operator
 CHANNELS ?= development
@@ -235,6 +236,7 @@ build-operator-bundle-image: check_container_runtime
 		$(BAZEL_OPTS) \
 		--action_env CONTAINER_CMD=$(CONTAINER_CMD) \
 		--action_env VERSION=$(VERSION) \
+		--action_env PREVIOUS_VERSION=$(PREVIOUS_VERSION) \
 		--action_env NAMESPACE=$(NAMESPACE) \
 		--action_env CHANNELS=$(CHANNELS) \
 		--action_env DEFAULT_CHANNEL=$(DEFAULT_CHANNEL) \
