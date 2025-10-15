@@ -752,8 +752,8 @@ go_repository(
 go_repository(
     name = "com_github_gin_contrib_cors",
     importpath = "github.com/gin-contrib/cors",
-    sum = "h1:doAsuITavI4IOcd0Y19U4B+O0dNWihRyX//nn4sEmgA=",
-    version = "v1.3.1",
+    sum = "h1:0Z7D/bVhE6ja07lI8CTjTonp6SB07o8bNuFyRbsBUQg=",
+    version = "v1.6.0",
 )
 
 go_repository(
