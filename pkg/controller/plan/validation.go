@@ -926,14 +926,18 @@ func (r *Reconciler) cancelOtherActiveVddkCheckJobs(plan *api.Plan) (err error) 
 	}
 
 	for _, job := range jobs.Items {
-		if job.Status.Active > 0 && job.Labels["vddk"] != jobLabels["vddk"] {
-			r.Log.Info("Another validation job is active for this plan. Stopping...", "job", job)
-			// make sure to delete the pod associated with this job so that it doesn't
-			// become orphaned while trying to pull its image indefinitely
-			fg := meta.DeletePropagationForeground
-			opts := &client.DeleteOptions{PropagationPolicy: &fg}
-			if err = ctx.Destination.Client.Delete(context.TODO(), &job, opts); err != nil {
-				return
+		// Only consider deleting other active VDDK validation jobs. Do not touch
+		// unrelated jobs (e.g., hook runner jobs) that do not carry the "vddk" label.
+		if job.Status.Active > 0 {
+			if otherVddk, ok := job.Labels["vddk"]; ok && otherVddk != jobLabels["vddk"] {
+				r.Log.Info("Another validation job is active for this plan. Stopping...", "job", job)
+				// make sure to delete the pod associated with this job so that it doesn't
+				// become orphaned while trying to pull its image indefinitely
+				fg := meta.DeletePropagationForeground
+				opts := &client.DeleteOptions{PropagationPolicy: &fg}
+				if err = ctx.Destination.Client.Delete(context.TODO(), &job, opts); err != nil {
+					return
+				}
 			}
 		}
 	}
