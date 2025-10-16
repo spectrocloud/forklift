@@ -1,3 +1,6 @@
+# Force WORKSPACE mode for compatibility with Bazel 6.5.0
+common --noenable_bzlmod
+
 # Container Runtime
 build --action_env=CONTAINER_CMD
 build --action_env=XDG_RUNTIME_DIR
