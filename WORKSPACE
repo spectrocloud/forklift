@@ -976,8 +976,8 @@ go_repository(
 go_repository(
     name = "com_github_golang_glog",
     importpath = "github.com/golang/glog",
-    sum = "h1:VKtxabqXZkF25pY9ekfRL6a582T4P37/31XEstQ5p58=",
-    version = "v0.0.0-20160126235308-23def4e6c14b",
+    sum = "h1:DVne25KDNbHb1hLc1e9F2wdgfjT3ExrJ0ldlz2n+22M=",
+    version = "v1.2.4",
 )
 
 go_repository(
@@ -1929,8 +1929,8 @@ go_repository(
 go_repository(
     name = "com_github_opencontainers_runc",
     importpath = "github.com/opencontainers/runc",
-    sum = "h1:4+xo8mtWixbHoEm451+WJNUrq12o2/tDsyK9Vgc/NcA=",
-    version = "v1.0.0-rc90",
+    sum = "h1:5Lg2ft+xUb0lqg4EJeHx9S1SY0/4WXgjVi+Z8luQj2E=",
+    version = "v1.1.14",
 )
 
 go_repository(
@@ -3170,15 +3170,15 @@ go_repository(
 go_repository(
     name = "org_golang_x_net",
     importpath = "golang.org/x/net",
-    sum = "h1:uwuIcX0g4Yl1NC5XAz37xsr2lTtcqevgzYNVt49waME=",
-    version = "v0.0.0-20201110031124-69a78807bb2b",
+    sum = "h1:vRMAPTMaeGqVhG5QyLJHqNDwecKTomGeqbnfZyKlBI8=",
+    version = "v0.38.0",
 )
 
 go_repository(
     name = "org_golang_x_oauth2",
     importpath = "golang.org/x/oauth2",
-    sum = "h1:ld7aEMNHoBnnDAX15v1T6z31v8HwR2A9FYOuAhWqkwc=",
-    version = "v0.0.0-20200902213428-5d25da1a8d43",
+    sum = "h1:da9Vo7/tDv5RH/7nZDz1eMGS/q1Vv1N/7FCrBhI9I3M=",
+    version = "v0.27.0",
 )
 
 go_repository(
