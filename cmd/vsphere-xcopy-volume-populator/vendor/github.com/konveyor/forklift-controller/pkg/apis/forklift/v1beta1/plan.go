@@ -134,6 +134,12 @@ type PlanSpec struct {
 	// Determines if the plan should skip the guest conversion.
 	// +kubebuilder:default:=false
 	SkipGuestConversion bool `json:"skipGuestConversion,omitempty"`
+	// useCompatibilityMode controls whether to use VirtIO devices when skipGuestConversion is true (Raw Copy mode).
+	// This setting has no effect when skipGuestConversion is false (V2V Conversion always uses VirtIO).
+	// - true (default): Use compatibility devices (SATA bus, E1000E NIC) to ensure bootability
+	// - false: Use high-performance VirtIO devices (requires VirtIO drivers already installed in source VM)
+	// +kubebuilder:default:=true
+	UseCompatibilityMode bool `json:"useCompatibilityMode,omitempty"`
 }
 
 // Find a planned VM.
@@ -179,6 +185,30 @@ type Plan struct {
 	Referenced `json:"-"`
 }
 
+// // If the plan calls for the vm to be cold migrated to the local cluster, we can
+// // just use virt-v2v directly to convert the vm while copying data over. In other
+// // cases, we use CDI to transfer disks to the destination cluster and then use
+// // virt-v2v-in-place to convert these disks after cutover.
+// func (p *Plan) VSphereColdLocal() (bool, error) {
+// 	source := p.Referenced.Provider.Source
+// 	if source == nil {
+// 		return false, liberr.New("Cannot analyze plan, source provider is missing.")
+// 	}
+// 	destination := p.Referenced.Provider.Destination
+// 	if destination == nil {
+// 		return false, liberr.New("Cannot analyze plan, destination provider is missing.")
+// 	}
+
+//		switch source.Type() {
+//		case VSphere:
+//			return !p.Spec.Warm && destination.IsHost(), nil
+//		case Ova:
+//			return true, nil
+//		default:
+//			return false, nil
+//		}
+//	}
+//
 // If the plan calls for the vm to be cold migrated to the local cluster, we can
 // just use virt-v2v directly to convert the vm while copying data over. In other
 // cases, we use CDI to transfer disks to the destination cluster and then use
@@ -229,6 +259,10 @@ func (r *Plan) IsSourceProviderOCP() bool {
 }
 
 func (r *Plan) IsSourceProviderVSphere() bool { return r.Provider.Source.Type() == VSphere }
+
+func (r *Plan) IsSourceProviderOVA() bool {
+	return r.Provider.Source.Type() == Ova
+}
 
 // PVCNameTemplateData contains fields used in naming templates.
 type PVCNameTemplateData struct {
