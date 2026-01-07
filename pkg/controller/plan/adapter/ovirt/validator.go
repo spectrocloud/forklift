@@ -19,9 +19,57 @@ type Validator struct {
 	inventory web.Client
 }
 
-// Load.
-func (r *Validator) Load() (err error) {
-	r.inventory, err = web.NewClient(r.plan.Referenced.Provider.Source)
+func (r *Validator) InvalidDiskSizes(vmRef ref.Ref) ([]string, error) {
+	vm := &model.Workload{}
+	err := r.Source.Inventory.Find(vm, vmRef)
+	if err != nil {
+		return nil, liberr.Wrap(err, "vm", vmRef.String())
+	}
+
+	invalidDisks := []string{}
+	for _, da := range vm.DiskAttachments {
+		if da.Disk.ProvisionedSize <= 0 {
+			invalidDisks = append(invalidDisks, da.Disk.ID)
+		}
+	}
+
+	return invalidDisks, nil
+}
+
+// NO-OP
+func (r *Validator) UdnStaticIPs(vmRef ref.Ref, client client.Client) (ok bool, err error) {
+	return true, nil
+}
+
+func (r *Validator) MacConflicts(vmRef ref.Ref) ([]planbase.MacConflict, error) {
+	// Get source VM using common helper
+	vm, err := planbase.FindSourceVM[model.Workload](r.Source.Inventory, vmRef)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get destination VMs and extract their MACs using common helper
+	destinationVMs, err := planbase.GetDestinationVMsFromInventory(r.Destination.Inventory, base.Param{
+		Key:   base.DetailParam,
+		Value: "all",
+	})
+	if err != nil {
+		return nil, liberr.Wrap(err)
+	}
+
+	// Extract source VM MACs
+	var sourceMacs []string
+	for _, nic := range vm.NICs {
+		// Include all MACs, even empty ones - the helper function will handle filtering
+		sourceMacs = append(sourceMacs, nic.MAC)
+	}
+
+	// Use common helper to detect conflicts
+	return planbase.CheckMacConflicts(sourceMacs, destinationVMs), nil
+}
+
+func (r *Validator) SharedDisks(vmRef ref.Ref, client client.Client) (ok bool, s string, s2 string, err error) {
+	ok = true
 	return
 }
 

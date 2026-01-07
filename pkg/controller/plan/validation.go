@@ -39,43 +39,55 @@ import (
 
 // Types
 const (
-	WarmMigrationNotReady         = "WarmMigrationNotReady"
-	NamespaceNotValid             = "NamespaceNotValid"
-	TransferNetNotValid           = "TransferNetworkNotValid"
-	NetRefNotValid                = "NetworkMapRefNotValid"
-	NetMapNotReady                = "NetworkMapNotReady"
-	DsMapNotReady                 = "StorageMapNotReady"
-	DsRefNotValid                 = "StorageRefNotValid"
-	VMRefNotValid                 = "VMRefNotValid"
-	VMNotFound                    = "VMNotFound"
-	VMAlreadyExists               = "VMAlreadyExists"
-	VMNetworksNotMapped           = "VMNetworksNotMapped"
-	VMStorageNotMapped            = "VMStorageNotMapped"
-	VMStorageNotSupported         = "VMStorageNotSupported"
-	VMMultiplePodNetworkMappings  = "VMMultiplePodNetworkMappings"
-	VMMissingGuestIPs             = "VMMissingGuestIPs"
-	VMMissingChangedBlockTracking = "VMMissingChangedBlockTracking"
-	HostNotReady                  = "HostNotReady"
-	DuplicateVM                   = "DuplicateVM"
-	SharedDisks                   = "SharedDisks"
-	SharedWarnDisks               = "SharedWarnDisks"
-	NameNotValid                  = "TargetNameNotValid"
-	HookNotValid                  = "HookNotValid"
-	HookNotReady                  = "HookNotReady"
-	HookStepNotValid              = "HookStepNotValid"
-	Executing                     = "Executing"
-	Succeeded                     = "Succeeded"
-	Failed                        = "Failed"
-	Canceled                      = "Canceled"
-	Deleted                       = "Deleted"
-	Paused                        = "Paused"
-	Archived                      = "Archived"
-	unsupportedVersion            = "UnsupportedVersion"
-	VDDKInvalid                   = "VDDKInvalid"
-	ValidatingVDDK                = "ValidatingVDDK"
-	VDDKInitImageNotReady         = "VDDKInitImageNotReady"
-	VDDKInitImageUnavailable      = "VDDKInitImageUnavailable"
-	UnsupportedOvaSource          = "UnsupportedOvaSource"
+	WarmMigrationNotReady           = "WarmMigrationNotReady"
+	MigrationTypeNotValid           = "MigrationTypeNotValid"
+	NamespaceNotValid               = "NamespaceNotValid"
+	TransferNetNotValid             = "TransferNetworkNotValid"
+	TransferNetMissingDefaultRoute  = "TransferNetworkMissingDefaultRoute"
+	NetRefNotValid                  = "NetworkMapRefNotValid"
+	NetMapNotReady                  = "NetworkMapNotReady"
+	NetMapPreservingIPsOnPodNetwork = "NetMapPreservingIPsOnPodNetwork"
+	DsMapNotReady                   = "StorageMapNotReady"
+	DsRefNotValid                   = "StorageRefNotValid"
+	VMRefNotValid                   = "VMRefNotValid"
+	VMNotFound                      = "VMNotFound"
+	VMAlreadyExists                 = "VMAlreadyExists"
+	VMNetworksNotMapped             = "VMNetworksNotMapped"
+	VMStorageNotMapped              = "VMStorageNotMapped"
+	VMStorageNotSupported           = "VMStorageNotSupported"
+	VMMultiplePodNetworkMappings    = "VMMultiplePodNetworkMappings"
+	VMMissingGuestIPs               = "VMMissingGuestIPs"
+	VMIpNotMatchingUdnSubnet        = "VMIpNotMatchingUdnSubnet"
+	VMMissingChangedBlockTracking   = "VMMissingChangedBlockTracking"
+	VMHasSnapshots                  = "VMHasSnapshots"
+	HostNotReady                    = "HostNotReady"
+	DuplicateVM                     = "DuplicateVM"
+	SharedDisks                     = "SharedDisks"
+	SharedWarnDisks                 = "SharedWarnDisks"
+	NameNotValid                    = "TargetNameNotValid"
+	HookNotValid                    = "HookNotValid"
+	HookNotReady                    = "HookNotReady"
+	HookStepNotValid                = "HookStepNotValid"
+	Executing                       = "Executing"
+	Succeeded                       = "Succeeded"
+	Failed                          = "Failed"
+	Canceled                        = "Canceled"
+	Deleted                         = "Deleted"
+	Paused                          = "Paused"
+	Archived                        = "Archived"
+	InvalidDiskSizes                = "InvalidDiskSizes"
+	MacConflicts                    = "MacConflicts"
+	MissingPvcForOnlyConversion     = "MissingPvcForOnlyConversion"
+	LuksAndClevisIncompatibility    = "LuksAndClevisIncompatibility"
+	UnsupportedUdn                  = "UnsupportedUserDefinedNetwork"
+	unsupportedVersion              = "UnsupportedVersion"
+	VDDKInvalid                     = "VDDKInvalid"
+	ValidatingVDDK                  = "ValidatingVDDK"
+	VDDKInitImageNotReady           = "VDDKInitImageNotReady"
+	VDDKInitImageUnavailable        = "VDDKInitImageUnavailable"
+	UnsupportedOvaSource            = "UnsupportedOvaSource"
+	VMPowerStateUnsupported         = "VMPowerStateUnsupported"
+	VMMigrationTypeUnsupported      = "VMMigrationTypeUnsupported"
 )
 
 // Categories
@@ -574,6 +586,65 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		Message:  "OVA appears to have been exported from an unsupported source, and may have issues during import.",
 		Items:    []string{},
 	}
+<<<<<<< HEAD
+=======
+	powerStateUnsupported := libcnd.Condition{
+		Type:     VMPowerStateUnsupported,
+		Status:   True,
+		Reason:   NotSupported,
+		Category: api.CategoryCritical,
+		Message:  "VM power state is incompatible with the selected migration type.",
+		Items:    []string{},
+	}
+	vmMigrationTypeUnsupported := libcnd.Condition{
+		Type:     VMMigrationTypeUnsupported,
+		Status:   True,
+		Reason:   NotSupported,
+		Category: api.CategoryCritical,
+		Message:  "VM is incompatible with the selected migration type.",
+		Items:    []string{},
+	}
+	guestToolsIssue := libcnd.Condition{
+		Type:     GuestToolsIssue,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "VMware Tools issues detected. This may impact migration performance, guest OS detection, and network configuration. Ensure VMware Tools are properly installed and running before migration. If this is an encrypted VM, please turn the VM off manually before migration.",
+		Items:    []string{},
+	}
+	invalidDiskSizes := libcnd.Condition{
+		Type:     InvalidDiskSizes,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "VM has disks with invalid sizes.",
+		Items:    []string{},
+	}
+	macConflicts := libcnd.Condition{
+		Type:     MacConflicts,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "",
+	}
+	missingPvcForOnlyConversion := libcnd.Condition{
+		Type:     MissingPvcForOnlyConversion,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "Missing required PVCs for conversion-only mode. Ensure vendor-provided PVCs exist in the target namespace and are labeled with vmID and vmUUID.",
+		Items:    []string{},
+	}
+	luksAndClevisIncompatibility := libcnd.Condition{
+		Type:     LuksAndClevisIncompatibility,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryWarn,
+		Message:  "LUKS keys and Clevis cannot be configured together; Clevis will be used.",
+		Items:    []string{},
+	}
+
+>>>>>>> 85fe594fe (Resolves: MTV-2444 | RFE: Enable NVMe disk support for vSphere VM migration)
 	var sharedDisksConditions []libcnd.Condition
 	setOf := map[string]bool{}
 	setOfTargetName := map[string]bool{}
@@ -707,6 +778,61 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		if err != nil {
 			return err
 		}
+<<<<<<< HEAD
+=======
+		if !ok {
+			powerStateUnsupported.Items = append(powerStateUnsupported.Items, ref.String())
+		}
+		ok, err = validator.VMMigrationType(*ref)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			vmMigrationTypeUnsupported.Items = append(vmMigrationTypeUnsupported.Items, ref.String())
+		}
+		if vm.LUKS.Name != "" && vm.NbdeClevis {
+			luksAndClevisIncompatibility.Items = append(luksAndClevisIncompatibility.Items, ref.String())
+		}
+		// Guest tools validation (provider-specific)
+		ok, err = validator.GuestToolsInstalled(*ref)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			guestToolsIssue.Items = append(guestToolsIssue.Items, ref.String())
+		}
+		invalidSizes, err := validator.InvalidDiskSizes(*ref)
+		if err != nil {
+			return err
+		}
+		if len(invalidSizes) > 0 {
+			invalidDiskSizes.Items = append(invalidDiskSizes.Items, ref.String())
+		}
+
+		conflicts, err := validator.MacConflicts(*ref)
+		if err != nil {
+			return err
+		}
+		if len(conflicts) > 0 {
+			macConflicts.Items = append(macConflicts.Items, ref.String())
+			// Group conflicts by destination VM for this specific source VM
+			vmConflictsByVM := make(map[string][]string)
+			for _, conflict := range conflicts {
+				vmConflictsByVM[conflict.DestinationVM] = append(vmConflictsByVM[conflict.DestinationVM], conflict.MAC)
+			}
+
+			// Build detailed message with grouped conflicts
+			var conflictDetails []string
+			for destinationVM, macs := range vmConflictsByVM {
+				conflictDetails = append(conflictDetails, fmt.Sprintf("MACs %s conflict with destination VM %s", strings.Join(macs, ", "), destinationVM))
+			}
+			if macConflicts.Message != "" {
+				macConflicts.Message += "; "
+			}
+			macConflicts.Message += fmt.Sprintf("VM %s has MAC address conflicts: %s", ref.String(), strings.Join(conflictDetails, "; "))
+		}
+
+>>>>>>> 85fe594fe (Resolves: MTV-2444 | RFE: Enable NVMe disk support for vSphere VM migration)
 		ok, msg, category, err := validator.SharedDisks(*ref, ctx.Destination.Client)
 		if err != nil {
 			return err
@@ -848,7 +974,31 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 	if len(unsupportedOvaSource.Items) > 0 {
 		plan.Status.SetCondition(unsupportedOvaSource)
 	}
+<<<<<<< HEAD
 
+=======
+	if len(powerStateUnsupported.Items) > 0 {
+		plan.Status.SetCondition(powerStateUnsupported)
+	}
+	if len(vmMigrationTypeUnsupported.Items) > 0 {
+		plan.Status.SetCondition(vmMigrationTypeUnsupported)
+	}
+	if len(guestToolsIssue.Items) > 0 {
+		plan.Status.SetCondition(guestToolsIssue)
+	}
+	if len(invalidDiskSizes.Items) > 0 {
+		plan.Status.SetCondition(invalidDiskSizes)
+	}
+	if len(macConflicts.Items) > 0 {
+		plan.Status.SetCondition(macConflicts)
+	}
+	if len(missingPvcForOnlyConversion.Items) > 0 {
+		plan.Status.SetCondition(missingPvcForOnlyConversion)
+	}
+	if len(luksAndClevisIncompatibility.Items) > 0 {
+		plan.Status.SetCondition(luksAndClevisIncompatibility)
+	}
+>>>>>>> 85fe594fe (Resolves: MTV-2444 | RFE: Enable NVMe disk support for vSphere VM migration)
 	return nil
 }
 

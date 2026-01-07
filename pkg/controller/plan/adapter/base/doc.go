@@ -154,6 +154,18 @@ type Validator interface {
 	SharedDisks(vmRef ref.Ref, client client.Client) (ok bool, msg string, category string, err error)
 	// Validate that the vm has the change tracking enabled
 	ChangeTrackingEnabled(vmRef ref.Ref) (bool, error)
+	// Validate that VM has no pre-existing snapshots for warm migration
+	HasSnapshot(vmRef ref.Ref) (ok bool, msg string, category string, err error)
+	// Validate that the VM power state is compatible with the migration type.
+	PowerState(vmRef ref.Ref) (bool, error)
+	// Validate that the VM is inherently compatible with the migration type.
+	VMMigrationType(vmRef ref.Ref) (bool, error)
+	// Validate that the VM disks have valid sizes (> 0).
+	InvalidDiskSizes(vmRef ref.Ref) ([]string, error)
+	// Validate that the VM MAC addresses don't conflict with existing destination VMs.
+	MacConflicts(vmRef ref.Ref) ([]MacConflict, error)
+	// Validate that the PVC name template is valid
+	PVCNameTemplate(vmRef ref.Ref, pvcNameTemplate string) (bool, error)
 }
 
 // DestinationClient API.
