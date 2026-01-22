@@ -586,8 +586,6 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		Message:  "OVA appears to have been exported from an unsupported source, and may have issues during import.",
 		Items:    []string{},
 	}
-<<<<<<< HEAD
-=======
 	powerStateUnsupported := libcnd.Condition{
 		Type:     VMPowerStateUnsupported,
 		Status:   True,
@@ -644,7 +642,6 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		Items:    []string{},
 	}
 
->>>>>>> 85fe594fe (Resolves: MTV-2444 | RFE: Enable NVMe disk support for vSphere VM migration)
 	var sharedDisksConditions []libcnd.Condition
 	setOf := map[string]bool{}
 	setOfTargetName := map[string]bool{}
@@ -778,8 +775,6 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		if err != nil {
 			return err
 		}
-<<<<<<< HEAD
-=======
 		if !ok {
 			powerStateUnsupported.Items = append(powerStateUnsupported.Items, ref.String())
 		}
@@ -832,7 +827,6 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 			macConflicts.Message += fmt.Sprintf("VM %s has MAC address conflicts: %s", ref.String(), strings.Join(conflictDetails, "; "))
 		}
 
->>>>>>> 85fe594fe (Resolves: MTV-2444 | RFE: Enable NVMe disk support for vSphere VM migration)
 		ok, msg, category, err := validator.SharedDisks(*ref, ctx.Destination.Client)
 		if err != nil {
 			return err
@@ -974,9 +968,6 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 	if len(unsupportedOvaSource.Items) > 0 {
 		plan.Status.SetCondition(unsupportedOvaSource)
 	}
-<<<<<<< HEAD
-
-=======
 	if len(powerStateUnsupported.Items) > 0 {
 		plan.Status.SetCondition(powerStateUnsupported)
 	}
@@ -998,7 +989,6 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 	if len(luksAndClevisIncompatibility.Items) > 0 {
 		plan.Status.SetCondition(luksAndClevisIncompatibility)
 	}
->>>>>>> 85fe594fe (Resolves: MTV-2444 | RFE: Enable NVMe disk support for vSphere VM migration)
 	return nil
 }
 
