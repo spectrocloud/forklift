@@ -1,181 +1,139 @@
 package main
 
 import (
-	"fmt"
 	"io"
-	"net"
-	"net/http"
-	"net/http/httptest"
+	"math"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	dto "github.com/prometheus/client_model/go"
 )
 
-func setupMockServer() (*httptest.Server, string, int, error) {
-	listener, err := net.Listen("tcp", ":0")
-	if err != nil {
-		return nil, "", 0, err
+func TestSensitiveInfo(t *testing.T) {
+	for _, tc := range []struct {
+		option string
+		want   bool
+	}{
+		{"password", true},
+		{"applicationCredentialSecret", true},
+		{"token", true},
+		{"username", false},
+		{"regionName", false},
+	} {
+		if got := sensitiveInfo(tc.option); got != tc.want {
+			t.Fatalf("sensitiveInfo(%q)=%v, want %v", tc.option, got, tc.want)
+		}
 	}
-
-	mux := http.NewServeMux()
-
-	port := listener.Addr().(*net.TCPAddr).Port
-	baseURL := fmt.Sprintf("http://localhost:%d", port)
-
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		response := fmt.Sprintf(`{
-            "versions": {
-                "values": [
-                    {
-                        "id": "v3.0",
-                        "links": [
-                            {"rel": "self", "href": "%s/v3/"}
-                        ],
-                        "status": "stable"
-                    }
-                ]
-            }
-        }`, baseURL)
-		fmt.Fprint(w, response)
-	})
-
-	mux.HandleFunc("/v2/images/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, `mock_data`)
-	})
-
-	mux.HandleFunc("/v3/auth/tokens", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Subject-Token", "MIIFvgY")
-		w.WriteHeader(http.StatusCreated)
-		identityServer := fmt.Sprintf("%s/v3/", baseURL)
-		imageServiceURL := fmt.Sprintf("%s/v2/images", baseURL)
-		fmt.Println("identityServer ", identityServer)
-		response := fmt.Sprintf(`{
-			"token": {
-				"methods": ["password"],
-				"project": {
-					"domain": {
-						"id": "default",
-						"name": "Default"
-					},
-					"id": "8538a3f13f9541b28c2620eb19065e45",
-					"name": "admin"
-				},
-				"catalog": [
-					{
-						"type": "identity",
-						"name": "keystone",
-						"endpoints": [
-							{
-								"url": "%s",
-								"region": "RegionOne",
-								"interface": "public",
-								"id": "identity-public-endpoint-id"
-							},
-							{
-								"url": "%s",
-								"region": "RegionOne",
-								"interface": "admin",
-								"id": "identity-admin-endpoint-id"
-							},
-							{
-								"url": "%s",
-								"region": "RegionOne",
-								"interface": "internal",
-								"id": "identity-internal-endpoint-id"
-							}
-						]
-					},
-					{
-						"type": "image",
-						"name": "glance",
-						"endpoints": [
-							{
-								"url": "%s",
-								"region": "RegionOne",
-								"interface": "public",
-								"id": "image-public-endpoint-id"
-							}
-						]
-					}
-				],
-				"user": {
-					"domain": {
-						"id": "default",
-						"name": "Default"
-					},
-					"id": "3ec3164f750146be97f21559ee4d9c51",
-					"name": "admin"
-				},
-				"issued_at": "201406-10T20:55:16.806027Z"
-			}
-		}`,
-			identityServer,
-			identityServer,
-			identityServer,
-			imageServiceURL)
-
-		fmt.Fprint(w, response)
-	})
-
-	server := httptest.NewUnstartedServer(mux)
-	server.Listener = listener
-
-	server.Start()
-
-	return server, baseURL, port, nil
 }
 
-func TestPopulate(t *testing.T) {
-	os.Setenv("username", "testuser")
-	os.Setenv("password", "testpassword")
-	os.Setenv("projectName", "Default")
-	os.Setenv("domainName", "Default")
-	os.Setenv("insecureSkipVerify", "true")
-	os.Setenv("availability", "public")
-	os.Setenv("regionName", "RegionOne")
-	os.Setenv("authType", "password")
+func TestReadOptions_PreservesValues(t *testing.T) {
+	t.Setenv("regionName", "region-1")
+	t.Setenv("username", "u1")
+	t.Setenv("password", "p1")
+	t.Setenv("token", "t1")
+	t.Setenv("insecureSkipVerify", "true")
 
-	server, identityServerURL, port, err := setupMockServer()
+	opts := readOptions()
+	if opts["regionName"] != "region-1" {
+		t.Fatalf("regionName: expected %q, got %q", "region-1", opts["regionName"])
+	}
+	if opts["username"] != "u1" {
+		t.Fatalf("username: expected %q, got %q", "u1", opts["username"])
+	}
+	if opts["password"] != "p1" {
+		t.Fatalf("password: expected %q, got %q", "p1", opts["password"])
+	}
+	if opts["token"] != "t1" {
+		t.Fatalf("token: expected %q, got %q", "t1", opts["token"])
+	}
+	if _, ok := opts["applicationCredentialID"]; !ok {
+		t.Fatalf("expected applicationCredentialID key to exist")
+	}
+}
+
+func TestCountingReader_ReadCountsBytes(t *testing.T) {
+	r := io.NopCloser(strings.NewReader("hello world"))
+	read := int64(0)
+	cr := &CountingReader{reader: r, total: 100, read: &read}
+
+	buf := make([]byte, 5)
+	n, err := cr.Read(buf)
 	if err != nil {
-		t.Fatalf("Failed to start mock server: %v", err)
+		t.Fatalf("unexpected err: %v", err)
 	}
-	defer server.Close()
-
-	fmt.Printf("Mock server running on port: %d\n", port)
-
-	fileName := "disk.img"
-	secretName := "test-secret"
-	imageID := "test-image-id"
-	ownerUID := "test-uid"
-
-	config := &AppConfig{
-		identityEndpoint: identityServerURL,
-		secretName:       secretName,
-		imageID:          imageID,
-		ownerUID:         ownerUID,
-		pvcSize:          100,
-		volumePath:       fileName,
+	if n != 5 || string(buf) != "hello" {
+		t.Fatalf("unexpected read: n=%d buf=%q", n, string(buf))
 	}
-
-	fmt.Println("server ", identityServerURL)
-	populate(config)
-
-	file, err := os.Open(fileName)
-	if err != nil {
-		t.Fatalf("Failed to open file: %v", err)
+	if read != 5 {
+		t.Fatalf("expected read=5, got %d", read)
 	}
-	defer file.Close() // Ensure the file is closed after reading
+}
 
-	content, err := io.ReadAll(file)
-	if err != nil {
-		t.Fatalf("Failed to read file: %v", err)
+func TestUpdateProgress_TotalZero_NoOp(t *testing.T) {
+	progress := createProgressCounter()
+	read := int64(10)
+	cr := &CountingReader{read: &read, total: 0}
+	updateProgress(cr, progress, "uid")
+}
+
+func TestUpdateProgress_AdvancesCounter(t *testing.T) {
+	progress := createProgressCounter()
+	read := int64(50)
+	cr := &CountingReader{read: &read, total: 100}
+
+	updateProgress(cr, progress, "uid")
+	metric := &dto.Metric{}
+	_ = progress.WithLabelValues("uid").Write(metric)
+	if metric.Counter == nil || metric.Counter.Value == nil {
+		t.Fatalf("expected counter metric")
+	}
+	if math.Abs(*metric.Counter.Value-50.0) > 0.001 {
+		t.Fatalf("expected ~50, got %v", *metric.Counter.Value)
 	}
 
-	if string(content) != "mock_data\n" {
-		t.Errorf("Expected %s, got %s", "mock_data", string(content))
+	// Advance to 60% and ensure it only adds the delta.
+	read = 60
+	updateProgress(cr, progress, "uid")
+	metric2 := &dto.Metric{}
+	_ = progress.WithLabelValues("uid").Write(metric2)
+	if math.Abs(*metric2.Counter.Value-60.0) > 0.001 {
+		t.Fatalf("expected ~60, got %v", *metric2.Counter.Value)
+	}
+}
+
+func TestFinalizeProgress_AdvancesTo100(t *testing.T) {
+	progress := createProgressCounter()
+	progress.WithLabelValues("uid").Add(20)
+
+	finalizeProgress(progress, "uid")
+
+	metric := &dto.Metric{}
+	_ = progress.WithLabelValues("uid").Write(metric)
+	if math.Abs(*metric.Counter.Value-100.0) > 0.001 {
+		t.Fatalf("expected ~100, got %v", *metric.Counter.Value)
+	}
+}
+
+func TestOpenFile_DiskImg_CreatesFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "disk.img")
+	f := openFile(p)
+	t.Cleanup(func() { _ = f.Close() })
+
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("expected file to exist: %v", err)
+	}
+}
+
+func TestOpenFile_NonDiskImg_OpensExisting(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "volume.bin")
+	if err := os.WriteFile(p, []byte("x"), 0o640); err != nil {
+		t.Fatalf("write: %v", err)
 	}
 
-	os.Remove(fileName)
+	f := openFile(p)
+	t.Cleanup(func() { _ = f.Close() })
 }

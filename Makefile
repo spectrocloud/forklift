@@ -89,13 +89,20 @@ UI_PLUGIN_IMAGE ?= quay.io/kubev2v/forklift-console-plugin:latest
 GOLANGCI_LINT_VERSION ?= v1.64.2
 GOLANGCI_LINT_BIN ?= $(GOBIN)/golangci-lint
 
+# Directory for CI/Sonar coverage artifacts.
+COVER_DIR ?= _build/cov
+
 ci: all tidy vendor generate-verify lint
 
 all: test forklift-controller
 
-# Run tests
-test: generate fmt vet manifests validation-test
-	go test -coverprofile=cover.out ./pkg/... ./cmd/...
+# Run tests (mogoco-style: single entrypoint that writes coverage artifact)
+# NOTE: Do NOT depend on `manifests`/`generate` here to avoid regenerating CRD YAMLs
+# during normal unit test runs. CI can run those checks explicitly.
+test:
+	@mkdir -p "$(COVER_DIR)"
+	@go test -v ./pkg/... ./cmd/... -coverprofile="$(COVER_DIR)/coverage.out" -covermode=atomic
+	@echo "Coverage written to $(COVER_DIR)/coverage.out"
 
 # Experimental e2e target
 e2e-sanity: e2e-sanity-ovirt e2e-sanity-vsphere

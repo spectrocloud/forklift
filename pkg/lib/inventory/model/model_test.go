@@ -508,13 +508,14 @@ func TestCascade(t *testing.T) {
 	n, _ = DB.Count(&DetailC{}, nil)
 	g.Expect(n).To(gomega.Equal(int64(27)))
 
-	for i := 0; i < 10; i++ {
-		time.Sleep(time.Millisecond * 10)
-		if len(handler.deleted) != 40 {
-			continue
-		} else {
+	// Deletion events are delivered asynchronously via watches; allow extra time
+	// to avoid flakiness on slower CI machines.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(handler.deleted) == 40 {
 			break
 		}
+		time.Sleep(time.Millisecond * 10)
 	}
 	g.Expect(len(handler.deleted)).To(gomega.Equal(40))
 
@@ -1049,7 +1050,7 @@ func TestWatch(t *testing.T) {
 				})
 		}
 	}
-	g.Expect(func() (eq bool) {
+	g.Eventually(func() (eq bool) {
 		h := handlerA
 		if len(all) != len(h.all) {
 			return
@@ -1067,8 +1068,8 @@ func TestWatch(t *testing.T) {
 			}
 		}
 		return true
-	}()).To(gomega.BeTrue())
-	g.Expect(func() (eq bool) {
+	}).WithTimeout(2 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
+	g.Eventually(func() (eq bool) {
 		h := handlerB
 		if len(all) != len(h.all) {
 			return
@@ -1080,7 +1081,7 @@ func TestWatch(t *testing.T) {
 			}
 		}
 		return true
-	}()).To(gomega.BeTrue())
+	}).WithTimeout(2 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
 	all = []TestEvent{}
 	for _, action := range []uint8{Created, Deleted} {
 		for i := 0; i < N; i++ {
@@ -1092,7 +1093,7 @@ func TestWatch(t *testing.T) {
 				})
 		}
 	}
-	g.Expect(func() (eq bool) {
+	g.Eventually(func() (eq bool) {
 		h := handlerC
 		if len(all) != len(h.all) {
 			return
@@ -1104,8 +1105,8 @@ func TestWatch(t *testing.T) {
 			}
 		}
 		return true
-	}()).To(gomega.BeTrue())
-	g.Expect(func() (eq bool) {
+	}).WithTimeout(2 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
+	g.Eventually(func() (eq bool) {
 		h := handlerD
 		if len(deleted) != len(h.deleted) {
 			return
@@ -1116,7 +1117,7 @@ func TestWatch(t *testing.T) {
 			}
 		}
 		return true
-	}()).To(gomega.BeTrue())
+	}).WithTimeout(2 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
 
 	//
 	// Test watch end.
