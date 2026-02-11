@@ -1,10 +1,13 @@
-name: Build and push images
+# DISABLED FOR FORK - This workflow pushes to upstream quay.io/kubev2v registry
+# Only enable if you have your own registry and credentials configured
+name: Build and push images (DISABLED)
 
 on:
-  push:
-    branches:
-      - main
-      - release-*
+  # Disabled - uncomment and configure REGISTRY_ORG before enabling
+  # push:
+  #   branches:
+  #     - main
+  #     - release-*
   workflow_dispatch:
 
 env:

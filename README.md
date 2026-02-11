@@ -1,4 +1,4 @@
-![Build](https://github.com/kubev2v/forklift/workflows/Build%20and%20push%20images/badge.svg)&nbsp;![CI](https://github.com/kubev2v/forklift/workflows/CI/badge.svg)&nbsp;[![Code Coverage](https://codecov.io/gh/kubev2v/forklift/branch/main/graph/badge.svg?token=VV6EBWKJGB)](https://codecov.io/gh/kubev2v/forklift)
+![CI](https://github.com/spectrocloud/forklift/workflows/CI/badge.svg)&nbsp;[![Code Coverage](https://codecov.io/gh/spectrocloud/forklift/branch/main/graph/badge.svg)](https://codecov.io/gh/spectrocloud/forklift)
 
 # Forklift
 Migrates virtual machines at scale to Kubernetes KubeVirt.
