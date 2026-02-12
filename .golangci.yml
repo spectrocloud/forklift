@@ -1,15 +1,74 @@
+# golangci-lint configuration
+# Documentation: https://golangci-lint.run/docs/configuration/
+
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - typecheck
+    - unused
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - dogsled
+    - durationcheck
+    - errorlint
+    - exhaustive
+    - exportloopref
+    - gocheckcompilerdirectives
+    - gochecksumtype
+    - gocritic
+    - gofmt
+    - goimports
+    - gomodguard
+    - goprintffuncname
+    - gosec
+    - intrange
+    - misspell
+    - nilerr
+    - nolintlint
+    - prealloc
+    - predeclared
+    - revive
+    - stylecheck
+    - thelper
+    - unconvert
+    - unparam
+    - wastedassign
+    - whitespace
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+  govet:
+    enable-all: true
+  gocyclo:
+    min-complexity: 15
+  dupl:
+    threshold: 100
+  goconst:
+    min-len: 3
+    min-occurrences: 3
+
 issues:
   exclude-dirs:
     - vendor
-    - pkg/lib/gob
-linters:
-  enable:
-  - ginkgolinter
-  - nilerr
-  - nilnil
-  - bodyclose
-  - gofmt
-  - goimports
-linters-settings:
-  ginkgolinter:
-    forbid-focus-container: true
+    - node_modules
+  exclude-files:
+    - ".*\\.pb\\.go$"
+    - ".*_test\\.go$"
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+run:
+  timeout: 10m
+  skip-dirs:
+    - vendor
+  skip-files:
+    - ".*\\.pb\\.go$"
