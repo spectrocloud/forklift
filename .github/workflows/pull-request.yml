@@ -111,6 +111,7 @@ jobs:
 
       - name: Post coverage report to PR
         uses: fgrosse/go-coverage-report@v1.2.0
+        continue-on-error: true  # Don't fail if no baseline exists yet
         with:
           coverage-artifact-name: "code-coverage"
           coverage-file-name: "coverage.out"
@@ -118,6 +119,7 @@ jobs:
 
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@v6
+        continue-on-error: true  # Don't fail if SonarQube is not configured yet
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
