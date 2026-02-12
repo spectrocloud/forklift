@@ -118,7 +118,6 @@ jobs:
           root-package: "github.com/kubev2v/forklift"
 
       - name: SonarQube Scan
-        if: secrets.SONAR_TOKEN != ''
         uses: SonarSource/sonarqube-scan-action@v6
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
