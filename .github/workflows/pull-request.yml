@@ -37,8 +37,13 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.8.0
-          args: --timeout=10m --out-format=checkstyle:golangci-lint-report.xml
+          args: --timeout=10m
           only-new-issues: true
+
+      - name: Generate lint report for SonarQube
+        if: always()
+        run: |
+          /home/runner/golangci-lint-2.8.0-linux-amd64/golangci-lint run --out-format checkstyle --timeout=10m > golangci-lint-report.xml || true
 
       - name: Archive lint results
         uses: actions/upload-artifact@v4
