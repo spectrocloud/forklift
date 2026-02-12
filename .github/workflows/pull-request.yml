@@ -118,11 +118,10 @@ jobs:
           root-package: "github.com/kubev2v/forklift"
 
       - name: SonarQube Scan
+        if: secrets.SONAR_TOKEN != ''
         uses: SonarSource/sonarqube-scan-action@v6
-        continue-on-error: true  # Don't fail if SonarQube is not configured yet
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
   # Job 3: Verify code generation (runs in parallel)
   verify:
