@@ -1,6 +1,6 @@
 module github.com/kubev2v/forklift/cmd/vsphere-xcopy-volume-populator
 
-go 1.24.13
+go 1.24.4
 
 toolchain go1.23.10
 
