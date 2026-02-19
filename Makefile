@@ -243,9 +243,11 @@ build-operator-bundle-image: check_container_runtime
 push-operator-bundle-image: build-operator-bundle-image
 	 $(CONTAINER_CMD) push $(OPERATOR_BUNDLE_IMAGE)
 
+# For operator-index build (opm pulls bundle from registry). Set e.g. export DOCKER_CONFIG=$HOME/.docker/config.json
 build-operator-index-image: check_container_runtime
 	$(eval OPERATOR_INDEX_IMAGE=$(REGISTRY)/$(REGISTRY_ORG)/forklift-operator-index:$(REGISTRY_TAG))
-	$(CONTAINER_CMD) build $(BUILD_OPT) -t $(OPERATOR_INDEX_IMAGE) -f build/forklift-operator-index/Containerfile . \
+	DOCKER_BUILDKIT=1 $(CONTAINER_CMD) build $(BUILD_OPT) -t $(OPERATOR_INDEX_IMAGE) -f build/forklift-operator-index/Containerfile . \
+		--secret id=dockerconfig,src=$(DOCKER_CONFIG) \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg OPERATOR_BUNDLE_IMAGE=$(OPERATOR_BUNDLE_IMAGE) \
 		--build-arg CHANNELS=$(CHANNELS) \

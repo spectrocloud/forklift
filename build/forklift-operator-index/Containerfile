@@ -16,7 +16,10 @@ COPY operator /app
 WORKDIR /app
 
 RUN cat catalog/operator.yml | envsubst > operator.yaml
-RUN opm render ${OPERATOR_BUNDLE_IMAGE} ${OPM_OPTS} -o yaml >> operator.yaml
+# Mount host docker config so opm can pull from a private registry (e.g. Artifact Registry).
+# Build with: docker build --secret id=dockerconfig,src=$HOME/.docker/config.json ...
+RUN --mount=type=secret,id=dockerconfig,dst=/root/.docker/config.json \
+    opm render ${OPERATOR_BUNDLE_IMAGE} ${OPM_OPTS} -o yaml >> operator.yaml
 
 FROM quay.io/operator-framework/opm:v1.52.0
 
