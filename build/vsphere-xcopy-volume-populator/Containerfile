@@ -9,7 +9,7 @@ RUN dnf install python -y
 # them in subsequent builds if they change
 COPY . .
 WORKDIR /usr/src/app/cmd/vsphere-xcopy-volume-populator
-RUN go mod download && go mod verify
+RUN go mod download && go mod verify && go mod vendor
 
 RUN make build
 

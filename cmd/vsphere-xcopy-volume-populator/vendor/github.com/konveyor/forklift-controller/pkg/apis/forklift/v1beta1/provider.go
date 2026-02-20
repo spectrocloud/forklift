@@ -84,6 +84,8 @@ type ProviderSpec struct {
 	Secret core.ObjectReference `json:"secret" ref:"Secret"`
 	// Provider settings.
 	Settings map[string]string `json:"settings,omitempty"`
+	// Whether or not the disk should be converted
+	ConvertDisk *bool `json:"convertDisk,omitempty"`
 }
 
 // ProviderStatus defines the observed state of Provider
@@ -157,7 +159,10 @@ func (p *Provider) HasReconciled() bool {
 
 // This provider requires VM guest conversion.
 func (p *Provider) RequiresConversion() bool {
-	return p.Type() == VSphere || p.Type() == Ova
+	if p.Spec.ConvertDisk == nil {
+		return false
+	}
+	return *p.Spec.ConvertDisk
 }
 
 // This provider support the vddk aio parameters.
