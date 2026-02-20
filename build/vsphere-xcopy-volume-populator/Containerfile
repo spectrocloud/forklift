@@ -11,9 +11,7 @@ COPY . .
 WORKDIR /usr/src/app/cmd/vsphere-xcopy-volume-populator
 RUN go mod download && go mod verify
 
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/.cache/go-build \
-    make build
+RUN make build
 
 RUN dnf install -y \
     # install python for vmkfstools-wrapper tests \
