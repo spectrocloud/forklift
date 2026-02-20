@@ -9,13 +9,13 @@ ENVTEST_VERSION ?= release-0.19
 CONTAINER_RUNTIME ?=
 
 ifeq ($(CONTAINER_RUNTIME),)
-CONTAINER_CMD ?= $(shell type -P podman)
+CONTAINER_CMD ?= $(shell command -v podman 2>/dev/null)
 ifeq ($(CONTAINER_CMD),)
-CONTAINER_CMD := $(shell type -P docker)
+CONTAINER_CMD := $(shell command -v docker 2>/dev/null)
 endif
-CONTAINER_RUNTIME=$(shell basename $(CONTAINER_CMD))
+CONTAINER_RUNTIME=$(shell basename $(CONTAINER_CMD) 2>/dev/null)
 else
-CONTAINER_CMD := $(shell type -P $(CONTAINER_RUNTIME))
+CONTAINER_CMD := $(shell command -v $(CONTAINER_RUNTIME) 2>/dev/null)
 endif
 
 REGISTRY ?= quay.io
