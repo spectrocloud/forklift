@@ -989,6 +989,30 @@ func (r *KubeVirt) EnsureGuestConversionPod(vm *plan.VMStatus, vmCr *VirtualMach
 		return
 	}
 
+	// Delete any failed/succeeded pods from previous migration attempts.
+	// This ensures that when a migration is rerun (e.g., after adding LUKS secret),
+	// a new pod is created with the updated configuration.
+	for i := range list.Items {
+		existingPod := &list.Items[i]
+		if existingPod.Status.Phase == core.PodFailed || existingPod.Status.Phase == core.PodSucceeded {
+			r.Log.Info(
+				"Deleting completed/failed virt-v2v pod from previous attempt.",
+				"pod", path.Join(existingPod.Namespace, existingPod.Name),
+				"phase", existingPod.Status.Phase,
+				"vm", vm.String())
+			if delErr := r.Destination.Client.Delete(context.TODO(), existingPod); delErr != nil {
+				r.Log.Error(delErr, "Failed to delete old virt-v2v pod.",
+					"pod", path.Join(existingPod.Namespace, existingPod.Name))
+			}
+		}
+	}
+
+	// Re-check for active pods after cleanup
+	list, err = r.GetPodsWithLabels(r.conversionLabels(vm.Ref, true))
+	if err != nil {
+		return
+	}
+
 	pod := &core.Pod{}
 	if len(list.Items) == 0 {
 		pod = newPod
