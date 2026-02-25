@@ -325,11 +325,17 @@ func TestProcessStartTimeMetricExist(t *testing.T) {
 
 	for _, metricsFamily := range metricsFamilies {
 		if metricsFamily.GetName() == processStartTimeMetric {
+			m := metricsFamily.GetMetric()
+			if len(m) == 0 || m[0].GetGauge() == nil {
+				t.Fatalf("Expected gauge metric for %s", processStartTimeMetric)
+			}
+			// The gauge value is the unix timestamp when the process started;
+			// it must be positive.
+			if m[0].GetGauge().GetValue() <= 0 {
+				t.Fatalf("Expected non-zero timestamp for process start time, got %v",
+					m[0].GetGauge().GetValue())
+			}
 			return
-		}
-		m := metricsFamily.GetMetric()
-		if m[0].GetGauge().GetValue() <= 0 {
-			t.Fatalf("Expected non zero timestamp for process start time")
 		}
 	}
 

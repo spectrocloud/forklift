@@ -529,25 +529,27 @@ func TestTransactions(t *testing.T) {
 	err := DB.Open(true)
 	g.Expect(err).ToNot(gomega.HaveOccurred())
 	for i := 0; i < 10; i++ {
-		// Begin
-		tx, err := DB.Begin()
-		defer tx.End()
-		g.Expect(err).ToNot(gomega.HaveOccurred())
-		object := &TestObject{
-			ID:   i,
-			Name: "Elmer",
-		}
-		err = tx.Insert(object)
-		g.Expect(err).ToNot(gomega.HaveOccurred())
-		// Get (not found)
-		object = &TestObject{ID: object.ID}
-		err = DB.Get(object)
-		g.Expect(errors.Is(err, NotFound)).To(gomega.BeTrue())
-		tx.Commit()
-		// Get (found)
-		object = &TestObject{ID: object.ID}
-		err = DB.Get(object)
-		g.Expect(err).ToNot(gomega.HaveOccurred())
+		func(i int) {
+			// Begin
+			tx, err := DB.Begin()
+			defer tx.End()
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			object := &TestObject{
+				ID:   i,
+				Name: "Elmer",
+			}
+			err = tx.Insert(object)
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			// Get (not found)
+			object = &TestObject{ID: object.ID}
+			err = DB.Get(object)
+			g.Expect(errors.Is(err, NotFound)).To(gomega.BeTrue())
+			tx.Commit()
+			// Get (found)
+			object = &TestObject{ID: object.ID}
+			err = DB.Get(object)
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+		}(i)
 	}
 }
 
@@ -1124,17 +1126,10 @@ func TestWatch(t *testing.T) {
 	watchB.End()
 	watchC.End()
 	watchD.End()
-	ended := false
-	for i := 0; i < 10; i++ {
-		if watchA.started || watchB.started || watchC.started || watchD.started {
-			time.Sleep(50 * time.Millisecond)
-		} else {
-			ended = true
-			break
-		}
-	}
+	g.Eventually(func() bool {
+		return !watchA.started && !watchB.started && !watchC.started && !watchD.started
+	}).WithTimeout(2 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
 	g.Expect(len(watchA.journal.watches)).To(gomega.Equal(0))
-	g.Expect(ended).To(gomega.BeTrue())
 	g.Expect(handlerA.done).To(gomega.BeTrue())
 	g.Expect(handlerB.done).To(gomega.BeTrue())
 	g.Expect(handlerC.done).To(gomega.BeTrue())
@@ -1158,27 +1153,18 @@ func TestCloseDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create watch: %v", err)
 	}
-	for i := 0; i < 10; i++ {
-		if !watch.started {
-			time.Sleep(50 * time.Millisecond)
-		} else {
-			break
-		}
-	}
+	g.Eventually(func() bool {
+		return watch.started
+	}).WithTimeout(2 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
 	g.Expect(handler.started).To(gomega.BeTrue())
 	g.Expect(handler.done).To(gomega.BeFalse())
 	_ = DB.Close(true)
 	for _, session := range DB.(*Client).pool.sessions {
 		g.Expect(session.closed).To(gomega.BeTrue())
 	}
-	for i := 0; i < 100; i++ {
-		if !watch.done {
-			time.Sleep(50 * time.Millisecond)
-		} else {
-			break
-		}
-	}
-
+	g.Eventually(func() bool {
+		return watch.done
+	}).WithTimeout(5 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
 	g.Expect(handler.done).To(gomega.BeTrue())
 }
 

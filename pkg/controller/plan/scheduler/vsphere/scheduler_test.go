@@ -200,146 +200,137 @@ func withExecutingSnapshot(p *api.Plan) {
 	p.Status.Migration.History = []planapi.Snapshot{s}
 }
 
-func TestFinishedDisks_EmptyPipeline_Zero(t *testing.T) {
+func TestFinishedDisks(t *testing.T) {
+	cases := []struct {
+		name     string
+		vm       *planapi.VMStatus
+		expected int
+	}{
+		{
+			name:     "EmptyPipeline",
+			vm:       &planapi.VMStatus{},
+			expected: 0,
+		},
+		{
+			name: "NoDiskTransferStep",
+			vm: &planapi.VMStatus{
+				Pipeline: []*planapi.Step{{Task: planapi.Task{Name: "Other"}}},
+			},
+			expected: 0,
+		},
+		{
+			name: "CountsCompletedTasksInDiskTransferStep",
+			vm: &planapi.VMStatus{
+				Pipeline: []*planapi.Step{{
+					Task:  planapi.Task{Name: DiskTransfer},
+					Tasks: []*planapi.Task{{Phase: Completed}, {Phase: "Running"}, {Phase: Completed}},
+				}},
+			},
+			expected: 2,
+		},
+	}
 	s := &Scheduler{}
-	if got := s.finishedDisks(&planapi.VMStatus{}); got != 0 {
-		t.Fatalf("expected 0 got %d", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := s.finishedDisks(tc.vm); got != tc.expected {
+				t.Fatalf("expected %d got %d", tc.expected, got)
+			}
+		})
 	}
 }
 
-func TestFinishedDisks_NoDiskTransferStep_Zero(t *testing.T) {
-	s := &Scheduler{}
-	vm := &planapi.VMStatus{
-		Pipeline: []*planapi.Step{{Task: planapi.Task{Name: "Other"}}},
+func TestCost(t *testing.T) {
+	cases := []struct {
+		name     string
+		useV2v   bool
+		disks    int
+		phase    string
+		pipeline []*planapi.Step
+		expected int
+	}{
+		{"V2v_CreateVM", true, 0, CreateVM, nil, 0},
+		{"V2v_PostHook", true, 0, PostHook, nil, 0},
+		{"V2v_Completed", true, 0, Completed, nil, 0},
+		{"V2v_Default", true, 0, "Other", nil, 1},
+		{"CDI_CreateVM", false, 3, CreateVM, nil, 0},
+		{"CDI_CopyingPaused", false, 3, CopyingPaused, nil, 0},
+		{
+			name:   "CDI_Default_DiskCountMinusFinished",
+			useV2v: false,
+			disks:  4,
+			phase:  "Other",
+			pipeline: []*planapi.Step{{
+				Task:  planapi.Task{Name: DiskTransfer},
+				Tasks: []*planapi.Task{{Phase: Completed}, {Phase: Completed}},
+			}},
+			expected: 2,
+		},
 	}
-	if got := s.finishedDisks(vm); got != 0 {
-		t.Fatalf("expected 0 got %d", got)
-	}
-}
-
-func TestFinishedDisks_CountsCompletedTasksInDiskTransferStep(t *testing.T) {
-	s := &Scheduler{}
-	vm := &planapi.VMStatus{
-		Pipeline: []*planapi.Step{{
-			Task:  planapi.Task{Name: DiskTransfer},
-			Tasks: []*planapi.Task{{Phase: Completed}, {Phase: "Running"}, {Phase: Completed}},
-		}},
-	}
-	if got := s.finishedDisks(vm); got != 2 {
-		t.Fatalf("expected 2 got %d", got)
-	}
-}
-
-func TestCost_UseV2v_CreateVM_Returns0(t *testing.T) {
-	p := mkPlan(true)
-	s := &Scheduler{Context: &plancontext.Context{Plan: p}}
-	vm := &model.VM{}
-	if got := s.cost(vm, mkVMStatus("1", CreateVM)); got != 0 {
-		t.Fatalf("expected 0 got %d", got)
-	}
-}
-
-func TestCost_UseV2v_PostHook_Returns0(t *testing.T) {
-	p := mkPlan(true)
-	s := &Scheduler{Context: &plancontext.Context{Plan: p}}
-	vm := &model.VM{}
-	if got := s.cost(vm, mkVMStatus("1", PostHook)); got != 0 {
-		t.Fatalf("expected 0 got %d", got)
-	}
-}
-
-func TestCost_UseV2v_Completed_Returns0(t *testing.T) {
-	p := mkPlan(true)
-	s := &Scheduler{Context: &plancontext.Context{Plan: p}}
-	vm := &model.VM{}
-	if got := s.cost(vm, mkVMStatus("1", Completed)); got != 0 {
-		t.Fatalf("expected 0 got %d", got)
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			p := mkPlan(tc.useV2v)
+			s := &Scheduler{Context: &plancontext.Context{Plan: p}}
+			vm := &model.VM{}
+			vm.Disks = make([]vsmodel.Disk, tc.disks)
+			st := mkVMStatus("1", tc.phase)
+			if tc.pipeline != nil {
+				st.Pipeline = tc.pipeline
+			}
+			if got := s.cost(vm, st); got != tc.expected {
+				t.Fatalf("expected %d got %d", tc.expected, got)
+			}
+		})
 	}
 }
 
-func TestCost_UseV2v_Default_Returns1(t *testing.T) {
-	p := mkPlan(true)
-	s := &Scheduler{Context: &plancontext.Context{Plan: p}}
-	vm := &model.VM{}
-	if got := s.cost(vm, mkVMStatus("1", "Other")); got != 1 {
-		t.Fatalf("expected 1 got %d", got)
+func TestSchedulable_EdgeCases(t *testing.T) {
+	cases := []struct {
+		name        string
+		maxInFlight int
+		pending     map[string][]*pendingVM
+		inFlight    map[string]int
+		expectedH1  int // expected len of schedulable["h1"]
+	}{
+		{
+			name:        "SkipsHostAtCapacity",
+			maxInFlight: 2,
+			pending:     map[string][]*pendingVM{"h1": {{cost: 1}}},
+			inFlight:    map[string]int{"h1": 2},
+			expectedH1:  0,
+		},
+		{
+			name:        "AllowsVMWhenCostFits",
+			maxInFlight: 3,
+			pending:     map[string][]*pendingVM{"h1": {{cost: 2}}},
+			inFlight:    map[string]int{"h1": 1},
+			expectedH1:  1,
+		},
+		{
+			name:        "AllowsBigVMWhenAlone",
+			maxInFlight: 2,
+			pending:     map[string][]*pendingVM{"h1": {{cost: 5}}},
+			inFlight:    map[string]int{"h1": 0},
+			expectedH1:  1,
+		},
+		{
+			name:        "DoesNotAllowBigVMWhenNotAlone",
+			maxInFlight: 2,
+			pending:     map[string][]*pendingVM{"h1": {{cost: 5}}},
+			inFlight:    map[string]int{"h1": 1},
+			expectedH1:  0,
+		},
 	}
-}
-
-func TestCost_CDI_CreateVM_Returns0(t *testing.T) {
-	p := mkPlan(false)
-	s := &Scheduler{Context: &plancontext.Context{Plan: p}}
-	vm := &model.VM{}
-	vm.Disks = make([]vsmodel.Disk, 3)
-	if got := s.cost(vm, mkVMStatus("1", CreateVM)); got != 0 {
-		t.Fatalf("expected 0 got %d", got)
-	}
-}
-
-func TestCost_CDI_CopyingPaused_Returns0(t *testing.T) {
-	p := mkPlan(false)
-	s := &Scheduler{Context: &plancontext.Context{Plan: p}}
-	vm := &model.VM{}
-	vm.Disks = make([]vsmodel.Disk, 3)
-	if got := s.cost(vm, mkVMStatus("1", CopyingPaused)); got != 0 {
-		t.Fatalf("expected 0 got %d", got)
-	}
-}
-
-func TestCost_CDI_Default_UsesDiskCountMinusFinished(t *testing.T) {
-	p := mkPlan(false)
-	s := &Scheduler{Context: &plancontext.Context{Plan: p}}
-	vm := &model.VM{}
-	vm.Disks = make([]vsmodel.Disk, 4)
-	st := mkVMStatus("1", "Other")
-	st.Pipeline = []*planapi.Step{{
-		Task:  planapi.Task{Name: DiskTransfer},
-		Tasks: []*planapi.Task{{Phase: Completed}, {Phase: Completed}},
-	}}
-	if got := s.cost(vm, st); got != 2 {
-		t.Fatalf("expected 2 got %d", got)
-	}
-}
-
-func TestSchedulable_SkipsHostAtCapacity(t *testing.T) {
-	s := &Scheduler{MaxInFlight: 2}
-	s.pending = map[string][]*pendingVM{"h1": {{cost: 1}}}
-	s.inFlight = map[string]int{"h1": 2}
-	if got := s.schedulable(); len(got) != 0 {
-		t.Fatalf("expected empty got %#v", got)
-	}
-}
-
-func TestSchedulable_AllowsVMWhenCostFits(t *testing.T) {
-	s := &Scheduler{MaxInFlight: 3}
-	vm := &pendingVM{cost: 2}
-	s.pending = map[string][]*pendingVM{"h1": {vm}}
-	s.inFlight = map[string]int{"h1": 1}
-	got := s.schedulable()
-	if len(got["h1"]) != 1 {
-		t.Fatalf("expected 1 schedulable got %#v", got)
-	}
-}
-
-func TestSchedulable_AllowsBigVMWhenAlone(t *testing.T) {
-	s := &Scheduler{MaxInFlight: 2}
-	vm := &pendingVM{cost: 5}
-	s.pending = map[string][]*pendingVM{"h1": {vm}}
-	s.inFlight = map[string]int{"h1": 0}
-	got := s.schedulable()
-	if len(got["h1"]) != 1 {
-		t.Fatalf("expected 1 schedulable got %#v", got)
-	}
-}
-
-func TestSchedulable_DoesNotAllowBigVMWhenNotAlone(t *testing.T) {
-	s := &Scheduler{MaxInFlight: 2}
-	vm := &pendingVM{cost: 5}
-	s.pending = map[string][]*pendingVM{"h1": {vm}}
-	s.inFlight = map[string]int{"h1": 1}
-	got := s.schedulable()
-	if len(got["h1"]) != 0 {
-		t.Fatalf("expected none got %#v", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Scheduler{MaxInFlight: tc.maxInFlight}
+			s.pending = tc.pending
+			s.inFlight = tc.inFlight
+			got := s.schedulable()
+			if len(got["h1"]) != tc.expectedH1 {
+				t.Fatalf("expected %d schedulable, got %d: %#v", tc.expectedH1, len(got["h1"]), got)
+			}
+		})
 	}
 }
 

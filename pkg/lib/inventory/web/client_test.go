@@ -78,19 +78,21 @@ func TestClient_Get_InvalidJSON(t *testing.T) {
 }
 
 func TestClient_patchURL(t *testing.T) {
+	cases := []struct {
+		name, input, expected string
+	}{
+		{"http->ws", "http://example.invalid/x", "ws://example.invalid/x"},
+		{"https->wss", "https://example.invalid/x", "wss://example.invalid/x"},
+		{"ftp_unchanged", "ftp://example.invalid/x", "ftp://example.invalid/x"},
+		{"invalid_unchanged", "://bad-url", "://bad-url"},
+	}
 	c := &Client{}
-	if got := c.patchURL("http://example.invalid/x"); got != "ws://example.invalid/x" {
-		t.Fatalf("unexpected patched url: %q", got)
-	}
-	if got := c.patchURL("https://example.invalid/x"); got != "wss://example.invalid/x" {
-		t.Fatalf("unexpected patched url: %q", got)
-	}
-	// Unsupported scheme / invalid URL => unchanged.
-	if got := c.patchURL("ftp://example.invalid/x"); got != "ftp://example.invalid/x" {
-		t.Fatalf("expected unchanged, got %q", got)
-	}
-	if got := c.patchURL("://bad-url"); got != "://bad-url" {
-		t.Fatalf("expected unchanged, got %q", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := c.patchURL(tc.input); got != tc.expected {
+				t.Fatalf("patchURL(%q) = %q, want %q", tc.input, got, tc.expected)
+			}
+		})
 	}
 }
 

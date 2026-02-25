@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"testing"
 	"time"
 
@@ -363,21 +362,29 @@ func TestAuth_Permit_ReturnsForbiddenAndErrorWhenNotAllowed(t *testing.T) {
 	}
 }
 
-func TestAuth_Token_TrimsBearerAndWhitespace(t *testing.T) {
-	a := &Auth{}
-	ctx := ginCtxWithAuth(t, "tok", "http://example.invalid/x")
-	ctx.Request.Header.Set("Authorization", "  Bearer   tok  ")
-	if got := a.Token(ctx); got != "tok" {
-		t.Fatalf("expected tok, got %q", got)
+func TestAuth_Token_Parsing(t *testing.T) {
+	cases := []struct {
+		name   string
+		header string
+		want   string
+	}{
+		{"TrimsBearerAndWhitespace", "  Bearer   tok  ", "tok"},
+		{"EmptyOnNonBearer", "Basic tok", ""},
+		{"EmptyOnEmptyHeader", "", ""},
+		{"EmptyOnOnlyBearer", "Bearer", ""},
+		{"EmptyOnBearerOnlySpaces", "Bearer   ", ""},
+		{"EmptyOnBearerTrailingSpace", "Bearer ", ""},
+		{"ParsesTabSeparator", "Bearer\ttok", "tok"},
 	}
-}
-
-func TestAuth_Token_EmptyOnNonBearer(t *testing.T) {
 	a := &Auth{}
-	ctx := ginCtxWithAuth(t, "tok", "http://example.invalid/x")
-	ctx.Request.Header.Set("Authorization", "Basic tok")
-	if got := a.Token(ctx); got != "" {
-		t.Fatalf("expected empty, got %q", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := ginCtxWithAuth(t, "", "http://example.invalid/x")
+			ctx.Request.Header.Set("Authorization", tc.header)
+			if got := a.Token(ctx); got != tc.want {
+				t.Fatalf("Token() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -431,47 +438,3 @@ func TestAuth_Permit_TokenWhitespaceIsTrimmed(t *testing.T) {
 	}
 }
 
-func TestAuth_Token_EmptyOnEmptyHeader(t *testing.T) {
-	a := &Auth{}
-	ctx := ginCtxWithAuth(t, "", "http://example.invalid/x")
-	ctx.Request.Header.Set("Authorization", "")
-	if got := a.Token(ctx); got != "" {
-		t.Fatalf("expected empty, got %q", got)
-	}
-}
-
-func TestAuth_Token_EmptyOnOnlyBearer(t *testing.T) {
-	a := &Auth{}
-	ctx := ginCtxWithAuth(t, "", "http://example.invalid/x")
-	ctx.Request.Header.Set("Authorization", "Bearer")
-	if got := a.Token(ctx); got != "" {
-		t.Fatalf("expected empty, got %q", got)
-	}
-}
-
-func TestAuth_Token_EmptyOnBearerOnlySpaces(t *testing.T) {
-	a := &Auth{}
-	ctx := ginCtxWithAuth(t, "", "http://example.invalid/x")
-	ctx.Request.Header.Set("Authorization", "Bearer   ")
-	if got := a.Token(ctx); got != "" {
-		t.Fatalf("expected empty, got %q", got)
-	}
-}
-
-func TestAuth_Token_EmptyOnEmptyBearerToken(t *testing.T) {
-	a := &Auth{}
-	ctx := ginCtxWithAuth(t, "", "http://example.invalid/x")
-	ctx.Request.Header.Set("Authorization", "Bearer ")
-	if got := a.Token(ctx); got != "" {
-		t.Fatalf("expected empty, got %q", got)
-	}
-}
-
-func TestAuth_Token_ParsesWeirdSpacing(t *testing.T) {
-	a := &Auth{}
-	ctx := ginCtxWithAuth(t, "", "http://example.invalid/x")
-	ctx.Request.Header.Set("Authorization", strings.Join([]string{"Bearer", "tok"}, "\t"))
-	if got := a.Token(ctx); got != "tok" {
-		t.Fatalf("expected tok, got %q", got)
-	}
-}
