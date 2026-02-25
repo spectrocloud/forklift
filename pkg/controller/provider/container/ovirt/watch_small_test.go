@@ -3,7 +3,6 @@ package ovirt
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/kubev2v/forklift/pkg/lib/logging"
 )
@@ -25,7 +24,7 @@ func TestVMEventHandler_canceled(t *testing.T) {
 		t.Fatalf("expected not canceled")
 	}
 	h.cancel()
-	time.Sleep(time.Millisecond)
+	// cancel() closes the Done channel synchronously; no sleep needed.
 	if !h.canceled() {
 		t.Fatalf("expected canceled")
 	}

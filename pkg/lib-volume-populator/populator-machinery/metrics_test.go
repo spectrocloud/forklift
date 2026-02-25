@@ -78,7 +78,7 @@ volume_populator_operation_seconds_bucket{result="result1",le="120"} 1
 volume_populator_operation_seconds_bucket{result="result1",le="300"} 1
 volume_populator_operation_seconds_bucket{result="result1",le="600"} 1
 volume_populator_operation_seconds_bucket{result="result1",le="+Inf"} 1
-volume_populator_operation_seconds_sum{result="result1"} 1.100328407
+volume_populator_operation_seconds_sum{result="result1"} 1.0
 volume_populator_operation_seconds_count{result="result1"} 1
 # HELP volume_populator_operations_in_flight [ALPHA] Total number of operations in flight
 # TYPE volume_populator_operations_in_flight gauge
@@ -90,6 +90,20 @@ volume_populator_operations_in_flight 0
 	}
 }
 
+// waitForMetric polls verifyInFlightMetric until it succeeds or the deadline is exceeded.
+func waitForMetric(t *testing.T, expected, srvAddr string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var err error
+	for time.Now().Before(deadline) {
+		if err = verifyInFlightMetric(expected, srvAddr); err == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("timed out waiting for metric %q: %v", expected, err)
+}
+
 func TestInFlightMetric(t *testing.T) {
 	inFlightCheckInterval = time.Millisecond * 50
 
@@ -99,38 +113,22 @@ func TestInFlightMetric(t *testing.T) {
 
 	pvcUID1 := types.UID("uid1")
 	mgr.operationStart(pvcUID1)
-	time.Sleep(500 * time.Millisecond)
-
-	if err := verifyInFlightMetric(`volume_populator_operations_in_flight 1`, srvAddr); err != nil {
-		t.Errorf("failed testing [%v]", err)
-	}
+	waitForMetric(t, `volume_populator_operations_in_flight 1`, srvAddr)
 
 	pvcUID2 := types.UID("uid2")
 	mgr.operationStart(pvcUID2)
-	time.Sleep(500 * time.Millisecond)
+	waitForMetric(t, `volume_populator_operations_in_flight 2`, srvAddr)
 
-	if err := verifyInFlightMetric(`volume_populator_operations_in_flight 2`, srvAddr); err != nil {
-		t.Errorf("failed testing [%v]", err)
-	}
-
-	//  Record, should be down to 1
+	// Record, should be down to 1
 	mgr.recordMetrics(pvcUID1, "result1")
-	time.Sleep(500 * time.Millisecond)
+	waitForMetric(t, `volume_populator_operations_in_flight 1`, srvAddr)
 
-	if err := verifyInFlightMetric(`volume_populator_operations_in_flight 1`, srvAddr); err != nil {
-		t.Errorf("failed testing [%v]", err)
-	}
-
-	//  Start 50 operations, should be 51
+	// Start 50 operations, should be 51
 	for i := 0; i < 50; i++ {
 		pvcUID := types.UID(fmt.Sprintf("uid%d", 3+i))
 		mgr.operationStart(pvcUID)
 	}
-	time.Sleep(500 * time.Millisecond)
-
-	if err := verifyInFlightMetric(`volume_populator_operations_in_flight 51`, srvAddr); err != nil {
-		t.Errorf("failed testing [%v]", err)
-	}
+	waitForMetric(t, `volume_populator_operations_in_flight 51`, srvAddr)
 }
 
 func verifyInFlightMetric(expected string, srvAddr string) error {
@@ -213,19 +211,17 @@ func verifyMetric(expected, srvAddr string) error {
 // sortMfs, sorts metric families in alphabetical order by type.
 // currently only supports counter and histogram
 func sortMfs(mfs []*cmg.MetricFamily) []*cmg.MetricFamily {
-	var sortedMfs []*cmg.MetricFamily
-
 	// Sort first by type
 	sort.Slice(mfs, func(i, j int) bool {
 		return *mfs[i].Type < *mfs[j].Type
 	})
 
-	// Next, sort by length of name
-	sort.Slice(mfs, func(i, j int) bool {
+	// Next, sort by length of name (stable so equal-length names keep type order)
+	sort.SliceStable(mfs, func(i, j int) bool {
 		return len(*mfs[i].Name) < len(*mfs[j].Name)
 	})
 
-	return sortedMfs
+	return mfs
 }
 
 func containsMetrics(expectedMfs, gotMfs []*cmg.MetricFamily) bool {

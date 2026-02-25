@@ -3,7 +3,6 @@ package openstack
 import (
 	"context"
 	"testing"
-	"time"
 )
 
 func TestAdapterList_IsInitialized(t *testing.T) {
@@ -19,8 +18,7 @@ func TestContext_canceled(t *testing.T) {
 		t.Fatalf("expected not canceled yet")
 	}
 	cancel()
-	// allow cancellation to propagate
-	time.Sleep(time.Millisecond)
+	// cancel() closes the Done channel synchronously; no sleep needed.
 	if !c.canceled() {
 		t.Fatalf("expected canceled")
 	}

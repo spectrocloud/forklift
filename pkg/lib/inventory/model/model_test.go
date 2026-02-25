@@ -994,20 +994,19 @@ func TestWatch(t *testing.T) {
 		err = DB.Delete(object)
 		g.Expect(err).ToNot(gomega.HaveOccurred())
 	}
-	for i := 0; i < N; i++ {
-		time.Sleep(time.Millisecond * 10)
-		if len(handlerA.created) != N ||
-			len(handlerA.updated) != N ||
-			len(handlerA.created) != N ||
-			len(handlerB.created) != N ||
-			len(handlerB.updated) != N ||
-			len(handlerB.created) != N ||
-			len(handlerC.created) != N ||
-			len(handlerC.created) != N {
-			continue
-		} else {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(handlerA.created) == N &&
+			len(handlerA.updated) == N &&
+			len(handlerA.deleted) == N &&
+			len(handlerB.created) == N &&
+			len(handlerB.updated) == N &&
+			len(handlerB.deleted) == N &&
+			len(handlerC.created) == N &&
+			len(handlerC.deleted) == N {
 			break
 		}
+		time.Sleep(time.Millisecond * 10)
 	}
 	g.Expect(handlerA.started).To(gomega.BeTrue())
 	g.Expect(handlerB.started).To(gomega.BeTrue())
@@ -1219,12 +1218,14 @@ func TestMutatingWatch(t *testing.T) {
 		g.Expect(err).ToNot(gomega.HaveOccurred())
 	}
 
-	for {
-		time.Sleep(time.Millisecond * 10)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
 		if len(handlerA.updated) == N*2 {
 			break
 		}
+		time.Sleep(time.Millisecond * 10)
 	}
+	g.Expect(len(handlerA.updated)).To(gomega.Equal(N * 2))
 }
 
 func TestExecute(t *testing.T) {
@@ -1541,4 +1542,67 @@ func fieldNames(fields []*Field) (names []string) {
 	}
 
 	return
+}
+
+// ---- Merged from model_more_test.go ----
+
+func TestPage_Slice_IgnoresNonPointer(t *testing.T) {
+	p := &Page{Offset: 1, Limit: 1}
+	s := []int{1, 2, 3}
+	p.Slice(s) // should not panic or modify
+	if len(s) != 3 {
+		t.Fatalf("expected unchanged")
+	}
+}
+
+func TestPage_Slice_IgnoresPointerToNonSlice(t *testing.T) {
+	p := &Page{Offset: 1, Limit: 1}
+	x := 10
+	p.Slice(&x)
+	if x != 10 {
+		t.Fatalf("expected unchanged")
+	}
+}
+
+func TestPage_Slice_OffsetAndLimit(t *testing.T) {
+	p := &Page{Offset: 1, Limit: 2}
+	s := []int{1, 2, 3, 4}
+	p.Slice(&s)
+	if len(s) != 2 || s[0] != 2 || s[1] != 3 {
+		t.Fatalf("unexpected slice: %#v", s)
+	}
+}
+
+func TestPage_Slice_OffsetBeyondLen_Empty(t *testing.T) {
+	p := &Page{Offset: 10, Limit: 2}
+	s := []int{1, 2, 3}
+	p.Slice(&s)
+	if len(s) != 0 {
+		t.Fatalf("expected empty, got %#v", s)
+	}
+}
+
+func TestPage_Slice_LimitZero_Empty(t *testing.T) {
+	p := &Page{Offset: 0, Limit: 0}
+	s := []int{1, 2, 3}
+	p.Slice(&s)
+	if len(s) != 0 {
+		t.Fatalf("expected empty, got %#v", s)
+	}
+}
+
+func TestBase_Pk_ReturnsPK(t *testing.T) {
+	b := &Base{PK: "abc"}
+	if b.Pk() != "abc" {
+		t.Fatalf("expected pk abc, got %q", b.Pk())
+	}
+}
+
+func TestPage_Slice_LimitGreaterThanLen_ReturnsToEnd(t *testing.T) {
+	p := &Page{Offset: 2, Limit: 100}
+	s := []int{1, 2, 3, 4}
+	p.Slice(&s)
+	if len(s) != 2 || s[0] != 3 || s[1] != 4 {
+		t.Fatalf("unexpected slice: %#v", s)
+	}
 }
