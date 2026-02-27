@@ -415,8 +415,6 @@ func TestConditions_ChangeSet(t *testing.T) {
 	g.Expect(explain.Deleted["D"].Type).To(gomega.Equal("D"))
 }
 
-// ---- Merged from condition_more_test.go ----
-
 func TestCondition_Update_NoChange_ReturnsFalse(t *testing.T) {
 	a := &Condition{Type: "A", Status: True, Category: Warn}
 	if a.Update(Condition{Type: "A", Status: True, Category: Warn}) {

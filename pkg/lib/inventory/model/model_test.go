@@ -1530,8 +1530,6 @@ func fieldNames(fields []*Field) (names []string) {
 	return
 }
 
-// ---- Merged from model_more_test.go ----
-
 func TestPage_Slice_IgnoresNonPointer(t *testing.T) {
 	p := &Page{Offset: 1, Limit: 1}
 	s := []int{1, 2, 3}

@@ -119,8 +119,6 @@ func TestScheduler(t *testing.T) {
 	g.Expect(scheduler.schedulable()).To(gomega.Equal(expectedSchedule))
 }
 
-// ---- Merged from scheduler_more_test.go ----
-
 type fakeInventory struct {
 	findFn func(resource interface{}, r webbase.Ref) error
 }

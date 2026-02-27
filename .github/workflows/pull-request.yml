@@ -17,40 +17,28 @@ permissions:
 
 # Run jobs in parallel for faster execution
 jobs:
-  # Job 1: Lint check (runs in parallel) - TEMPORARILY DISABLED
-  # lint:
-  #   name: Lint
-  #   runs-on: ubuntu-latest
-  #   timeout-minutes: 10
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v6
-  #
-  #     - name: Setup Go
-  #       uses: actions/setup-go@v6
-  #       with:
-  #         go-version: '1.23.6'
-  #         cache: true
-  #         cache-dependency-path: go.sum
-  #
-  #     - name: golangci-lint
-  #       uses: golangci/golangci-lint-action@v9
-  #       with:
-  #         version: v2.9.0
-  #         args: --timeout=10m
-  #         only-new-issues: true
-  #
-  #     - name: Generate lint report for SonarQube
-  #       if: always()
-  #       run: |
-  #         golangci-lint run --timeout=10m --output.checkstyle.path=golangci-lint-report.xml || true
-  #
-  #     - name: Archive lint results
-  #       uses: actions/upload-artifact@v4
-  #       if: always()
-  #       with:
-  #         name: lint-report
-  #         path: golangci-lint-report.xml
+  # Job 1: Lint check (runs in parallel)
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.23.6'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.9.0
+          args: --timeout=10m
+          only-new-issues: true
 
   # Job 2: Unit tests with coverage (runs in parallel)
   test:

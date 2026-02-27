@@ -8,7 +8,6 @@ import (
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/provider"
 	"github.com/kubev2v/forklift/pkg/controller/base"
-	"github.com/kubev2v/forklift/pkg/lib/condition"
 	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
 	"github.com/kubev2v/forklift/pkg/settings"
@@ -16,8 +15,6 @@ import (
 	"github.com/onsi/gomega"
 	batchv1 "k8s.io/api/batch/v1"
 	core "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
-	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/version"
@@ -87,24 +84,24 @@ var _ = ginkgo.Describe("Plan Validations", func() {
 			source := createProvider(sourceName, sourceNamespace, "https://source", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
 			destination := createProvider(destName, destNamespace, "", api.OpenShift, &core.ObjectReference{})
 			plan := createPlan(testPlanName, testNamespace, source, destination)
-			source.Status.Conditions.SetCondition(condition.Condition{Type: condition.Ready, Status: condition.True})
-			destination.Status.Conditions.SetCondition(condition.Condition{Type: condition.Ready, Status: condition.True})
+		source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+		destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
 
-			reconciler = createFakeReconciler(secret, plan, source, destination)
-			err := reconciler.ensureSecretForProvider(plan)
-			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		reconciler = createFakeReconciler(secret, plan, source, destination)
+		err := reconciler.ensureSecretForProvider(plan)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
-			// secret should be set on plan.Referenced.Secret
-			gomega.Expect(plan.Referenced.Secret).NotTo(gomega.BeNil())
-		})
+		// secret should be set on plan.Referenced.Secret
+		gomega.Expect(plan.Referenced.Secret).NotTo(gomega.BeNil())
+	})
 
-		ginkgo.It("Should not setup secret when source is local cluster", func() {
-			secret := createSecret(sourceSecretName, sourceNamespace, false)
-			source := createProvider(sourceName, sourceNamespace, "", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
-			destination := createProvider(destName, destNamespace, "https://destination", api.OpenShift, &core.ObjectReference{})
-			plan := createPlan(testPlanName, testNamespace, source, destination)
-			source.Status.Conditions.SetCondition(condition.Condition{Type: condition.Ready, Status: condition.True})
-			destination.Status.Conditions.SetCondition(condition.Condition{Type: condition.Ready, Status: condition.True})
+	ginkgo.It("Should not setup secret when source is local cluster", func() {
+		secret := createSecret(sourceSecretName, sourceNamespace, false)
+		source := createProvider(sourceName, sourceNamespace, "", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
+		destination := createProvider(destName, destNamespace, "https://destination", api.OpenShift, &core.ObjectReference{})
+		plan := createPlan(testPlanName, testNamespace, source, destination)
+		source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+		destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
 
 			reconciler = createFakeReconciler(secret, plan, source, destination)
 			err := reconciler.ensureSecretForProvider(plan)
@@ -211,7 +208,7 @@ func createFakeReconciler(objects ...runtime.Object) *Reconciler {
 	objs = append(objs, objects...)
 
 	scheme := runtime.NewScheme()
-	_ = v1.AddToScheme(scheme)
+	_ = core.AddToScheme(scheme)
 	api.SchemeBuilder.AddToScheme(scheme)
 
 	client := fakeClient.NewClientBuilder().
@@ -229,7 +226,7 @@ func createFakeReconciler(objects ...runtime.Object) *Reconciler {
 
 func createProvider(name, namespace, url string, providerType api.ProviderType, secret *core.ObjectReference) *api.Provider {
 	return &api.Provider{
-		ObjectMeta: meta.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
 		},
@@ -243,7 +240,7 @@ func createProvider(name, namespace, url string, providerType api.ProviderType, 
 
 func createSecret(name, namespace string, insecure bool) *core.Secret {
 	return &core.Secret{
-		ObjectMeta: meta.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
 		},
@@ -256,7 +253,7 @@ func createSecret(name, namespace string, insecure bool) *core.Secret {
 
 func createPlan(name, namespace string, source, destination *api.Provider) *api.Plan {
 	return &api.Plan{
-		ObjectMeta: meta.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
 		},
@@ -283,8 +280,6 @@ func createPlan(name, namespace string, source, destination *api.Provider) *api.
 		},
 	}
 }
-
-// ---- Merged from validation_more_test.go ----
 
 func TestValidateTargetNamespace_NotSet_SetsCondition(t *testing.T) {
 	r := createFakeReconciler()

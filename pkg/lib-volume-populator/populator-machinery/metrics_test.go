@@ -58,6 +58,11 @@ func TestRecordMetrics(t *testing.T) {
 	time.Sleep(1100 * time.Millisecond)
 	mgr.recordMetrics(pvcUID, "result1")
 
+	// The expected sum value of 1.0 is a minimum threshold, not an exact match.
+	// The test sleeps for 1100ms, so the actual recorded latency will be >= 1.1s.
+	// The verification logic in containsMetrics checks that the actual
+	// SampleSum >= expected SampleSum, so 1.0 acts as a stable lower bound
+	// that avoids flakiness from wall-clock jitter.
 	expected :=
 		`# HELP process_start_time_seconds [ALPHA] Start time of the process since unix epoch in seconds.
 # TYPE process_start_time_seconds gauge

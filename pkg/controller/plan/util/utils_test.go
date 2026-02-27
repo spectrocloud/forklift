@@ -30,8 +30,6 @@ var _ = Describe("Plan/utils", func() {
 	)
 })
 
-// ---- Merged from utils_more_test.go ----
-
 func TestRoundUp_MultipleZero_ReturnsRequested(t *testing.T) {
 	if got := RoundUp(123, 0); got != 123 {
 		t.Fatalf("expected 123 got %d", got)

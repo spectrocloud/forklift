@@ -53,8 +53,6 @@ func TestVmNameHandler(t *testing.T) {
 	g.Expect(validateVmName(changedMultiDotName2)).To(gomega.BeTrue(), "Changed name with multiple leading dots should match DNS1123 subdomain format")
 }
 
-// ---- Merged from vm_name_handler_more_test.go ----
-
 func newKubevirtFakeClientWithFieldIndexes(t *testing.T, scheme *runtime.Scheme) client.Client {
 	t.Helper()
 	return fake.NewClientBuilder().
