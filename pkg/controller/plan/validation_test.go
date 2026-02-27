@@ -91,8 +91,8 @@ var _ = ginkgo.Describe("Plan Validations", func() {
 		err := reconciler.ensureSecretForProvider(plan)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
-		// secret should be set on plan.Referenced.Secret
-		gomega.Expect(plan.Referenced.Secret).NotTo(gomega.BeNil())
+		// secret should be set on plan.Secret
+		gomega.Expect(plan.Secret).NotTo(gomega.BeNil())
 	})
 
 	ginkgo.It("Should not setup secret when source is local cluster", func() {
@@ -107,8 +107,8 @@ var _ = ginkgo.Describe("Plan Validations", func() {
 			err := reconciler.ensureSecretForProvider(plan)
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
-			// secret should NOT be set on plan.Referenced.Secret
-			gomega.Expect(plan.Referenced.Secret).To(gomega.BeNil())
+			// secret should NOT be set on plan.Secret
+			gomega.Expect(plan.Secret).To(gomega.BeNil())
 		})
 	})
 
@@ -369,7 +369,7 @@ func TestValidateWarmMigration_NoProvider_ReturnsNil(t *testing.T) {
 	r := &Reconciler{}
 	p := &api.Plan{}
 	p.Spec.Warm = true
-	p.Referenced.Provider.Source = nil
+	p.Provider.Source = nil
 	if err := r.validateWarmMigration(p); err != nil {
 		t.Fatalf("expected nil, got %v", err)
 	}
@@ -380,7 +380,7 @@ func TestValidateWarmMigration_UnsupportedProvider_ReturnsError(t *testing.T) {
 	p := &api.Plan{}
 	p.Spec.Warm = true
 	tp := api.ProviderType("nope")
-	p.Referenced.Provider.Source = &api.Provider{Spec: api.ProviderSpec{Type: &tp}}
+	p.Provider.Source = &api.Provider{Spec: api.ProviderSpec{Type: &tp}}
 	if err := r.validateWarmMigration(p); err == nil {
 		t.Fatalf("expected error")
 	}
@@ -415,7 +415,7 @@ func TestValidateNetworkMap_NotReady_SetsNotReadyConditionAndReferencesMap(t *te
 	p := &api.Plan{}
 	p.Spec.Map.Network = core.ObjectReference{Namespace: "ns", Name: "nm"}
 	_ = r.validateNetworkMap(p)
-	if p.Referenced.Map.Network == nil || p.Referenced.Map.Network.Name != "nm" {
+	if p.Map.Network == nil || p.Map.Network.Name != "nm" {
 		t.Fatalf("expected referenced map set")
 	}
 	if !p.Status.HasCondition(NetMapNotReady) {
@@ -430,7 +430,7 @@ func TestValidateNetworkMap_Ready_SetsReferenceWithoutNotReadyCondition(t *testi
 	p := &api.Plan{}
 	p.Spec.Map.Network = core.ObjectReference{Namespace: "ns", Name: "nm"}
 	_ = r.validateNetworkMap(p)
-	if p.Referenced.Map.Network == nil || p.Referenced.Map.Network.Name != "nm" {
+	if p.Map.Network == nil || p.Map.Network.Name != "nm" {
 		t.Fatalf("expected referenced map set")
 	}
 	if p.Status.HasCondition(NetMapNotReady) {
@@ -466,7 +466,7 @@ func TestValidateStorageMap_NotReady_SetsNotReadyConditionAndReferencesMap(t *te
 	p := &api.Plan{}
 	p.Spec.Map.Storage = core.ObjectReference{Namespace: "ns", Name: "sm"}
 	_ = r.validateStorageMap(p)
-	if p.Referenced.Map.Storage == nil || p.Referenced.Map.Storage.Name != "sm" {
+	if p.Map.Storage == nil || p.Map.Storage.Name != "sm" {
 		t.Fatalf("expected referenced map set")
 	}
 	if !p.Status.HasCondition(DsMapNotReady) {
@@ -481,7 +481,7 @@ func TestValidateStorageMap_Ready_SetsReferenceWithoutNotReadyCondition(t *testi
 	p := &api.Plan{}
 	p.Spec.Map.Storage = core.ObjectReference{Namespace: "ns", Name: "sm"}
 	_ = r.validateStorageMap(p)
-	if p.Referenced.Map.Storage == nil || p.Referenced.Map.Storage.Name != "sm" {
+	if p.Map.Storage == nil || p.Map.Storage.Name != "sm" {
 		t.Fatalf("expected referenced map set")
 	}
 	if p.Status.HasCondition(DsMapNotReady) {
@@ -497,9 +497,9 @@ func TestJobExceedsDeadline_NoStartTime_False(t *testing.T) {
 }
 
 func TestJobExceedsDeadline_WithinDeadline_False(t *testing.T) {
-	old := settings.Settings.Migration.VddkJobActiveDeadline
-	t.Cleanup(func() { settings.Settings.Migration.VddkJobActiveDeadline = old })
-	settings.Settings.Migration.VddkJobActiveDeadline = 1000
+	old := settings.Settings.VddkJobActiveDeadline
+	t.Cleanup(func() { settings.Settings.VddkJobActiveDeadline = old })
+	settings.Settings.VddkJobActiveDeadline = 1000
 
 	now := metav1.Now()
 	j := &batchv1.Job{}
@@ -510,9 +510,9 @@ func TestJobExceedsDeadline_WithinDeadline_False(t *testing.T) {
 }
 
 func TestJobExceedsDeadline_Exceeded_True(t *testing.T) {
-	old := settings.Settings.Migration.VddkJobActiveDeadline
-	t.Cleanup(func() { settings.Settings.Migration.VddkJobActiveDeadline = old })
-	settings.Settings.Migration.VddkJobActiveDeadline = 1
+	old := settings.Settings.VddkJobActiveDeadline
+	t.Cleanup(func() { settings.Settings.VddkJobActiveDeadline = old })
+	settings.Settings.VddkJobActiveDeadline = 1
 
 	past := metav1.NewTime(time.Now().Add(-10 * time.Second))
 	j := &batchv1.Job{}

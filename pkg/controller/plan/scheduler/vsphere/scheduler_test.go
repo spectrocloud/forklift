@@ -171,8 +171,8 @@ func mkPlan(useV2v bool) *api.Plan {
 	dst := &api.Provider{Spec: api.ProviderSpec{Type: &dstType, URL: ""}} // host
 
 	// referenced providers drive ShouldUseV2vForTransfer
-	p.Referenced.Provider.Source = src
-	p.Referenced.Provider.Destination = dst
+	p.Provider.Source = src
+	p.Provider.Destination = dst
 
 	// also set spec provider refs for scheduler cross-plan comparisons
 	p.Spec.Provider.Source = core.ObjectReference{Namespace: "ns", Name: "src"}
