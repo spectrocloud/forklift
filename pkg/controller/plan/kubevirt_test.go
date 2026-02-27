@@ -21,7 +21,6 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	k8smeta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -304,7 +303,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 								Status:             v1.ConditionTrue,
 								Reason:             "Ok",
 								Message:            "ready",
-								LastTransitionTime: k8smeta.Now(),
+								LastTransitionTime: metav1.Now(),
 							},
 						},
 					},
@@ -441,7 +440,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			got := &v1.Pod{}
-			Expect(kubevirt.Destination.Client.Get(
+			Expect(kubevirt.Destination.Get(
 				context.TODO(),
 				types.NamespacedName{Name: "p1", Namespace: "test"},
 				got,
@@ -474,7 +473,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 				},
 			}
 			// Create existing PVC in the fake destination.
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), existing)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), existing)).To(Succeed())
 
 			desired := []v1.PersistentVolumeClaim{
 				// This one already exists by matching "volume" label.
@@ -514,7 +513,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 
 			// Validate the new PVC exists.
 			got := &v1.PersistentVolumeClaim{}
-			Expect(kubevirt.Destination.Client.Get(
+			Expect(kubevirt.Destination.Get(
 				context.TODO(),
 				types.NamespacedName{Name: "pvc-new", Namespace: "test"},
 				got,
@@ -542,7 +541,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 					},
 				},
 			}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), existing)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), existing)).To(Succeed())
 
 			desired := []v1.PersistentVolume{
 				// matches by volume label => should be skipped
@@ -584,7 +583,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 			Expect(kubevirt.EnsurePersistentVolume(vmRef, desired)).To(Succeed())
 
 			got := &v1.PersistentVolume{}
-			Expect(kubevirt.Destination.Client.Get(
+			Expect(kubevirt.Destination.Get(
 				context.TODO(),
 				types.NamespacedName{Name: "pv-new"},
 				got,
@@ -622,8 +621,8 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 					},
 				},
 			}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), pv)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), pvc)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), pv)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), pvc)).To(Succeed())
 
 			pvs, _, err := GetOvaPvListNfs(kubevirt.Destination.Client, "plan-uid")
 			Expect(err).ToNot(HaveOccurred())
@@ -699,7 +698,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 			defer func() { settings.Settings.VirtV2vDontRequestKVM = orig }()
 
 			vs := v1beta1.VSphere
-			kubevirt.Plan.Referenced.Provider.Source = &v1beta1.Provider{Spec: v1beta1.ProviderSpec{Type: &vs}}
+			kubevirt.Plan.Provider.Source = &v1beta1.Provider{Spec: v1beta1.ProviderSpec{Type: &vs}}
 
 			ps := &v1.PodSpec{
 				Containers: []v1.Container{{}},
@@ -717,7 +716,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 			defer func() { settings.Settings.VirtV2vDontRequestKVM = orig }()
 
 			vs := v1beta1.VSphere
-			kubevirt.Plan.Referenced.Provider.Source = &v1beta1.Provider{Spec: v1beta1.ProviderSpec{Type: &vs}}
+			kubevirt.Plan.Provider.Source = &v1beta1.Provider{Spec: v1beta1.ProviderSpec{Type: &vs}}
 
 			ps := &v1.PodSpec{Containers: []v1.Container{{}}}
 			kubevirt.setKvmOnPodSpec(ps)
@@ -754,7 +753,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 			Expect(kubevirt.EnsureNamespace()).To(Succeed())
 
 			got := &v1.Namespace{}
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "test"}, got)).To(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "test"}, got)).To(Succeed())
 			Expect(got.Labels).To(HaveKeyWithValue("pod-security.kubernetes.io/enforce", "privileged"))
 			Expect(got.Labels).To(HaveKeyWithValue("pod-security.kubernetes.io/audit", "privileged"))
 			Expect(got.Labels).To(HaveKeyWithValue("pod-security.kubernetes.io/warn", "privileged"))
@@ -775,7 +774,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 					Labels:    labels,
 				},
 			}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), vm)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), vm)).To(Succeed())
 
 			list, err := kubevirt.ListVMs()
 			Expect(err).ToNot(HaveOccurred())
@@ -822,17 +821,17 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 
 			// Matching pod should be gone; other should remain.
 			gone := &v1.Pod{}
-			err = kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: match.Name, Namespace: "test"}, gone)
+			err = kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: match.Name, Namespace: "test"}, gone)
 			Expect(err).To(HaveOccurred())
 
 			still := &v1.Pod{}
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: other.Name, Namespace: "test"}, still)).To(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: other.Name, Namespace: "test"}, still)).To(Succeed())
 		})
 
 		ginkgo.It("EnsureExtraV2vConfConfigMap should copy a source configmap into destination with generated name", func() {
-			orig := settings.Settings.Migration.VirtV2vExtraConfConfigMap
-			settings.Settings.Migration.VirtV2vExtraConfConfigMap = "extra-src"
-			defer func() { settings.Settings.Migration.VirtV2vExtraConfConfigMap = orig }()
+			orig := settings.Settings.VirtV2vExtraConfConfigMap
+			settings.Settings.VirtV2vExtraConfConfigMap = "extra-src"
+			defer func() { settings.Settings.VirtV2vExtraConfConfigMap = orig }()
 
 			scheme := runtime.NewScheme()
 			_ = v1.AddToScheme(scheme)
@@ -892,28 +891,28 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 			consumerPod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "consumer", Namespace: "test", Labels: consumerLabels}}
 			conversionPod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "v2v", Namespace: "test", Labels: conversionLabels}}
 			otherPod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "test", Labels: map[string]string{"x": "y"}}}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), consumerPod)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), conversionPod)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), otherPod)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), consumerPod)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), conversionPod)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), otherPod)).To(Succeed())
 
 			Expect(kubevirt.DeletePVCConsumerPod(vm)).To(Succeed())
 			Expect(kubevirt.DeleteGuestConversionPod(vm)).To(Succeed())
 
 			// consumer/conversion deleted; other remains
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "consumer", Namespace: "test"}, &v1.Pod{})).ToNot(Succeed())
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "v2v", Namespace: "test"}, &v1.Pod{})).ToNot(Succeed())
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "other", Namespace: "test"}, &v1.Pod{})).To(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "consumer", Namespace: "test"}, &v1.Pod{})).ToNot(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "v2v", Namespace: "test"}, &v1.Pod{})).ToNot(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "other", Namespace: "test"}, &v1.Pod{})).To(Succeed())
 
 			// Hook jobs.
 			jobLabels := kubevirt.vmAllButMigrationLabels(vm.Ref)
 			job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "job1", Namespace: "test", Labels: jobLabels}}
 			otherJob := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "job2", Namespace: "test", Labels: map[string]string{"x": "y"}}}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), job)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), otherJob)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), job)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), otherJob)).To(Succeed())
 
 			Expect(kubevirt.DeleteHookJobs(vm)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "job1", Namespace: "test"}, &batchv1.Job{})).ToNot(Succeed())
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "job2", Namespace: "test"}, &batchv1.Job{})).To(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "job1", Namespace: "test"}, &batchv1.Job{})).ToNot(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "job2", Namespace: "test"}, &batchv1.Job{})).To(Succeed())
 
 			// DeleteObject should ignore NotFound.
 			missing := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "missing", Namespace: "test"}}
@@ -950,9 +949,9 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 					Labels:    map[string]string{kMigration: "other"},
 				},
 			}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), match)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), nonPrefix)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), otherMig)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), match)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), nonPrefix)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), otherMig)).To(Succeed())
 
 			pods, err := kubevirt.getPopulatorPods()
 			Expect(err).ToNot(HaveOccurred())
@@ -960,9 +959,9 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 			Expect(pods[0].Name).To(Equal(match.Name))
 
 			Expect(kubevirt.DeletePopulatorPods(vm)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: match.Name, Namespace: "test"}, &v1.Pod{})).ToNot(Succeed())
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: nonPrefix.Name, Namespace: "test"}, &v1.Pod{})).To(Succeed())
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: otherMig.Name, Namespace: "test"}, &v1.Pod{})).To(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: match.Name, Namespace: "test"}, &v1.Pod{})).ToNot(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: nonPrefix.Name, Namespace: "test"}, &v1.Pod{})).To(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: otherMig.Name, Namespace: "test"}, &v1.Pod{})).To(Succeed())
 		})
 	})
 
@@ -979,9 +978,9 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 					Labels:    labels,
 				},
 			}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), dv)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), dv)).To(Succeed())
 			Expect(kubevirt.DeleteDataVolumes(vm)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "dv-1", Namespace: "test"}, &cdi.DataVolume{})).ToNot(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "dv-1", Namespace: "test"}, &cdi.DataVolume{})).ToNot(Succeed())
 		})
 
 		ginkgo.It("DeleteJobs should delete jobs and their pods", func() {
@@ -1003,12 +1002,12 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 					Labels:    map[string]string{"job-name": "job-1"},
 				},
 			}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), job)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), pod)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), job)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), pod)).To(Succeed())
 			Expect(kubevirt.DeleteJobs(vm)).To(Succeed())
 
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "job-1", Namespace: "test"}, &batchv1.Job{})).ToNot(Succeed())
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "job-1-pod", Namespace: "test"}, &v1.Pod{})).ToNot(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "job-1", Namespace: "test"}, &batchv1.Job{})).ToNot(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "job-1-pod", Namespace: "test"}, &v1.Pod{})).ToNot(Succeed())
 		})
 
 		ginkgo.It("DeleteSecret/DeleteConfigMap/DeleteVM should delete labeled objects", func() {
@@ -1020,17 +1019,17 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 			cm := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cm1", Namespace: "test", Labels: labels}}
 			kvm := &cnv.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: "vmobj", Namespace: "test", Labels: labels}}
 
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), sec)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), cm)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), kvm)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), sec)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), cm)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), kvm)).To(Succeed())
 
 			Expect(kubevirt.DeleteSecret(vm)).To(Succeed())
 			Expect(kubevirt.DeleteConfigMap(vm)).To(Succeed())
 			Expect(kubevirt.DeleteVM(vm)).To(Succeed())
 
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "s1", Namespace: "test"}, &v1.Secret{})).ToNot(Succeed())
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "cm1", Namespace: "test"}, &v1.ConfigMap{})).ToNot(Succeed())
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "vmobj", Namespace: "test"}, &cnv.VirtualMachine{})).ToNot(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "s1", Namespace: "test"}, &v1.Secret{})).ToNot(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "cm1", Namespace: "test"}, &v1.ConfigMap{})).ToNot(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "vmobj", Namespace: "test"}, &cnv.VirtualMachine{})).ToNot(Succeed())
 		})
 
 		ginkgo.It("GetPods should list pods for the VM labels", func() {
@@ -1040,8 +1039,8 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 			labels := kubevirt.vmAllButMigrationLabels(vm.Ref)
 			p1 := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "test", Labels: labels}}
 			p2 := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p2", Namespace: "test", Labels: labels}}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), p1)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), p2)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), p1)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), p2)).To(Succeed())
 
 			list, err := kubevirt.GetPods(vm)
 			Expect(err).ToNot(HaveOccurred())
@@ -1177,8 +1176,8 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 				Parameters: []templatev1.Parameter{{Name: "NAME"}},
 				Objects:    []runtime.RawExtension{{Raw: rawVM, Object: u}},
 			}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), old)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), newer)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), old)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), newer)).To(Succeed())
 
 			vm := &planapi.VMStatus{VM: planapi.VM{Ref: ref.Ref{ID: "vm-1", Name: "myvm"}}}
 			got, ok := kubevirt.vmTemplate(vm)
@@ -1245,15 +1244,15 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 
 			// Ensure setVmLabels doesn't nil-deref on referenced providers.
 			convertDisk := true
-			kubevirt.Plan.Referenced.Provider.Source = &v1beta1.Provider{Spec: v1beta1.ProviderSpec{ConvertDisk: &convertDisk}}
-			kubevirt.Plan.Referenced.Provider.Destination = &v1beta1.Provider{}
+			kubevirt.Plan.Provider.Source = &v1beta1.Provider{Spec: v1beta1.ProviderSpec{ConvertDisk: &convertDisk}}
+			kubevirt.Plan.Provider.Destination = &v1beta1.Provider{}
 
 			// Provide source provider type (Undefined is fine, it causes preference lookup to fail and fall back to template).
 			kubevirt.Source.Provider = &v1beta1.Provider{}
 
 			lbls := map[string]string{"os.template.kubevirt.io/rhel8.1": "true"}
 			kubevirt.Builder = fakeBuilder{templateLabels: lbls}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), mkTemplate(lbls))).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), mkTemplate(lbls))).To(Succeed())
 
 			vm := &planapi.VMStatus{
 				VM: planapi.VM{Ref: ref.Ref{ID: "vm-1", Name: "orig"}},
@@ -1268,17 +1267,17 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 					Namespace: "test",
 					Labels: map[string]string{
 						"migration": string(kubevirt.Migration.UID),
-						kVM:         vm.Ref.ID,
+						kVM:         vm.ID,
 					},
 				},
 			}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), pvc)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), pvc)).To(Succeed())
 
 			Expect(kubevirt.EnsureVM(vm)).To(Succeed())
 
 			// VM created with new name and run strategy Always.
 			vmList := &cnv.VirtualMachineList{}
-			Expect(kubevirt.Destination.Client.List(context.TODO(), vmList)).To(Succeed())
+			Expect(kubevirt.Destination.List(context.TODO(), vmList)).To(Succeed())
 			Expect(vmList.Items).To(HaveLen(1))
 			Expect(vmList.Items[0].Name).To(Equal("renamed"))
 			Expect(vmList.Items[0].Spec.RunStrategy).ToNot(BeNil())
@@ -1288,7 +1287,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 
 			// PVC patched with owner ref.
 			gotPVC := &v1.PersistentVolumeClaim{}
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "pvc1", Namespace: "test"}, gotPVC)).To(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "pvc1", Namespace: "test"}, gotPVC)).To(Succeed())
 			Expect(gotPVC.OwnerReferences).To(HaveLen(1))
 			Expect(gotPVC.OwnerReferences[0].Kind).To(Equal("VirtualMachine"))
 			Expect(gotPVC.OwnerReferences[0].Name).To(Equal("renamed"))
@@ -1297,8 +1296,8 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 		ginkgo.It("EnsureVM should use existing VM if present", func() {
 			kubevirt := createKubeVirt()
 			convertDisk := false
-			kubevirt.Plan.Referenced.Provider.Source = &v1beta1.Provider{Spec: v1beta1.ProviderSpec{ConvertDisk: &convertDisk}}
-			kubevirt.Plan.Referenced.Provider.Destination = &v1beta1.Provider{}
+			kubevirt.Plan.Provider.Source = &v1beta1.Provider{Spec: v1beta1.ProviderSpec{ConvertDisk: &convertDisk}}
+			kubevirt.Plan.Provider.Destination = &v1beta1.Provider{}
 			kubevirt.Source.Provider = &v1beta1.Provider{}
 
 			vm := &planapi.VMStatus{VM: planapi.VM{Ref: ref.Ref{ID: "vm-1", Name: "n"}}}
@@ -1310,7 +1309,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 					Labels:    kubevirt.vmLabels(vm.Ref),
 				},
 			}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), existing)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), existing)).To(Succeed())
 
 			pvc := &v1.PersistentVolumeClaim{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1318,17 +1317,17 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 					Namespace: "test",
 					Labels: map[string]string{
 						"migration": string(kubevirt.Migration.UID),
-						kVM:         vm.Ref.ID,
+						kVM:         vm.ID,
 					},
 				},
 			}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), pvc)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), pvc)).To(Succeed())
 
 			Expect(kubevirt.EnsureVM(vm)).To(Succeed())
 
 			// Existing VM should remain.
 			vmList := &cnv.VirtualMachineList{}
-			Expect(kubevirt.Destination.Client.List(context.TODO(), vmList)).To(Succeed())
+			Expect(kubevirt.Destination.List(context.TODO(), vmList)).To(Succeed())
 			Expect(vmList.Items).To(HaveLen(1))
 			Expect(vmList.Items[0].Name).To(Equal("existing"))
 		})
@@ -1352,11 +1351,11 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 					UID:       types.UID("pvcuid"),
 					Labels: map[string]string{
 						"migration": string(kubevirt.Migration.UID),
-						kVM:         vm.Ref.ID,
+						kVM:         vm.ID,
 					},
 				},
 			}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), pvc)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), pvc)).To(Succeed())
 
 			// Matching populator pod (name suffix equals pvc UID) + migration label.
 			pod := &v1.Pod{
@@ -1366,12 +1365,12 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 					Labels:    map[string]string{kMigration: "miguid"},
 				},
 			}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), pod)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), pod)).To(Succeed())
 
 			Expect(kubevirt.SetPopulatorPodOwnership(vm)).To(Succeed())
 
 			got := &v1.Pod{}
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: "test"}, got)).To(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: "test"}, got)).To(Succeed())
 			Expect(got.OwnerReferences).To(HaveLen(1))
 			Expect(got.OwnerReferences[0].Kind).To(Equal("PersistentVolumeClaim"))
 			Expect(got.OwnerReferences[0].Name).To(Equal("pvc1"))
@@ -1389,7 +1388,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 					Finalizers: []string{"finalizer.example"},
 					Labels: map[string]string{
 						"migration": string(kubevirt.Migration.UID),
-						kVM:         vm.Ref.ID,
+						kVM:         vm.ID,
 					},
 				},
 			}
@@ -1399,14 +1398,14 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 					Namespace: "test",
 				},
 			}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), pvc)).To(Succeed())
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), prime)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), pvc)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), prime)).To(Succeed())
 
 			Expect(kubevirt.DeletePopulatedPVCs(vm)).To(Succeed())
 
 			// Both should be deleted.
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "prime-pvcuid", Namespace: "test"}, &v1.PersistentVolumeClaim{})).ToNot(Succeed())
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: "pvc1", Namespace: "test"}, &v1.PersistentVolumeClaim{})).ToNot(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "prime-pvcuid", Namespace: "test"}, &v1.PersistentVolumeClaim{})).ToNot(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "pvc1", Namespace: "test"}, &v1.PersistentVolumeClaim{})).ToNot(Succeed())
 		})
 	})
 
@@ -1440,7 +1439,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 			Expect(cm).To(BeNil())
 
 			obj := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "present", Namespace: "test"}}
-			Expect(kubevirt.Destination.Client.Create(context.TODO(), obj)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), obj)).To(Succeed())
 			cm, exists, err = kubevirt.findConfigMapInNamespace("present", "test")
 			Expect(err).ToNot(HaveOccurred())
 			Expect(exists).To(BeTrue())
@@ -1488,7 +1487,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 			Expect(sec2.Name).To(Equal(sec.Name))
 
 			got := &v1.Secret{}
-			Expect(kubevirt.Destination.Client.Get(context.TODO(), types.NamespacedName{Name: sec.Name, Namespace: "test"}, got)).To(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: sec.Name, Namespace: "test"}, got)).To(Succeed())
 			Expect(got.StringData).To(HaveKeyWithValue("a", "2"))
 			Expect(got.StringData).To(HaveKeyWithValue("b", "3"))
 		})
@@ -1582,7 +1581,7 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 			kubevirt.Source.Provider = &v1beta1.Provider{Spec: v1beta1.ProviderSpec{Type: &t}}
 
 			// Enable extra config map mount.
-			settings.Settings.Migration.VirtV2vExtraConfConfigMap = "something"
+			settings.Settings.VirtV2vExtraConfConfigMap = "something"
 
 			block := v1.PersistentVolumeBlock
 			fs := v1.PersistentVolumeFilesystem

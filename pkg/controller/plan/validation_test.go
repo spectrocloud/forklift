@@ -84,8 +84,8 @@ var _ = ginkgo.Describe("Plan Validations", func() {
 			source := createProvider(sourceName, sourceNamespace, "https://source", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
 			destination := createProvider(destName, destNamespace, "", api.OpenShift, &core.ObjectReference{})
 			plan := createPlan(testPlanName, testNamespace, source, destination)
-		source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
-		destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+		source.Status.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+		destination.Status.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
 
 		reconciler = createFakeReconciler(secret, plan, source, destination)
 		err := reconciler.ensureSecretForProvider(plan)
@@ -100,8 +100,8 @@ var _ = ginkgo.Describe("Plan Validations", func() {
 		source := createProvider(sourceName, sourceNamespace, "", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
 		destination := createProvider(destName, destNamespace, "https://destination", api.OpenShift, &core.ObjectReference{})
 		plan := createPlan(testPlanName, testNamespace, source, destination)
-		source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
-		destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+		source.Status.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+		destination.Status.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
 
 			reconciler = createFakeReconciler(secret, plan, source, destination)
 			err := reconciler.ensureSecretForProvider(plan)
@@ -137,7 +137,7 @@ var _ = ginkgo.Describe("Plan Validations", func() {
 				}
 
 				hasInvalidCondition := false
-				for _, cond := range plan.Status.Conditions.List {
+				for _, cond := range plan.Status.List {
 					if cond.Type == NotValid {
 						hasInvalidCondition = true
 						break

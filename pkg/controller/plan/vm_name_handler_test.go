@@ -131,7 +131,7 @@ func TestGenerateRandVmNameSuffix_Charset(t *testing.T) {
 	got := generateRandVmNameSuffix()
 	for i := 0; i < len(got); i++ {
 		c := got[i]
-		if !(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
 			t.Fatalf("unexpected char %q in %q", c, got)
 		}
 	}

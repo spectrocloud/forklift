@@ -291,7 +291,7 @@ var _ = Describe("OpenStack Glance const test", func() {
 func createBuilder(objs ...runtime.Object) *Builder {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
-	v1beta1.SchemeBuilder.AddToScheme(scheme)
+	_ = v1beta1.SchemeBuilder.AddToScheme(scheme)
 	_ = cdi.AddToScheme(scheme)
 
 	cl := fake.NewClientBuilder().
@@ -341,7 +341,7 @@ var _ = Describe("OpenStack builder storage helpers", func() {
 	Describe("getStorageClassName", func() {
 		It("should return storage class by volumeType ID", func() {
 			b := createBuilder()
-			b.Context.Map.Storage.Spec.Map = []v1beta1.StoragePair{
+			b.Map.Storage.Spec.Map = []v1beta1.StoragePair{
 				{Source: refapi.Ref{ID: "vtid"}, Destination: v1beta1.DestinationStorage{StorageClass: "sc1"}},
 			}
 			w := &model.Workload{}
@@ -355,7 +355,7 @@ var _ = Describe("OpenStack builder storage helpers", func() {
 
 		It("should return storage class by volumeType name mapping", func() {
 			b := createBuilder()
-			b.Context.Map.Storage.Spec.Map = []v1beta1.StoragePair{
+			b.Map.Storage.Spec.Map = []v1beta1.StoragePair{
 				{Source: refapi.Ref{Name: "fast"}, Destination: v1beta1.DestinationStorage{StorageClass: "sc2"}},
 			}
 			w := &model.Workload{}
