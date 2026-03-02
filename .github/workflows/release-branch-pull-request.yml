@@ -29,8 +29,8 @@ jobs:
           - name: Setup Golang
             uses: actions/setup-go@v4
             with:
-              # NOTE: Keep the version in sync with Go toolchain in WORKSPACE.
-              go-version: '1.23.6'
+              # NOTE: Keep the version in sync with Go toolchain in go.mod.
+              go-version: '1.24.13'
     
           # Setup the run environment and run CI test suite
           - name: Go build

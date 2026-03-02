@@ -46,3 +46,5 @@ __pycache__
 # ignore intermediate manifests
 operator/streams/**/upstream_manifests
 operator/streams/**/downstream_manifests
+
+forklift.code-workspace
