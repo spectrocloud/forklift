@@ -47,4 +47,3 @@ __pycache__
 operator/streams/**/upstream_manifests
 operator/streams/**/downstream_manifests
 
-forklift.code-workspace
