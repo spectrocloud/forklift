@@ -1,8 +1,8 @@
 module github.com/konveyor/forklift-controller
 
-go 1.23.8
+go 1.25
 
-toolchain go1.24.6
+toolchain go1.25.7
 
 require (
 	github.com/gin-contrib/cors v1.3.1
