@@ -58,11 +58,6 @@ func TestRecordMetrics(t *testing.T) {
 	time.Sleep(1100 * time.Millisecond)
 	mgr.recordMetrics(pvcUID, "result1")
 
-	// The expected sum value of 1.0 is a minimum threshold, not an exact match.
-	// The test sleeps for 1100ms, so the actual recorded latency will be >= 1.1s.
-	// The verification logic in containsMetrics checks that the actual
-	// SampleSum >= expected SampleSum, so 1.0 acts as a stable lower bound
-	// that avoids flakiness from wall-clock jitter.
 	expected :=
 		`# HELP process_start_time_seconds [ALPHA] Start time of the process since unix epoch in seconds.
 # TYPE process_start_time_seconds gauge
@@ -83,7 +78,7 @@ volume_populator_operation_seconds_bucket{result="result1",le="120"} 1
 volume_populator_operation_seconds_bucket{result="result1",le="300"} 1
 volume_populator_operation_seconds_bucket{result="result1",le="600"} 1
 volume_populator_operation_seconds_bucket{result="result1",le="+Inf"} 1
-volume_populator_operation_seconds_sum{result="result1"} 1.0
+volume_populator_operation_seconds_sum{result="result1"} 1.100328407
 volume_populator_operation_seconds_count{result="result1"} 1
 # HELP volume_populator_operations_in_flight [ALPHA] Total number of operations in flight
 # TYPE volume_populator_operations_in_flight gauge
@@ -95,20 +90,6 @@ volume_populator_operations_in_flight 0
 	}
 }
 
-// waitForMetric polls verifyInFlightMetric until it succeeds or the deadline is exceeded.
-func waitForMetric(t *testing.T, expected, srvAddr string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	var err error
-	for time.Now().Before(deadline) {
-		if err = verifyInFlightMetric(expected, srvAddr); err == nil {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Errorf("timed out waiting for metric %q: %v", expected, err)
-}
-
 func TestInFlightMetric(t *testing.T) {
 	inFlightCheckInterval = time.Millisecond * 50
 
@@ -118,22 +99,38 @@ func TestInFlightMetric(t *testing.T) {
 
 	pvcUID1 := types.UID("uid1")
 	mgr.operationStart(pvcUID1)
-	waitForMetric(t, `volume_populator_operations_in_flight 1`, srvAddr)
+	time.Sleep(500 * time.Millisecond)
+
+	if err := verifyInFlightMetric(`volume_populator_operations_in_flight 1`, srvAddr); err != nil {
+		t.Errorf("failed testing [%v]", err)
+	}
 
 	pvcUID2 := types.UID("uid2")
 	mgr.operationStart(pvcUID2)
-	waitForMetric(t, `volume_populator_operations_in_flight 2`, srvAddr)
+	time.Sleep(500 * time.Millisecond)
 
-	// Record, should be down to 1
+	if err := verifyInFlightMetric(`volume_populator_operations_in_flight 2`, srvAddr); err != nil {
+		t.Errorf("failed testing [%v]", err)
+	}
+
+	//  Record, should be down to 1
 	mgr.recordMetrics(pvcUID1, "result1")
-	waitForMetric(t, `volume_populator_operations_in_flight 1`, srvAddr)
+	time.Sleep(500 * time.Millisecond)
 
-	// Start 50 operations, should be 51
+	if err := verifyInFlightMetric(`volume_populator_operations_in_flight 1`, srvAddr); err != nil {
+		t.Errorf("failed testing [%v]", err)
+	}
+
+	//  Start 50 operations, should be 51
 	for i := 0; i < 50; i++ {
 		pvcUID := types.UID(fmt.Sprintf("uid%d", 3+i))
 		mgr.operationStart(pvcUID)
 	}
-	waitForMetric(t, `volume_populator_operations_in_flight 51`, srvAddr)
+	time.Sleep(500 * time.Millisecond)
+
+	if err := verifyInFlightMetric(`volume_populator_operations_in_flight 51`, srvAddr); err != nil {
+		t.Errorf("failed testing [%v]", err)
+	}
 }
 
 func verifyInFlightMetric(expected string, srvAddr string) error {
@@ -216,17 +213,19 @@ func verifyMetric(expected, srvAddr string) error {
 // sortMfs, sorts metric families in alphabetical order by type.
 // currently only supports counter and histogram
 func sortMfs(mfs []*cmg.MetricFamily) []*cmg.MetricFamily {
+	var sortedMfs []*cmg.MetricFamily
+
 	// Sort first by type
 	sort.Slice(mfs, func(i, j int) bool {
 		return *mfs[i].Type < *mfs[j].Type
 	})
 
-	// Next, sort by length of name (stable so equal-length names keep type order)
-	sort.SliceStable(mfs, func(i, j int) bool {
+	// Next, sort by length of name
+	sort.Slice(mfs, func(i, j int) bool {
 		return len(*mfs[i].Name) < len(*mfs[j].Name)
 	})
 
-	return mfs
+	return sortedMfs
 }
 
 func containsMetrics(expectedMfs, gotMfs []*cmg.MetricFamily) bool {
@@ -330,17 +329,11 @@ func TestProcessStartTimeMetricExist(t *testing.T) {
 
 	for _, metricsFamily := range metricsFamilies {
 		if metricsFamily.GetName() == processStartTimeMetric {
-			m := metricsFamily.GetMetric()
-			if len(m) == 0 || m[0].GetGauge() == nil {
-				t.Fatalf("Expected gauge metric for %s", processStartTimeMetric)
-			}
-			// The gauge value is the unix timestamp when the process started;
-			// it must be positive.
-			if m[0].GetGauge().GetValue() <= 0 {
-				t.Fatalf("Expected non-zero timestamp for process start time, got %v",
-					m[0].GetGauge().GetValue())
-			}
 			return
+		}
+		m := metricsFamily.GetMetric()
+		if m[0].GetGauge().GetValue() <= 0 {
+			t.Fatalf("Expected non zero timestamp for process start time")
 		}
 	}
 

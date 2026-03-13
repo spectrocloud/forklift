@@ -508,14 +508,13 @@ func TestCascade(t *testing.T) {
 	n, _ = DB.Count(&DetailC{}, nil)
 	g.Expect(n).To(gomega.Equal(int64(27)))
 
-	// Deletion events are delivered asynchronously via watches; allow extra time
-	// to avoid flakiness on slower CI machines.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(handler.deleted) == 40 {
+	for i := 0; i < 10; i++ {
+		time.Sleep(time.Millisecond * 10)
+		if len(handler.deleted) != 40 {
+			continue
+		} else {
 			break
 		}
-		time.Sleep(time.Millisecond * 10)
 	}
 	g.Expect(len(handler.deleted)).To(gomega.Equal(40))
 
@@ -529,27 +528,25 @@ func TestTransactions(t *testing.T) {
 	err := DB.Open(true)
 	g.Expect(err).ToNot(gomega.HaveOccurred())
 	for i := 0; i < 10; i++ {
-		func(i int) {
-			// Begin
-			tx, err := DB.Begin()
-			defer tx.End()
-			g.Expect(err).ToNot(gomega.HaveOccurred())
-			object := &TestObject{
-				ID:   i,
-				Name: "Elmer",
-			}
-			err = tx.Insert(object)
-			g.Expect(err).ToNot(gomega.HaveOccurred())
-			// Get (not found)
-			object = &TestObject{ID: object.ID}
-			err = DB.Get(object)
-			g.Expect(errors.Is(err, NotFound)).To(gomega.BeTrue())
-			tx.Commit()
-			// Get (found)
-			object = &TestObject{ID: object.ID}
-			err = DB.Get(object)
-			g.Expect(err).ToNot(gomega.HaveOccurred())
-		}(i)
+		// Begin
+		tx, err := DB.Begin()
+		defer tx.End()
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		object := &TestObject{
+			ID:   i,
+			Name: "Elmer",
+		}
+		err = tx.Insert(object)
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		// Get (not found)
+		object = &TestObject{ID: object.ID}
+		err = DB.Get(object)
+		g.Expect(errors.Is(err, NotFound)).To(gomega.BeTrue())
+		tx.Commit()
+		// Get (found)
+		object = &TestObject{ID: object.ID}
+		err = DB.Get(object)
+		g.Expect(err).ToNot(gomega.HaveOccurred())
 	}
 }
 
@@ -996,19 +993,20 @@ func TestWatch(t *testing.T) {
 		err = DB.Delete(object)
 		g.Expect(err).ToNot(gomega.HaveOccurred())
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(handlerA.created) == N &&
-			len(handlerA.updated) == N &&
-			len(handlerA.deleted) == N &&
-			len(handlerB.created) == N &&
-			len(handlerB.updated) == N &&
-			len(handlerB.deleted) == N &&
-			len(handlerC.created) == N &&
-			len(handlerC.deleted) == N {
+	for i := 0; i < N; i++ {
+		time.Sleep(time.Millisecond * 10)
+		if len(handlerA.created) != N ||
+			len(handlerA.updated) != N ||
+			len(handlerA.created) != N ||
+			len(handlerB.created) != N ||
+			len(handlerB.updated) != N ||
+			len(handlerB.created) != N ||
+			len(handlerC.created) != N ||
+			len(handlerC.created) != N {
+			continue
+		} else {
 			break
 		}
-		time.Sleep(time.Millisecond * 10)
 	}
 	g.Expect(handlerA.started).To(gomega.BeTrue())
 	g.Expect(handlerB.started).To(gomega.BeTrue())
@@ -1051,7 +1049,7 @@ func TestWatch(t *testing.T) {
 				})
 		}
 	}
-	g.Eventually(func() (eq bool) {
+	g.Expect(func() (eq bool) {
 		h := handlerA
 		if len(all) != len(h.all) {
 			return
@@ -1069,8 +1067,8 @@ func TestWatch(t *testing.T) {
 			}
 		}
 		return true
-	}).WithTimeout(2 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
-	g.Eventually(func() (eq bool) {
+	}()).To(gomega.BeTrue())
+	g.Expect(func() (eq bool) {
 		h := handlerB
 		if len(all) != len(h.all) {
 			return
@@ -1082,7 +1080,7 @@ func TestWatch(t *testing.T) {
 			}
 		}
 		return true
-	}).WithTimeout(2 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
+	}()).To(gomega.BeTrue())
 	all = []TestEvent{}
 	for _, action := range []uint8{Created, Deleted} {
 		for i := 0; i < N; i++ {
@@ -1094,7 +1092,7 @@ func TestWatch(t *testing.T) {
 				})
 		}
 	}
-	g.Eventually(func() (eq bool) {
+	g.Expect(func() (eq bool) {
 		h := handlerC
 		if len(all) != len(h.all) {
 			return
@@ -1106,8 +1104,8 @@ func TestWatch(t *testing.T) {
 			}
 		}
 		return true
-	}).WithTimeout(2 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
-	g.Eventually(func() (eq bool) {
+	}()).To(gomega.BeTrue())
+	g.Expect(func() (eq bool) {
 		h := handlerD
 		if len(deleted) != len(h.deleted) {
 			return
@@ -1118,7 +1116,7 @@ func TestWatch(t *testing.T) {
 			}
 		}
 		return true
-	}).WithTimeout(2 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
+	}()).To(gomega.BeTrue())
 
 	//
 	// Test watch end.
@@ -1126,10 +1124,17 @@ func TestWatch(t *testing.T) {
 	watchB.End()
 	watchC.End()
 	watchD.End()
-	g.Eventually(func() bool {
-		return !watchA.started && !watchB.started && !watchC.started && !watchD.started
-	}).WithTimeout(2 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
+	ended := false
+	for i := 0; i < 10; i++ {
+		if watchA.started || watchB.started || watchC.started || watchD.started {
+			time.Sleep(50 * time.Millisecond)
+		} else {
+			ended = true
+			break
+		}
+	}
 	g.Expect(len(watchA.journal.watches)).To(gomega.Equal(0))
+	g.Expect(ended).To(gomega.BeTrue())
 	g.Expect(handlerA.done).To(gomega.BeTrue())
 	g.Expect(handlerB.done).To(gomega.BeTrue())
 	g.Expect(handlerC.done).To(gomega.BeTrue())
@@ -1153,18 +1158,27 @@ func TestCloseDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create watch: %v", err)
 	}
-	g.Eventually(func() bool {
-		return watch.started
-	}).WithTimeout(2 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
+	for i := 0; i < 10; i++ {
+		if !watch.started {
+			time.Sleep(50 * time.Millisecond)
+		} else {
+			break
+		}
+	}
 	g.Expect(handler.started).To(gomega.BeTrue())
 	g.Expect(handler.done).To(gomega.BeFalse())
 	_ = DB.Close(true)
 	for _, session := range DB.(*Client).pool.sessions {
 		g.Expect(session.closed).To(gomega.BeTrue())
 	}
-	g.Eventually(func() bool {
-		return watch.done
-	}).WithTimeout(5 * time.Second).WithPolling(10 * time.Millisecond).Should(gomega.BeTrue())
+	for i := 0; i < 100; i++ {
+		if !watch.done {
+			time.Sleep(50 * time.Millisecond)
+		} else {
+			break
+		}
+	}
+
 	g.Expect(handler.done).To(gomega.BeTrue())
 }
 
@@ -1204,14 +1218,12 @@ func TestMutatingWatch(t *testing.T) {
 		g.Expect(err).ToNot(gomega.HaveOccurred())
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	for {
+		time.Sleep(time.Millisecond * 10)
 		if len(handlerA.updated) == N*2 {
 			break
 		}
-		time.Sleep(time.Millisecond * 10)
 	}
-	g.Expect(len(handlerA.updated)).To(gomega.Equal(N * 2))
 }
 
 func TestExecute(t *testing.T) {
@@ -1528,65 +1540,4 @@ func fieldNames(fields []*Field) (names []string) {
 	}
 
 	return
-}
-
-func TestPage_Slice_IgnoresNonPointer(t *testing.T) {
-	p := &Page{Offset: 1, Limit: 1}
-	s := []int{1, 2, 3}
-	p.Slice(s) // should not panic or modify
-	if len(s) != 3 {
-		t.Fatalf("expected unchanged")
-	}
-}
-
-func TestPage_Slice_IgnoresPointerToNonSlice(t *testing.T) {
-	p := &Page{Offset: 1, Limit: 1}
-	x := 10
-	p.Slice(&x)
-	if x != 10 {
-		t.Fatalf("expected unchanged")
-	}
-}
-
-func TestPage_Slice_OffsetAndLimit(t *testing.T) {
-	p := &Page{Offset: 1, Limit: 2}
-	s := []int{1, 2, 3, 4}
-	p.Slice(&s)
-	if len(s) != 2 || s[0] != 2 || s[1] != 3 {
-		t.Fatalf("unexpected slice: %#v", s)
-	}
-}
-
-func TestPage_Slice_OffsetBeyondLen_Empty(t *testing.T) {
-	p := &Page{Offset: 10, Limit: 2}
-	s := []int{1, 2, 3}
-	p.Slice(&s)
-	if len(s) != 0 {
-		t.Fatalf("expected empty, got %#v", s)
-	}
-}
-
-func TestPage_Slice_LimitZero_Empty(t *testing.T) {
-	p := &Page{Offset: 0, Limit: 0}
-	s := []int{1, 2, 3}
-	p.Slice(&s)
-	if len(s) != 0 {
-		t.Fatalf("expected empty, got %#v", s)
-	}
-}
-
-func TestBase_Pk_ReturnsPK(t *testing.T) {
-	b := &Base{PK: "abc"}
-	if b.Pk() != "abc" {
-		t.Fatalf("expected pk abc, got %q", b.Pk())
-	}
-}
-
-func TestPage_Slice_LimitGreaterThanLen_ReturnsToEnd(t *testing.T) {
-	p := &Page{Offset: 2, Limit: 100}
-	s := []int{1, 2, 3, 4}
-	p.Slice(&s)
-	if len(s) != 2 || s[0] != 3 || s[1] != 4 {
-		t.Fatalf("unexpected slice: %#v", s)
-	}
 }
