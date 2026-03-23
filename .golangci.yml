@@ -1,15 +1,4 @@
-issues:
-  exclude-dirs:
-    - vendor
-    - pkg/lib/gob
-linters:
-  enable:
-  - ginkgolinter
-  - nilerr
-  - nilnil
-  - bodyclose
-  - gofmt
-  - goimports
-linters-settings:
-  ginkgolinter:
-    forbid-focus-container: true
+version: "2"
+
+run:
+  timeout: 10m

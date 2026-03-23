@@ -89,13 +89,18 @@ UI_PLUGIN_IMAGE ?= quay.io/kubev2v/forklift-console-plugin:latest
 GOLANGCI_LINT_VERSION ?= v1.64.2
 GOLANGCI_LINT_BIN ?= $(GOBIN)/golangci-lint
 
+# Directory for CI/Sonar coverage artifacts.
+COVER_DIR ?= _build/cov
+
 ci: all tidy vendor generate-verify lint
 
 all: test forklift-controller
 
-# Run tests
+# Run tests; keep target dependencies close to upstream to minimize upgrade delta.
 test: generate fmt vet manifests validation-test
 	go test -coverprofile=cover.out ./pkg/... ./cmd/...
+	@mkdir -p "$(COVER_DIR)" && cp -f cover.out "$(COVER_DIR)/coverage.out"
+	@echo "Coverage copied to $(COVER_DIR)/coverage.out"
 
 # Experimental e2e target
 e2e-sanity: e2e-sanity-ovirt e2e-sanity-vsphere
