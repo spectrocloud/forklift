@@ -341,7 +341,17 @@ func (r *Collector) Follow(moRef interface{}, p []string, dst interface{}) error
 	if err != nil {
 		return err
 	}
-	defer client.CloseIdleConnections()
+	defer func() {
+		// PVM-113: every Login here must be paired with a Logout, otherwise
+		// each Follow call leaks a vCenter session for the lifetime of the
+		// inventory web API.
+		if logoutErr := client.Logout(context.Background()); logoutErr != nil {
+			r.log.V(1).Info(
+				"vsphere logout (Follow) failed",
+				"err", logoutErr)
+		}
+		client.CloseIdleConnections()
+	}()
 	return client.RetrieveOne(ctx, ref, p, dst)
 }
 
@@ -350,11 +360,8 @@ func (r *Collector) Test() (status int, err error) {
 	ctx := context.Background()
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	defer r.close()
 	status, err = r.connect(ctx)
-	if err == nil {
-		r.close()
-	}
-
 	return
 }
 
@@ -569,14 +576,14 @@ func (r *Collector) watch() (list []*libmodel.Watch) {
 // Build the client.
 func (r *Collector) connect(ctx context.Context) (status int, err error) {
 	r.close()
-	r.client, err = r.buildClient(ctx)
+	client, err := r.buildClient(ctx)
 	if err != nil {
 		if strings.Contains(err.Error(), "incorrect") && strings.Contains(err.Error(), "password") {
 			return http.StatusUnauthorized, err
 		}
 		return
 	}
-
+	r.client = client
 	return http.StatusOK, nil
 }
 
@@ -610,9 +617,16 @@ func (r *Collector) buildClient(ctx context.Context) (*govmomi.Client, error) {
 		SessionManager: session.NewManager(vimClient),
 		Client:         vimClient,
 	}
-	err = client.Login(ctx, url.User)
-	return client, err
-
+	if err = client.Login(ctx, url.User); err != nil {
+		// PVM-113: mirror govmomi.NewClient — on Login failure, best-effort
+		// Logout (in case a partial session was established) and release the
+		// underlying TCP/TLS keep-alive sockets, then return a nil client so
+		// callers cannot accidentally reference a half-built one.
+		_ = client.Logout(context.Background())
+		client.CloseIdleConnections()
+		return nil, err
+	}
+	return client, nil
 }
 
 // Close connections.
