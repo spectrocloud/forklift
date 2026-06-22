@@ -229,20 +229,26 @@
             plugins: "{{ console_plugins + [ui_plugin_console_name] }}"
       when: ui_plugin_console_name not in console_plugins
 
-  - name: "Create controller service-account token Secret for download vddk tar"
-    k8s:
-      state: present
-      definition: "{{ lookup('template', 'controller/secret-forklift-controller-token.yml.j2') }}"
+  # The VDDK image is built in-cluster using OpenShift BuildConfig/ImageStream
+  # (build.openshift.io, image.openshift.io), which do not exist on plain
+  # Kubernetes. Skip on non-OpenShift clusters, where VDDK is supplied via the
+  # vddk_image (VDDK_IMAGE) path instead.
+  - when: not k8s_cluster|bool
+    block:
+    - name: "Create controller service-account token Secret for download vddk tar"
+      k8s:
+        state: present
+        definition: "{{ lookup('template', 'controller/secret-forklift-controller-token.yml.j2') }}"
 
-  - name: "Create VDDK BuildConfig"
-    k8s:
-      state: present
-      definition: "{{ lookup('template', 'controller/buildconfig-vddk.yml.j2') }}"
+    - name: "Create VDDK BuildConfig"
+      k8s:
+        state: present
+        definition: "{{ lookup('template', 'controller/buildconfig-vddk.yml.j2') }}"
 
-  - name: "Create VDDK ImageStream"
-    k8s:
-      state: present
-      definition: "{{ lookup('template', 'controller/imagestream-vddk.yml.j2') }}"
+    - name: "Create VDDK ImageStream"
+      k8s:
+        state: present
+        definition: "{{ lookup('template', 'controller/imagestream-vddk.yml.j2') }}"
 
   - when: not feature_ui_plugin|bool
     name: "Cleanup {{ ui_plugin_service_name }} if disabled"
