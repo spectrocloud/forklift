@@ -1,0 +1,15 @@
+{
+  "repoOwner": "spectrocloud",
+  "repoName": "forklift",
+  "editor": "code",
+
+  "targetBranchChoices": ["rc-4.9", "spectro-rc-4.8", "spectro-rc-4.7"],
+  "mainline": 1,
+  "autoMerge": false,
+  "autoMergeMethod": "squash",
+  "targetPRLabels": ["ok-to-test"],
+  "commitConflicts": true,
+  "branchLabelMapping": {
+    "^backport-(.+)$": "$1"
+  }
+}
