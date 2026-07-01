@@ -1,0 +1,16 @@
+{
+  "repoOwner": "spectrocloud",
+  "repoName": "forklift",
+  "targetBranchChoices": ["main", "rc-4.5", "rc-4.7", "rc-4.9"],
+  "targetPRLabels": ["ok-to-test"],
+  "sourcePRLabels": ["was-backported"],
+  "conflictResolution": "commit",
+  "autoMerge": false,
+  "autoMergeMethod": "squash",
+  "publishStatusCommentOnFailure": true,
+  "publishStatusCommentOnAbort": true,
+  "branchLabelMapping": {
+    "^backport-to-(.+)$": "$1",
+    "^backport-(.+)$": "$1"
+  }
+}
