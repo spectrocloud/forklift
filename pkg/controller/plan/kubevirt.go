@@ -984,30 +984,59 @@ func (r *KubeVirt) EnsureGuestConversionPod(vm *plan.VMStatus, vmCr *VirtualMach
 		return
 	}
 
-	list, err := r.GetPodsWithLabels(r.conversionLabels(vm.Ref, true))
+	needNew, err := r.reserveConversionPodSlot(vm)
 	if err != nil {
 		return
 	}
-
-	pod := &core.Pod{}
-	if len(list.Items) == 0 {
-		pod = newPod
-		err = r.Destination.Client.Create(context.TODO(), pod)
-		if err != nil {
-			err = liberr.Wrap(err)
-			return
-		}
-		r.Log.Info(
-			"Created virt-v2v pod.",
-			"pod",
-			path.Join(
-				pod.Namespace,
-				pod.Name),
-			"vm",
-			vm.String())
+	if !needNew {
+		return
 	}
 
+	pod := newPod
+	err = r.Destination.Client.Create(context.TODO(), pod)
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+	r.Log.Info(
+		"Created virt-v2v pod.",
+		"pod",
+		path.Join(
+			pod.Namespace,
+			pod.Name),
+		"vm",
+		vm.String())
+
 	return
+}
+
+// reserveConversionPodSlot decides whether a new virt-v2v pod must be created
+// for the current migration attempt. If a pod already exists for THIS
+// migration (matched by migration label), no new pod is needed. Otherwise any
+// stale conversion pods left over from previous migration attempts for the
+// same plan+VM are deleted so that a fresh pod can be created with the
+// current plan spec (e.g. picking up a newly-added spec.vms[].luks.name and
+// mounting the LUKS secret at /etc/luks).
+func (r *KubeVirt) reserveConversionPodSlot(vm *plan.VMStatus) (needNew bool, err error) {
+	currentList, err := r.GetPodsWithLabels(r.conversionLabels(vm.Ref, false))
+	if err != nil {
+		return
+	}
+	if len(currentList.Items) > 0 {
+		return false, nil
+	}
+
+	staleList, err := r.GetPodsWithLabels(r.conversionLabels(vm.Ref, true))
+	if err != nil {
+		return
+	}
+	for i := range staleList.Items {
+		stale := &staleList.Items[i]
+		if err = r.DeleteObject(stale, vm, "Deleted stale guest conversion pod.", "pod"); err != nil {
+			return
+		}
+	}
+	return true, nil
 }
 
 func (r *KubeVirt) EnsureOVAVirtV2VPVCStatus(vmID string) (ready bool, err error) {

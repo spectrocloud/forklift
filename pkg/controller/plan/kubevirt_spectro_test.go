@@ -919,6 +919,79 @@ var _ = ginkgo.Describe("kubevirt tests", func() {
 			Expect(kubevirt.DeleteObject(missing, vm, "x", "cm")).To(Succeed())
 		})
 
+		ginkgo.It("reserveConversionPodSlot should delete stale conversion pods from prior migrations and request a new one (PEM-9121)", func() {
+			kubevirt := createKubeVirtSpectro()
+			vm := &planapi.VMStatus{VM: planapi.VM{Ref: ref.Ref{ID: "vm-1", Name: "vm1"}}}
+
+			// Simulate a virt-v2v pod left over from a PREVIOUS migration
+			// attempt (different migration UID) that was created before the
+			// user added spec.vms[].luks.name to the plan — so it has the
+			// plan+VM labels but a stale migration label and no LUKS mount.
+			currentLabels := kubevirt.conversionLabels(vm.Ref, false)
+			staleLabels := map[string]string{}
+			for k, v := range currentLabels {
+				staleLabels[k] = v
+			}
+			staleLabels[kMigration] = "previous-migration"
+			stalePod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "stale-v2v",
+					Namespace: "test",
+					Labels:    staleLabels,
+				},
+				Status: v1.PodStatus{Phase: v1.PodFailed},
+			}
+			// Unrelated pod for a different VM must NOT be touched.
+			otherVMLabels := kubevirt.conversionLabels(ref.Ref{ID: "vm-2"}, false)
+			otherPod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "other-vm-v2v",
+					Namespace: "test",
+					Labels:    otherVMLabels,
+				},
+			}
+			Expect(kubevirt.Destination.Create(context.TODO(), stalePod)).To(Succeed())
+			Expect(kubevirt.Destination.Create(context.TODO(), otherPod)).To(Succeed())
+
+			needNew, err := kubevirt.reserveConversionPodSlot(vm)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(needNew).To(BeTrue())
+
+			// Stale pod for this VM is gone; other VM's pod is untouched.
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "stale-v2v", Namespace: "test"}, &v1.Pod{})).ToNot(Succeed())
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "other-vm-v2v", Namespace: "test"}, &v1.Pod{})).To(Succeed())
+		})
+
+		ginkgo.It("reserveConversionPodSlot should be a no-op when a pod already exists for the current migration", func() {
+			kubevirt := createKubeVirtSpectro()
+			vm := &planapi.VMStatus{VM: planapi.VM{Ref: ref.Ref{ID: "vm-1", Name: "vm1"}}}
+
+			currentPod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "current-v2v",
+					Namespace: "test",
+					Labels:    kubevirt.conversionLabels(vm.Ref, false),
+				},
+			}
+			Expect(kubevirt.Destination.Create(context.TODO(), currentPod)).To(Succeed())
+
+			needNew, err := kubevirt.reserveConversionPodSlot(vm)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(needNew).To(BeFalse())
+
+			// Existing pod for the current migration must survive.
+			Expect(kubevirt.Destination.Get(context.TODO(), types.NamespacedName{Name: "current-v2v", Namespace: "test"}, &v1.Pod{})).To(Succeed())
+		})
+
+		ginkgo.It("reserveConversionPodSlot should request a new pod when no conversion pod exists at all", func() {
+			kubevirt := createKubeVirtSpectro()
+			vm := &planapi.VMStatus{VM: planapi.VM{Ref: ref.Ref{ID: "vm-1", Name: "vm1"}}}
+
+			needNew, err := kubevirt.reserveConversionPodSlot(vm)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(needNew).To(BeTrue())
+		})
+
 		ginkgo.It("getPopulatorPods/DeletePopulatorPods should filter by migration label and prefix", func() {
 			kubevirt := createKubeVirtSpectro()
 			vm := &planapi.VMStatus{VM: planapi.VM{Ref: ref.Ref{ID: "vm-1"}}}
