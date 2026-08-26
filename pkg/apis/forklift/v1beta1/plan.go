@@ -536,6 +536,10 @@ func (r *Plan) IsSourceProviderOCP() bool {
 
 func (r *Plan) IsSourceProviderVSphere() bool { return r.Provider.Source.Type() == VSphere }
 
+func (r *Plan) IsSourceProviderOVA() bool {
+	return r.Provider.Source.Type() == Ova
+}
+
 func (r *Plan) ShouldRunPreflightInspection() bool {
 	return r.IsSourceProviderVSphere() &&
 		r.IsWarm() &&
