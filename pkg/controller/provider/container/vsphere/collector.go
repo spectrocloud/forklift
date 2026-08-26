@@ -359,7 +359,14 @@ func (r *Collector) Follow(moRef interface{}, p []string, dst interface{}) error
 	if err != nil {
 		return err
 	}
-	defer client.CloseIdleConnections()
+	defer func() {
+		// Every Login here must be paired with a Logout, otherwise each Follow
+		// call leaks a vCenter session for the lifetime of the inventory API.
+		if logoutErr := client.Logout(context.Background()); logoutErr != nil {
+			r.log.V(1).Info("vsphere logout (Follow) failed", "err", logoutErr)
+		}
+		client.CloseIdleConnections()
+	}()
 	return client.RetrieveOne(ctx, ref, p, dst)
 }
 
@@ -368,11 +375,9 @@ func (r *Collector) Test() (status int, err error) {
 	ctx := context.Background()
 	ctx, cancel := context.WithTimeout(ctx, ConnectionTimeout)
 	defer cancel()
+	// Release the client even when connect() fails part-way.
+	defer r.close()
 	status, err = r.connect(ctx)
-	if err == nil {
-		r.close()
-	}
-
 	return
 }
 
@@ -821,8 +826,15 @@ func (r *Collector) buildClient(ctx context.Context) (*govmomi.Client, error) {
 		SessionManager: session.NewManager(vimClient),
 		Client:         vimClient,
 	}
-	err = client.Login(ctx, url.User)
-	return client, err
+	if err = client.Login(ctx, url.User); err != nil {
+		// Mirror govmomi.NewClient: on Login failure best-effort Logout (a
+		// partial session may exist), release keep-alive sockets, and return a
+		// nil client so callers cannot reference a half-built one.
+		_ = client.Logout(context.Background())
+		client.CloseIdleConnections()
+		return nil, err
+	}
+	return client, nil
 
 }
 
