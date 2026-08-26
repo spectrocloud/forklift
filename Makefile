@@ -358,6 +358,13 @@ push-virt-v2v-xfs-image: build-virt-v2v-xfs-image
 		$(CONTAINER_CMD) push $(VIRT_V2V_IMAGE_RHEL9)$(PLATFORM_SUFFIX); \
 	fi
 
+build-virt-v2v-fedora-image: check_container_runtime
+	$(eval VIRT_V2V_IMAGE=$(REGISTRY)/$(REGISTRY_ORG)/forklift-virt-v2v:$(REGISTRY_TAG))
+	$(CONTAINER_CMD) build $(PLATFORM_FLAG) -t $(VIRT_V2V_IMAGE) -f build/virt-v2v/Containerfile-upstream-fedora .
+
+push-virt-v2v-fedora-image: build-virt-v2v-fedora-image
+	$(CONTAINER_CMD) push $(VIRT_V2V_IMAGE)
+
 build-operator-bundle-image: check_container_runtime
 	$(CONTAINER_CMD) build $(PLATFORM_FLAG) $(BUILD_LABEL_ARGS) \
 		-t $(OPERATOR_BUNDLE_IMAGE)$(PLATFORM_SUFFIX) \
