@@ -450,29 +450,18 @@ func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref, destinationClient k8sclien
 
 	switch source.Type() {
 	case VSphere:
-		// The virt-v2v transfers all disks attached to the VM. If we want to skip the shared disks so we don't transfer
-		// them multiple times we need to manage the transfer using KubeVirt CDI DataVolumes and v2v-in-place.
-		migrateSharedDisks := p.Spec.MigrateSharedDisks
-		if vm, found := p.Spec.FindVM(vmRef); found && vm.MigrateSharedDisks != nil {
-			migrateSharedDisks = *vm.MigrateSharedDisks
-		}
-		if p.IsWarm() || !destination.IsHost() || !migrateSharedDisks ||
-			p.Spec.SkipGuestConversion || p.Spec.Type == MigrationOnlyConversion {
-			return false, nil
-		}
-		if p.Map.Storage != nil {
-			hasNetAppShift, err := p.Map.Storage.HasNetAppShiftDestination(destinationClient)
-			if err != nil {
-				return false, err
-			}
-			if hasNetAppShift {
-				return false, nil
-			}
-		}
-		if p.IsUsingOffloadPlugin() {
-			return false, nil
-		}
-		return true, nil
+		// Spectro: the virt-v2v transfer path is removed for vSphere. CDI+VDDK
+		// always copies the disks and virt-v2v only converts in place, so this
+		// always reports false. Upstream instead weighs warm/host/shared-disk/
+		// NetApp-shift/offload conditions here to decide between the two paths.
+		//
+		// Returning false here is what drives, via BasePredicate.Evaluate:
+		//   CDIDiskCopy      -> true  (PhaseCopyDisks runs)
+		//   VirtV2vDiskCopy  -> false (PhaseAllocateDisks + PhaseCopyDisksVirtV2V skipped)
+		// and, via KubeVirt.ResolveConversionType, api.InPlace (V2V_inPlace=1).
+		//
+		// OVA/HyperV deliberately keep upstream behaviour below.
+		return false, nil
 	case Ova, HyperV:
 		return true, nil
 	default:
