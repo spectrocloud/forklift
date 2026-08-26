@@ -34,10 +34,9 @@ func (r *EsxHost) TestConnection() (err error) {
 	ctx := context.Background()
 	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
+	// Release the session even when connect() fails part-way.
+	defer r.close()
 	err = r.connect(ctx)
-	if err == nil {
-		r.close()
-	}
 	return
 }
 
@@ -98,8 +97,14 @@ func (r *EsxHost) connect(ctx context.Context) (err error) {
 		SessionManager: session.NewManager(vimClient),
 		Client:         vimClient,
 	}
-	err = r.client.Login(ctx, url.User)
-	if err != nil {
+	if err = r.client.Login(ctx, url.User); err != nil {
+		// Login failed after vim25.NewClient already opened the SOAP/HTTP
+		// stack. Best-effort logout, release keep-alive sockets, and clear the
+		// client/finder so a half-built host cannot be reused on retry.
+		_ = r.client.Logout(context.Background())
+		r.client.CloseIdleConnections()
+		r.client = nil
+		r.finder = nil
 		return liberr.Wrap(err)
 	}
 

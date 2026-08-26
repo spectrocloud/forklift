@@ -328,7 +328,9 @@ func (r *Migration) Load() (err error) {
 	if val, found := os.LookupEnv(VirtV2vContainerLimitsMemory); found {
 		r.VirtV2vContainerLimitsMemory = val
 	} else {
-		r.VirtV2vContainerLimitsMemory = "8Gi"
+		// Spectro: 8Gi upstream. virt-v2v converting large Windows guests was
+		// OOM-killed at 8Gi.
+		r.VirtV2vContainerLimitsMemory = "12Gi"
 	}
 	if val, found := os.LookupEnv(VirtV2vContainerRequestsCpu); found {
 		r.VirtV2vContainerRequestsCpu = val

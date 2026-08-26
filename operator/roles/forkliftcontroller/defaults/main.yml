@@ -78,8 +78,10 @@ inventory_container_name: "{{ app_name }}-inventory"
 inventory_service_name: "{{ app_name }}-inventory"
 inventory_route_name: "{{ inventory_service_name }}"
 inventory_route_timeout: "360s"
-inventory_container_limits_cpu: "2"
-inventory_container_limits_memory: "1Gi"
+# Spectro: upstream defaults are 2 cpu / 1Gi; the inventory container was
+# throttled and OOM-killed collecting large vSphere inventories.
+inventory_container_limits_cpu: "8000m"
+inventory_container_limits_memory: "8Gi"
 inventory_container_requests_cpu: "500m"
 inventory_container_requests_memory: "500Mi"
 inventory_tls_secret_name: "{{ inventory_service_name }}-serving-cert"
