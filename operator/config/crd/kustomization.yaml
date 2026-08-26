@@ -5,6 +5,7 @@ resources:
 - bases/forklift.konveyor.io_forkliftcontrollers.yaml
 - bases/forklift.konveyor.io_hooks.yaml
 - bases/forklift.konveyor.io_hosts.yaml
+- bases/forklift.konveyor.io_conversions.yaml
 - bases/forklift.konveyor.io_migrations.yaml
 - bases/forklift.konveyor.io_networkmaps.yaml
 - bases/forklift.konveyor.io_plans.yaml
@@ -13,4 +14,6 @@ resources:
 - bases/forklift.konveyor.io_ovirtvolumepopulators.yaml
 - bases/forklift.konveyor.io_openstackvolumepopulators.yaml
 - bases/forklift.konveyor.io_vspherexcopyvolumepopulators.yaml
+- bases/forklift.konveyor.io_ovaproviderservers.yaml
+- bases/forklift.konveyor.io_hypervproviderservers.yaml
 #+kubebuilder:scaffold:crdkustomizeresource

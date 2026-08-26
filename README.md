@@ -1,4 +1,4 @@
-![CI](https://github.com/spectrocloud/forklift/workflows/CI/badge.svg)&nbsp;[![Code Coverage](https://codecov.io/gh/spectrocloud/forklift/branch/main/graph/badge.svg)](https://codecov.io/gh/spectrocloud/forklift)
+![Build](https://github.com/kubev2v/forklift/workflows/Build%20and%20push%20images/badge.svg)&nbsp;![CI](https://github.com/kubev2v/forklift/workflows/CI/badge.svg)&nbsp;[![Code Coverage](https://codecov.io/gh/kubev2v/forklift/branch/main/graph/badge.svg?token=VV6EBWKJGB)](https://codecov.io/gh/kubev2v/forklift)
 
 # Forklift
 Migrates virtual machines at scale to Kubernetes KubeVirt.
@@ -16,9 +16,21 @@ executing the migration effort.
 ---
 
 ## Deploy
-Deploy the latest Forklift operator index to the cluster
+Deploy the Forklift operator index to the cluster.
+
+Create the target namespace first (it is not created automatically):
 ```bash
-make deploy-operator-index REGISTRY_TAG=latest
+kubectl create namespace konveyor-forklift
+```
+
+For single-architecture deployment (development):
+```bash
+make deploy-operator-index PLATFORM=linux/amd64 REGISTRY_TAG=latest
+```
+
+For multi-architecture deployment (production):
+```bash
+make deploy-operator-index-multiarch REGISTRY_TAG=latest
 ```
 
 
@@ -33,6 +45,77 @@ make push-controller-image \
 ```
 Note: The order of targets is important as the bundle needs to be created after controller and index after bundle.
 
+### Multi-Architecture Builds
+
+For information about building images for multiple architectures (AMD64, ARM64) and creating multi-arch manifests, see the [Cross-Platform Build Support](docs/enhancements/cross-platform-build-support.md) enhancement document.
+
+## Development
+
+### Commit Message Format
+
+All commits must include one of these formats in the **commit description** (the body of the commit message):
+
+**Primary format**: `Resolves: MTV-<number>`
+
+Example commit:
+```
+Subject: Fix bug in data processing
+Description: Resolves: MTV-123
+```
+
+**Exclusion format**: `Resolves: None`
+
+Example commit:
+```
+Subject: Update documentation
+Description: Resolves: None
+```
+
+**Chore commits**: Any commit containing "chore" in the message (case insensitive) is automatically skipped.
+
+Example chore commits:
+```
+chore: update dependencies
+CHORE: clean up build files
+Update dependencies and chore tasks
+```
+
+**Note**: The commit description validation is enforced via a GitHub Action that runs on all branches for push and pull request events. The validation automatically skips:
+- Bot users (dependabot, renovate, ci, github-actions, etc.)
+- Commits containing "chore" in the message (case insensitive)
+
+### Local Validation
+
+You can validate commit messages locally using the provided script or Makefile targets:
+
+**Using Makefile targets:**
+```bash
+# Validate the latest commit
+make validate-commits
+
+# Validate a range of commits
+make validate-commits-range RANGE="HEAD~5..HEAD"
+```
+
+**Using the script directly:**
+```bash
+# Validate the latest commit
+./scripts/validate-commits.sh
+
+# Validate a range of commits
+./scripts/validate-commits.sh --range HEAD~5..HEAD
+
+# Validate with verbose output
+./scripts/validate-commits.sh --verbose
+
+# Get help
+./scripts/validate-commits.sh --help
+```
+
+### Detailed Commit Message Guide
+
+For comprehensive information about commit message formatting, supported issue tracking systems, and troubleshooting, see [commit-message-guide.md](.cursor/skills/git-commit/commit-message-guide.md).
+
 ### Configuration
 
 | Name                       | Default value                                  | Description                                                            |
@@ -40,6 +123,7 @@ Note: The order of targets is important as the bundle needs to be created after 
 | REGISTRY_TAG               | devel                                          | The tag with which the image will be built and pushed to the registry. |
 | REGISTRY_ORG               | kubev2v                                        | The registry organization to which the built image should be pushed.   |
 | REGISTRY                   | quay.io                                        | The registry address to which the images should be pushed.             |
+| PLATFORM                   | linux/amd64                                    | The target platform for container image builds (e.g.: linux/arm64, linux/amd64). |
 | CONTAINER_CMD              | autodetected                                   | The container runtime command (e.g.: /usr/bin/podman)                  |
 | VERSION                    | 99.0.0                                         | The version with which the forklift should be built.                   |
 | NAMESPACE                  | konveyor-forklift                              | The namespace in which the operator should be installed.               |

@@ -2,30 +2,30 @@ package ovirt
 
 import (
 	"context"
+	"encoding/pem"
 	"fmt"
 	"net/url"
 	"path"
 	"strconv"
 	"strings"
 
-	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
-	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
+	"github.com/kubev2v/forklift/pkg/controller/base"
 	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
 	utils "github.com/kubev2v/forklift/pkg/controller/plan/util"
-	"github.com/kubev2v/forklift/pkg/controller/provider/web/base"
-	"github.com/kubev2v/forklift/pkg/controller/provider/web/ocp"
 	model "github.com/kubev2v/forklift/pkg/controller/provider/web/ovirt"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	libitr "github.com/kubev2v/forklift/pkg/lib/itinerary"
+	util "github.com/kubev2v/forklift/pkg/lib/util"
+	"github.com/kubev2v/forklift/pkg/settings"
 	core "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	cnv "kubevirt.io/api/core/v1"
 	cdi "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
@@ -119,50 +119,60 @@ var osMap = map[string]string{
 // oVirt builder.
 type Builder struct {
 	*plancontext.Context
-	// MAC addresses already in use on the destination cluster. k=mac, v=vmName
-	macConflictsMap map[string]string
-}
-
-// Get list of destination VMs with mac addresses that would
-// conflict with this VM, if any exist.
-func (r *Builder) macConflicts(vm *model.Workload) (conflictingVMs []string, err error) {
-	if r.macConflictsMap == nil {
-		list := []ocp.VM{}
-		err = r.Destination.Inventory.List(&list, base.Param{
-			Key:   base.DetailParam,
-			Value: "all",
-		})
-		if err != nil {
-			return
-		}
-
-		r.macConflictsMap = make(map[string]string)
-		for _, kVM := range list {
-			for _, iface := range kVM.Object.Spec.Template.Spec.Domain.Devices.Interfaces {
-				r.macConflictsMap[iface.MacAddress] = path.Join(kVM.Namespace, kVM.Name)
-			}
-		}
-	}
-
-	for _, nic := range vm.NICs {
-		if conflictingVm, found := r.macConflictsMap[nic.MAC]; found {
-			for i := range conflictingVMs {
-				// ignore duplicates
-				if conflictingVMs[i] == conflictingVm {
-					continue
-				}
-			}
-			conflictingVMs = append(conflictingVMs, conflictingVm)
-		}
-	}
-
-	return
 }
 
 // Create DataVolume certificate configmap.
 func (r *Builder) ConfigMap(_ ref.Ref, in *core.Secret, object *core.ConfigMap) (err error) {
-	object.BinaryData["ca.pem"] = in.Data["cacert"]
+	// For CNV 4.21+, ConfigMap is only needed in secure mode (when insecureSkipVerify is not used).
+	// For CNV < 4.21, ConfigMap is required even in insecure mode as a fallback,
+	// since the InsecureSkipVerify field is not supported.
+	if cacert, exists := util.GetCACert(in); exists && len(cacert) > 0 {
+		object.BinaryData["ca.pem"] = cacert
+	} else {
+		// If no CA cert provided, try to fetch it from the oVirt engine.
+		// This is needed for CNV < 4.21 when insecure mode is enabled but
+		// InsecureSkipVerify field is not supported.
+		cacert, err = r.fetchOVirtCACert()
+		if err != nil {
+			r.Log.Error(err, "Failed to fetch CA certificate from oVirt engine")
+			// Don't return error - let migration proceed and fail with clear error if cert is actually needed
+			err = nil
+		} else if len(cacert) > 0 {
+			object.BinaryData["ca.pem"] = cacert
+		}
+	}
 	return
+}
+
+// Fetches the CA certificate from the oVirt engine URL.
+// This is needed for CNV < 4.21 in insecure mode as a fallback when InsecureSkipVerify field is not supported.
+func (r *Builder) fetchOVirtCACert() (cert []byte, err error) {
+	engineURL := r.Source.Provider.Spec.URL
+	parsedURL, err := url.Parse(engineURL)
+	if err != nil {
+		return nil, liberr.Wrap(err, "failed to parse oVirt engine URL", "url", engineURL)
+	}
+
+	tempSecret := &core.Secret{
+		Data: map[string][]byte{
+			"insecureSkipVerify": []byte("true"),
+		},
+	}
+
+	cacert, err := util.GetTlsCertificate(parsedURL, tempSecret)
+	if err != nil {
+		return nil, liberr.Wrap(err, "failed to fetch certificate from oVirt engine")
+	}
+	if cacert == nil {
+		return nil, liberr.New("no certificate returned from oVirt engine")
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: cacert.Raw,
+	})
+
+	return certPEM, nil
 }
 
 func (r *Builder) PodEnvironment(_ ref.Ref, _ *core.Secret) (env []core.EnvVar, err error) {
@@ -203,14 +213,27 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, configMap *cor
 				if da.Disk.ActualSize > size {
 					size = da.Disk.ActualSize
 				}
+
+				insecure := base.GetInsecureSkipVerifyFlag(r.Source.Secret)
+
+				imageioSource := &cdi.DataVolumeSourceImageIO{
+					URL:       url,
+					DiskID:    da.Disk.ID,
+					SecretRef: secret.Name,
+				}
+
+				if insecure && settings.Settings.InsecureSkipVerifySupported {
+					// CNV 4.21+: Use CDI's insecureSkipVerify field to skip TLS verification
+					imageioSource.InsecureSkipVerify = &insecure
+				} else {
+					// CNV < 4.21 or secure mode: Use ConfigMap with CA cert
+					// For older CNV versions with insecure flag, fall back to using CA cert
+					// since InsecureSkipVerify field is not supported
+					imageioSource.CertConfigMap = configMap.Name
+				}
 				dvSpec := cdi.DataVolumeSpec{
 					Source: &cdi.DataVolumeSource{
-						Imageio: &cdi.DataVolumeSourceImageIO{
-							URL:           url,
-							DiskID:        da.Disk.ID,
-							SecretRef:     secret.Name,
-							CertConfigMap: configMap.Name,
-						},
+						Imageio: imageioSource,
 					},
 					Storage: &cdi.StorageSpec{
 						Resources: core.VolumeResourceRequirements{
@@ -253,24 +276,13 @@ func (r *Builder) VirtualMachine(vmRef ref.Ref, object *cnv.VirtualMachineSpec, 
 		return
 	}
 
-	var conflicts []string
-	conflicts, err = r.macConflicts(vm)
-	if err != nil {
-		return
-	}
-	if len(conflicts) > 0 {
-		err = liberr.New(
-			fmt.Sprintf("Source VM has a mac address conflict with one or more destination VMs: %s", conflicts))
-		return
-	}
-
 	if object.Template == nil {
 		object.Template = &cnv.VirtualMachineInstanceTemplateSpec{}
 	}
 	r.mapDisks(vm, persistentVolumeClaims, object)
 	r.mapFirmware(vm, &vm.Cluster, object)
 	if !usesInstanceType {
-		r.mapCPU(vm, object)
+		r.mapCPU(vmRef, vm, object)
 		r.mapMemory(vm, object)
 	}
 	r.mapClock(vm, object)
@@ -289,59 +301,54 @@ func (r *Builder) mapNetworks(vm *model.Workload, object *cnv.VirtualMachineSpec
 	var kInterfaces []cnv.Interface
 
 	numNetworks := 0
-	netMapIn := r.Context.Map.Network.Spec.Map
-	for i := range netMapIn {
-		mapped := &netMapIn[i]
+	hasUDN := r.Plan.DestinationHasUdnNetwork(r.Destination)
 
-		// Skip network mappings with destination type 'Ignored'
-		if mapped.Destination.Type == Ignored {
-			continue
+	resolved, rErr := resolveNICMappings(vm.NICs, r.Map.Network.Spec.Map, r.Source.Inventory)
+	if rErr != nil {
+		err = rErr
+		return
+	}
+
+	for _, entry := range resolved {
+		nic := entry.NIC
+		mapped := entry.Mapping
+
+		networkName := fmt.Sprintf("net-%v", numNetworks)
+		numNetworks++
+		kNetwork := cnv.Network{
+			Name: networkName,
+		}
+		kInterface := cnv.Interface{
+			Name:  networkName,
+			Model: nic.Interface,
 		}
 
-		ref := mapped.Source
-		network := &model.Network{}
-		fErr := r.Source.Inventory.Find(network, ref)
-		if fErr != nil {
-			err = fErr
-			return
+		if !hasUDN || settings.Settings.UdnSupportsMac {
+			kInterface.MacAddress = nic.MAC
 		}
-		needed := []model.XNIC{}
-		for _, nic := range vm.NICs {
-			if nic.Profile.Network == network.ID {
-				needed = append(needed, nic)
-			}
-		}
-		if len(needed) == 0 {
-			continue
-		}
-		for _, nic := range needed {
-			networkName := fmt.Sprintf("net-%v", numNetworks)
-			numNetworks++
-			kNetwork := cnv.Network{
-				Name: networkName,
-			}
-			kInterface := cnv.Interface{
-				Name:       networkName,
-				Model:      nic.Interface,
-				MacAddress: nic.MAC,
-			}
-			switch mapped.Destination.Type {
-			case Pod:
-				kNetwork.Pod = &cnv.PodNetwork{}
+
+		switch mapped.Destination.Type {
+		case Pod:
+			kNetwork.Pod = &cnv.PodNetwork{}
+			if hasUDN {
+				kInterface.Binding = &cnv.PluginBinding{
+					Name: planbase.UdnL2bridge,
+				}
+			} else {
 				kInterface.Masquerade = &cnv.InterfaceMasquerade{}
-			case Multus:
-				kNetwork.Multus = &cnv.MultusNetwork{
-					NetworkName: path.Join(mapped.Destination.Namespace, mapped.Destination.Name),
-				}
-				if nic.Profile.PassThrough {
-					kInterface.SRIOV = &cnv.InterfaceSRIOV{}
-				} else {
-					kInterface.Bridge = &cnv.InterfaceBridge{}
-				}
 			}
-			kNetworks = append(kNetworks, kNetwork)
-			kInterfaces = append(kInterfaces, kInterface)
+		case Multus:
+			kNetwork.Multus = &cnv.MultusNetwork{
+				NetworkName: path.Join(mapped.Destination.Namespace, mapped.Destination.Name),
+			}
+			if nic.Profile.PassThrough {
+				kInterface.SRIOV = &cnv.InterfaceSRIOV{}
+			} else {
+				kInterface.Bridge = &cnv.InterfaceBridge{}
+			}
 		}
+		kNetworks = append(kNetworks, kNetwork)
+		kInterfaces = append(kInterfaces, kInterface)
 	}
 	object.Template.Spec.Networks = kNetworks
 	object.Template.Spec.Domain.Devices.Interfaces = kInterfaces
@@ -371,7 +378,7 @@ func (r *Builder) mapMemory(vm *model.Workload, object *cnv.VirtualMachineSpec) 
 	object.Template.Spec.Domain.Memory = &cnv.Memory{Guest: reservation}
 }
 
-func (r *Builder) mapCPU(vm *model.Workload, object *cnv.VirtualMachineSpec) {
+func (r *Builder) mapCPU(vmRef ref.Ref, vm *model.Workload, object *cnv.VirtualMachineSpec) {
 	object.Template.Spec.Domain.CPU = &cnv.CPU{
 		Sockets: uint32(vm.CpuSockets),
 		Cores:   uint32(vm.CpuCores),
@@ -385,6 +392,16 @@ func (r *Builder) mapCPU(vm *model.Workload, object *cnv.VirtualMachineSpec) {
 		r.setCpuFlags(vm.CustomCpuModel, object)
 	} else if r.Plan.Spec.PreserveClusterCPUModel {
 		r.setCpuFlags(r.getClusterCpu(vm), object)
+	}
+	if enableNestedVirt := r.NestedVirtualizationSetting(vmRef, false); enableNestedVirt != nil {
+		policy := "optional"
+		if !*enableNestedVirt {
+			policy = "disable"
+		}
+		object.Template.Spec.Domain.CPU.Features = append(object.Template.Spec.Domain.CPU.Features,
+			cnv.CPUFeature{Name: "vmx", Policy: policy},
+			cnv.CPUFeature{Name: "svm", Policy: policy},
+		)
 	}
 }
 
@@ -558,6 +575,14 @@ func (r *Builder) PreferenceName(vmRef ref.Ref, configMap *core.ConfigMap) (name
 	return
 }
 
+func (r *Builder) ConfigMaps(vmRef ref.Ref) (list []core.ConfigMap, err error) {
+	return nil, nil
+}
+
+func (r *Builder) Secrets(vmRef ref.Ref) (list []core.Secret, err error) {
+	return nil, nil
+}
+
 func (r *Builder) TemplateLabels(vmRef ref.Ref) (labels map[string]string, err error) {
 	vm := &model.Workload{}
 	err = r.Source.Inventory.Find(vm, vmRef)
@@ -710,7 +735,7 @@ func (r *Builder) LunPersistentVolumeClaims(vmRef ref.Ref) (pvcs []core.Persiste
 }
 
 func (r *Builder) SupportsVolumePopulators() bool {
-	return !r.Context.Plan.Spec.Warm && r.Context.Plan.Provider.Destination.IsHost()
+	return !r.Context.Plan.IsWarm() && r.Context.Plan.Provider.Destination.IsHost()
 }
 
 func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string, secretName string) (pvcs []*core.PersistentVolumeClaim, err error) {
@@ -819,6 +844,7 @@ func (r *Builder) createVolumePopulatorCR(diskAttachment model.XDiskAttachment, 
 			Labels: map[string]string{
 				"vmID":      vmId,
 				"migration": migrationId,
+				"plan":      string(r.Plan.GetUID()),
 				"diskID":    diskAttachment.Disk.ID,
 			},
 		},
@@ -890,6 +916,7 @@ func (r *Builder) persistentVolumeClaimWithSourceRef(diskAttachment model.XDiskA
 			Annotations:  annotations,
 			Labels: map[string]string{
 				"migration": string(r.Migration.UID),
+				"plan":      string(r.Plan.GetUID()),
 				"vmID":      vmID,
 				"diskID":    diskAttachment.Disk.ID,
 			},
@@ -904,7 +931,7 @@ func (r *Builder) persistentVolumeClaimWithSourceRef(diskAttachment model.XDiskA
 			VolumeMode:       volumeMode,
 			DataSourceRef: &core.TypedObjectReference{
 				APIGroup: &api.SchemeGroupVersion.Group,
-				Kind:     v1beta1.OvirtVolumePopulatorKind,
+				Kind:     api.OvirtVolumePopulatorKind,
 				Name:     populatorName,
 			},
 		},
@@ -982,6 +1009,7 @@ func (r *Builder) setOvirtPopulatorLabels(populatorCr api.OvirtVolumePopulator, 
 	}
 	populatorCr.Labels["vmID"] = vmId
 	populatorCr.Labels["migration"] = migrationId
+	populatorCr.Labels["plan"] = string(r.Plan.GetUID())
 	patch := client.MergeFrom(populatorCrCopy)
 	err = r.Destination.Client.Patch(context.TODO(), &populatorCr, patch)
 	return
@@ -989,5 +1017,19 @@ func (r *Builder) setOvirtPopulatorLabels(populatorCr api.OvirtVolumePopulator, 
 
 func (r *Builder) GetPopulatorTaskName(pvc *core.PersistentVolumeClaim) (taskName string, err error) {
 	taskName = pvc.Annotations[planbase.AnnDiskSource]
+	return
+}
+
+// ConversionPodConfig returns provider-specific configuration for the virt-v2v conversion pod.
+// oVirt provider does not require any special configuration.
+func (r *Builder) ConversionPodConfig(_ ref.Ref) (*planbase.ConversionPodConfigResult, error) {
+	return &planbase.ConversionPodConfigResult{}, nil
+}
+
+func (r *Builder) NetAppShiftPVCs(vmRef ref.Ref, labels map[string]string) ([]core.PersistentVolumeClaim, error) {
+	return nil, nil
+}
+
+func (r *Builder) SourceVMLabelsAndAnnotations(vmRef ref.Ref, tagMapping *api.TagMapping) (labels map[string]string, annotations map[string]string, sanitizationReport map[string]string, err error) {
 	return
 }

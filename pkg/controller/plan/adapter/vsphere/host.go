@@ -5,8 +5,10 @@ import (
 	liburl "net/url"
 	"time"
 
+	"github.com/kubev2v/forklift/pkg/controller/base"
 	model "github.com/kubev2v/forklift/pkg/controller/provider/web/vsphere"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
+	"github.com/kubev2v/forklift/pkg/lib/util"
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/session"
@@ -32,6 +34,7 @@ func (r *EsxHost) TestConnection() (err error) {
 	ctx := context.Background()
 	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
+	// Release the session even when connect() fails part-way.
 	defer r.close()
 	err = r.connect(ctx)
 	return
@@ -71,9 +74,20 @@ func (r *EsxHost) connect(ctx context.Context) (err error) {
 		r.user(),
 		r.password())
 
-	// Always use insecure skip verify for ESX hosts.
-	soapClient := soap.NewClient(url, true)
-	soapClient.SetThumbprint(url.Host, r.thumbprint())
+	thumbprint := r.thumbprint()
+	skipVerifying := base.GetInsecureSkipVerifyFlag(r.Secret)
+
+	// If thumbprint is not provided, verify the TLS connection to get it.
+	if !skipVerifying && thumbprint == "" {
+		cert, errtls := base.VerifyTLSConnection(r.URL, r.Secret)
+		if errtls != nil {
+			return liberr.Wrap(errtls)
+		}
+		thumbprint = util.Fingerprint(cert)
+	}
+
+	soapClient := soap.NewClient(url, skipVerifying)
+	soapClient.SetThumbprint(url.Host, thumbprint)
 
 	vimClient, err := vim25.NewClient(ctx, soapClient)
 	if err != nil {
@@ -84,10 +98,9 @@ func (r *EsxHost) connect(ctx context.Context) (err error) {
 		Client:         vimClient,
 	}
 	if err = r.client.Login(ctx, url.User); err != nil {
-		// PVM-113: Login failed after vim25.NewClient already opened the
-		// SOAP/HTTP stack. Best-effort logout in case a partial session was
-		// established, release keep-alive sockets, and clear the client/finder
-		// so a half-built host can't be reused on retry.
+		// Login failed after vim25.NewClient already opened the SOAP/HTTP
+		// stack. Best-effort logout, release keep-alive sockets, and clear the
+		// client/finder so a half-built host cannot be reused on retry.
 		_ = r.client.Logout(context.Background())
 		r.client.CloseIdleConnections()
 		r.client = nil

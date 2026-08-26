@@ -2,6 +2,7 @@ package vsphere
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	liburl "net/url"
 
@@ -14,6 +15,7 @@ import (
 	model "github.com/kubev2v/forklift/pkg/controller/provider/web/vsphere"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	"github.com/vmware/govmomi"
+	"github.com/vmware/govmomi/fault"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/session"
@@ -34,6 +36,10 @@ const (
 	createSnapshotTaskName = "vim.VirtualMachine.createSnapshot"
 	removeSnapshotTaskName = "vim.vm.Snapshot.remove"
 )
+
+var ErrTaskNotFound = errors.New("not found")
+var ErrTaskNotFoundPropSet = errors.New("not found property set")
+var ErrTaskValueNotFound = errors.New("no task value found for task")
 
 // vSphere VM Client
 type Client struct {
@@ -124,7 +130,7 @@ func (r *Client) RemoveSnapshot(vmRef ref.Ref, snapshot string, hosts util.Hosts
 		"snapshot", snapshot,
 		"children", false)
 
-	task, err := vm.RemoveSnapshot(context.TODO(), snapshot, false, nil)
+	task, err := vm.RemoveSnapshot(context.TODO(), snapshot, false, ptr.To(true))
 	if err != nil {
 		return "", liberr.Wrap(err)
 	}
@@ -151,10 +157,20 @@ func (r *Client) SetCheckpoints(vmRef ref.Ref, precopies []planapi.Precopy, data
 	changeIds := previous.DeltaMap()
 	for i := range datavolumes {
 		dv := &datavolumes[i]
-		dv.Spec.Checkpoints = append(dv.Spec.Checkpoints, cdi.DataVolumeCheckpoint{
-			Current:  current.Snapshot,
-			Previous: changeIds[dv.Spec.Source.VDDK.BackingFile],
-		})
+		alreadyExists := false
+		for _, checkpoint := range dv.Spec.Checkpoints {
+			if checkpoint.Current == current.Snapshot {
+				r.Log.V(1).Info("Snapshot already exists in DataVolume checkpoints list", "vmRef", vmRef, "DataVolume", dv.Name, "checkpoints", dv.Spec.Checkpoints)
+				alreadyExists = true
+				break
+			}
+		}
+		if !alreadyExists {
+			dv.Spec.Checkpoints = append(dv.Spec.Checkpoints, cdi.DataVolumeCheckpoint{
+				Current:  current.Snapshot,
+				Previous: changeIds[dv.Spec.Source.VDDK.BackingFile],
+			})
+		}
 		dv.Spec.FinalCheckpoint = final
 	}
 	return
@@ -306,11 +322,29 @@ func (r *Client) GetSnapshotDeltas(vmRef ref.Ref, snapshotId string, hosts util.
 // Check if a snapshot is removed
 func (r *Client) CheckSnapshotRemove(vmRef ref.Ref, precopy planapi.Precopy, hosts util.HostsFunc) (bool, error) {
 	r.Log.Info("Check Snapshot Remove", "vmRef", vmRef, "precopy", precopy)
+
 	taskInfo, err := r.getTaskById(vmRef, precopy.RemoveTaskId, hosts)
-	if err != nil {
+	if err == nil {
+		return r.checkTaskStatus(taskInfo)
+	}
+
+	notFound := errors.Is(err, ErrTaskNotFound) || errors.Is(err, ErrTaskNotFoundPropSet) || errors.Is(err, ErrTaskValueNotFound)
+	alreadyDeleted := fault.Is(err, &types.ManagedObjectNotFound{})
+	if !notFound && !alreadyDeleted {
 		return false, liberr.Wrap(err)
 	}
-	return r.checkTaskStatus(taskInfo)
+
+	// If the task is done and gone, make sure the snapshot itself is gone
+	r.Log.Info("Snapshot removal task not found, checking for existing snapshot", "vmRef", vmRef, "precopy", precopy)
+	vm := &model.VM{}
+	if err := r.Source.Inventory.Find(vm, vmRef); err != nil {
+		return false, liberr.Wrap(err)
+	}
+	if vm.Snapshot.ID == "" {
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // Check if a snapshot is ready to transfer.
@@ -341,7 +375,7 @@ func (r *Client) checkTaskStatus(taskInfo *types.TaskInfo) (ready bool, err erro
 	case types.TaskInfoStateSuccess:
 		return true, nil
 	case types.TaskInfoStateError:
-		return false, fmt.Errorf(taskInfo.Error.LocalizedMessage)
+		return false, fmt.Errorf("error cheking task status: %s", taskInfo.Error.LocalizedMessage)
 	default:
 		return false, nil
 	}
@@ -384,26 +418,20 @@ func (r *Client) getTaskById(vmRef ref.Ref, taskId string, hosts util.HostsFunc)
 		return nil, err
 	}
 	if len(content) == 0 {
-		return nil, fmt.Errorf("task %s not found", taskId)
+		return nil, fmt.Errorf("task %s %w", taskId, ErrTaskNotFound)
 	}
 	if len(content[0].PropSet) == 0 {
-		return nil, fmt.Errorf("task %s not found property set", taskId)
+		return nil, fmt.Errorf("task %s %w", taskId, ErrTaskNotFoundPropSet)
 	}
 	if content[0].PropSet[0].Val == nil {
-		return nil, fmt.Errorf("no task value found for task %s", taskId)
+		return nil, fmt.Errorf("%w %s", ErrTaskValueNotFound, taskId)
 	}
 	task := content[0].PropSet[0].Val.(types.TaskInfo)
 	return &task, nil
 }
 
 func (r *Client) getClient(vm *model.VM, hosts util.HostsFunc) (client *vim25.Client, err error) {
-	// if coldLocal, vErr := r.Plan.VSphereColdLocal(); vErr == nil && coldLocal {
-	// 	// when virt-v2v runs the migration, forklift-controller should interact only
-	// 	// with the component that serves the SDK endpoint of the provider
-	// 	client = r.client.Client
-	// 	return
-	// }
-	if useV2vForTransfer, vErr := r.Plan.ShouldUseV2vForTransfer(); vErr == nil && useV2vForTransfer {
+	if useV2vForTransfer, vErr := r.Plan.ShouldUseV2vForTransfer(ref.Ref{ID: vm.ID}, r.Destination.Client); vErr == nil && useV2vForTransfer {
 		// when virt-v2v runs the migration, forklift-controller should interact only
 		// with the component that serves the SDK endpoint of the provider
 		client = r.client.Client
@@ -445,7 +473,7 @@ func (r *Client) getClient(vm *model.VM, hosts util.HostsFunc) (client *vim25.Cl
 }
 
 func (r *Client) getHostClient(hostDef *v1beta1.Host, host *model.Host) (client *vim25.Client, err error) {
-	url, err := liburl.Parse("https://" + hostDef.Spec.IpAddress + "/sdk")
+	url, err := liburl.Parse("https://" + formatHostAddress(hostDef.Spec.IpAddress) + "/sdk")
 	if err != nil {
 		err = liberr.Wrap(err)
 		return
@@ -505,7 +533,12 @@ func (r *Client) getVM(vmRef ref.Ref, hosts util.HostsFunc) (vsphereVm *object.V
 	}
 
 	searchIndex := object.NewSearchIndex(client)
-	vsphereRef, err := searchIndex.FindByUuid(context.TODO(), nil, vm.UUID, true, ptr.To(false))
+	uuid := vm.InstanceUUID
+	useInstanceUUID := uuid != ""
+	if !useInstanceUUID {
+		uuid = vm.UUID
+	}
+	vsphereRef, err := searchIndex.FindByUuid(context.TODO(), nil, uuid, true, ptr.To(useInstanceUUID))
 	if err != nil {
 		err = liberr.Wrap(err)
 		return
@@ -572,4 +605,59 @@ func (r *Client) thumbprint() string {
 func (r *Client) DetachDisks(vmRef ref.Ref) (err error) {
 	// no-op
 	return
+}
+
+func (r *Client) getNAAFromDatastore(ctx context.Context, datastoreRef ref.Ref) (string, error) {
+	ds := &model.Datastore{}
+	err := r.Source.Inventory.Find(ds, datastoreRef)
+	if err != nil {
+		return "", liberr.Wrap(err, "datastore", datastoreRef.String())
+	}
+
+	if r.client == nil {
+		if err := r.connect(); err != nil {
+			return "", liberr.Wrap(err, "failed to connect to vSphere")
+		}
+	}
+
+	properties := []string{"info"}
+	var dsMo mo.Datastore
+	err = property.DefaultCollector(r.client.Client).RetrieveOne(
+		ctx,
+		types.ManagedObjectReference{
+			Type:  "Datastore",
+			Value: datastoreRef.ID,
+		},
+		properties,
+		&dsMo,
+	)
+	if err != nil {
+		return "", liberr.Wrap(err, "failed to retrieve datastore properties")
+	}
+
+	dsinfo := dsMo.Info
+	vmfsInfo, ok := dsinfo.(*types.VmfsDatastoreInfo)
+	if !ok {
+		return "", liberr.New(
+			fmt.Sprintf("datastore '%s' is not a VMFS datastore (Type: %T)", ds.Name, dsMo.Info.GetDatastoreInfo()),
+		)
+	}
+
+	if len(vmfsInfo.Vmfs.Extent) == 0 {
+		return "", liberr.New(
+			fmt.Sprintf("VMFS datastore '%s' has no associated extents/devices", ds.Name),
+		)
+	}
+
+	// The DiskName field contains the NAA ID (e.g., "naa.600508b1001c1234567890abcdef1234")
+	naaID := vmfsInfo.Vmfs.Extent[0].DiskName
+
+	r.Log.Info("Retrieved NAA ID for datastore",
+		"datastore", ds.Name,
+		"naaID", naaID,
+		"vmfsVersion", vmfsInfo.Vmfs.Version,
+		"vmfsUUID", vmfsInfo.Vmfs.Uuid,
+		"extentCount", len(vmfsInfo.Vmfs.Extent))
+
+	return naaID, nil
 }

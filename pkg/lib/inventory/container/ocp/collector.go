@@ -2,23 +2,96 @@ package ocp
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"net/http"
 	"path"
 	"time"
 
+	net "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	ocp "github.com/kubev2v/forklift/pkg/lib/client/openshift"
+	liberr "github.com/kubev2v/forklift/pkg/lib/error"
+	fb "github.com/kubev2v/forklift/pkg/lib/filebacked"
 	libmodel "github.com/kubev2v/forklift/pkg/lib/inventory/model"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
 	core "k8s.io/api/core/v1"
+	storage "k8s.io/api/storage/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
+	cnv "kubevirt.io/api/core/v1"
+	instancetype "kubevirt.io/api/instancetype/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
 	RetryDelay = time.Second * 5
 )
+
+var (
+	// ErrNotImplemented is returned by NilDB methods as they are not implemented.
+	ErrNotImplemented = fmt.Errorf("not implemented")
+)
+
+// NilDB is a no-op implementation of the DB interface.
+// Used by the OCP collector which doesn't require database operations.
+type NilDB struct{}
+
+func (n *NilDB) Open(bool) error {
+	return ErrNotImplemented
+}
+
+func (n *NilDB) Close(bool) error {
+	return ErrNotImplemented
+}
+
+func (n *NilDB) Execute(sql string) (sql.Result, error) {
+	return nil, ErrNotImplemented
+}
+
+func (n *NilDB) Get(libmodel.Model) error {
+	return ErrNotImplemented
+}
+
+func (n *NilDB) List(interface{}, libmodel.ListOptions) error {
+	return ErrNotImplemented
+}
+
+func (n *NilDB) Find(interface{}, libmodel.ListOptions) (fb.Iterator, error) {
+	return nil, ErrNotImplemented
+}
+
+func (n *NilDB) Count(libmodel.Model, libmodel.Predicate) (int64, error) {
+	return 0, ErrNotImplemented
+}
+
+func (n *NilDB) Begin(...string) (*libmodel.Tx, error) {
+	return nil, ErrNotImplemented
+}
+
+func (n *NilDB) With(fn func(*libmodel.Tx) error, labels ...string) error {
+	return ErrNotImplemented
+}
+
+func (n *NilDB) Insert(libmodel.Model) error {
+	return ErrNotImplemented
+}
+
+func (n *NilDB) Update(libmodel.Model, ...libmodel.Predicate) error {
+	return ErrNotImplemented
+}
+
+func (n *NilDB) Delete(libmodel.Model) error {
+	return ErrNotImplemented
+}
+
+func (n *NilDB) Watch(libmodel.Model, libmodel.EventHandler) (*libmodel.Watch, error) {
+	return nil, ErrNotImplemented
+}
+
+func (n *NilDB) EndWatch(watch *libmodel.Watch) {
+}
 
 // Cluster.
 type Cluster interface {
@@ -39,6 +112,8 @@ type Collector struct {
 	client client.Client
 	// cancel function.
 	cancel func()
+	//
+	errors map[string]error
 }
 
 // New collector.
@@ -57,6 +132,7 @@ func New(
 		cluster:     cluster,
 		secret:      secret,
 		log:         log,
+		errors:      make(map[string]error),
 	}
 }
 
@@ -72,7 +148,7 @@ func (r *Collector) Owner() meta.Object {
 
 // Get the DB.
 func (r *Collector) DB() libmodel.DB {
-	return nil
+	return &NilDB{}
 }
 
 // Get the Client.
@@ -96,7 +172,47 @@ func (r *Collector) HasParity() bool {
 
 // Test connection with credentials.
 func (r *Collector) Test() (int, error) {
-	return 0, r.buildClient()
+	if err := r.buildClient(); err != nil {
+		return 0, err
+	}
+
+	// Test permissions for all resource types that the OCP provider needs
+	testResources := []struct {
+		resource string
+		list     client.ObjectList
+	}{
+		{"namespaces", &core.NamespaceList{}},
+		{"storageclasses", &storage.StorageClassList{}},
+		{"network-attachment-definitions", &net.NetworkAttachmentDefinitionList{}},
+		{"virtualmachines", &cnv.VirtualMachineList{}},
+		{"virtualmachineinstancetypes", &instancetype.VirtualMachineInstancetypeList{}},
+		{"virtualmachineclusterinstancetypes", &instancetype.VirtualMachineClusterInstancetypeList{}},
+	}
+
+	ctx := context.TODO()
+	for _, resource := range testResources {
+		listOptions := &client.ListOptions{Limit: 1}
+
+		if err := r.client.List(ctx, resource.list, listOptions); err != nil {
+			r.log.Info(
+				"Permission test failed for resource",
+				"resource", resource.resource,
+				"error", err.Error())
+
+			var statusCode int
+			apiStatus, ok := err.(k8serrors.APIStatus)
+			if ok {
+				statusCode = int(apiStatus.Status().Code)
+			} else {
+				statusCode = http.StatusInternalServerError
+			}
+			return statusCode, liberr.New(fmt.Sprintf(
+				"Failed to get resource %s: %v",
+				resource.resource, err))
+		}
+	}
+
+	return 0, nil
 }
 
 // Start the collector.
@@ -175,4 +291,12 @@ func (r *Collector) buildClient() (err error) {
 		})
 
 	return
+}
+
+func (r *Collector) ClearError(kind string) {
+	delete(r.errors, kind)
+}
+
+func (r *Collector) SetError(kind string, err error) {
+	r.errors[kind] = err
 }

@@ -10,7 +10,6 @@ import (
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web"
 	model "github.com/kubev2v/forklift/pkg/controller/provider/web/vsphere"
-	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 )
 
@@ -27,8 +26,10 @@ const (
 
 // Steps.
 const (
-	DiskTransfer = "DiskTransfer"
-	NotFound     = "NotFound"
+	DiskTransfer    = "DiskTransfer"
+	DiskTransferV2v = "DiskTransferV2v"
+	DiskAllocation  = "DiskAllocation"
+	NotFound        = "NotFound"
 )
 
 // Package level mutex to ensure that
@@ -124,16 +125,6 @@ func (r *Scheduler) buildInFlight() (err error) {
 		vm := &model.VM{}
 		err = r.Source.Inventory.Find(vm, vmStatus.Ref)
 		if err != nil {
-			if errors.As(err, &web.NotFoundError{}) {
-				vmStatus.SetCondition(libcnd.Condition{
-					Type:     api.ConditionCanceled,
-					Status:   libcnd.True,
-					Category: api.CategoryAdvisory,
-					Reason:   NotFound,
-					Message:  "VM was not found in inventory.",
-					Durable:  true,
-				})
-			}
 			return
 		}
 		if vmStatus.Running() {
@@ -216,8 +207,8 @@ func (r *Scheduler) buildPending() (err error) {
 }
 
 func (r *Scheduler) cost(vm *model.VM, vmStatus *plan.VMStatus) int {
-	useV2vForTransfer, _ := r.Plan.ShouldUseV2vForTransfer()
-	if useV2vForTransfer {
+	useV2vForTransfer, _ := r.Plan.ShouldUseV2vForTransfer(vmStatus.Ref, r.Destination.Client)
+	if useV2vForTransfer || r.Plan.IsUsingOffloadPlugin() {
 		switch vmStatus.Phase {
 		case CreateVM, PostHook, Completed:
 			// In these phases we already have the disk transferred and are left only to create the VM
@@ -245,7 +236,8 @@ func (r *Scheduler) cost(vm *model.VM, vmStatus *plan.VMStatus) int {
 func (r *Scheduler) finishedDisks(vmStatus *plan.VMStatus) int {
 	var resp = 0
 	for _, step := range vmStatus.Pipeline {
-		if step.Name == DiskTransfer {
+		switch step.Name {
+		case DiskTransfer, DiskTransferV2v, DiskAllocation:
 			for _, task := range step.Tasks {
 				if task.Phase == Completed {
 					resp += 1

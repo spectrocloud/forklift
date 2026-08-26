@@ -4,19 +4,30 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
+	"time"
 
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	"github.com/kubev2v/forklift/pkg/controller/base"
+	hvutil "github.com/kubev2v/forklift/pkg/controller/hyperv"
+	"github.com/kubev2v/forklift/pkg/controller/ova"
 	"github.com/kubev2v/forklift/pkg/controller/provider/container"
+	vsphere "github.com/kubev2v/forklift/pkg/controller/provider/model/vsphere"
 	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
+	"github.com/kubev2v/forklift/pkg/lib/inventory/model"
 	libref "github.com/kubev2v/forklift/pkg/lib/ref"
 	"github.com/kubev2v/forklift/pkg/lib/util"
+	appsv1 "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -32,7 +43,18 @@ const (
 	ConnectionTestFailed    = "ConnectionTestFailed"
 	InventoryCreated        = "InventoryCreated"
 	LoadInventory           = "LoadInventory"
+	InventoryError          = "InventoryError"
 	ConnectionInsecure      = "ConnectionInsecure"
+	SSHReady                = "SSHReady"
+	SSHNotReady             = "SSHNotReady"
+	SMBCSIDriverNotReady    = "SMBCSIDriverNotReady"
+	SMBMountFailed          = "SMBMountFailed"
+	WaitingForService       = "WaitingForService"
+)
+
+// CSI driver names
+const (
+	SMBCSIDriverName = "smb.csi.k8s.io"
 )
 
 // Categories
@@ -65,6 +87,16 @@ const (
 	Staging          = "Staging"
 )
 
+const (
+	ReasonContainerCreating       = "ContainerCreating"
+	ReasonErrImagePull            = "ErrImagePull"
+	ReasonImagePullBackOff        = "ImagePullBackOff"
+	ReasonInvalidImageName        = "InvalidImageName"
+	ReasonCrashLoopBackOff        = "CrashLoopBackOff"
+	ReasonCreateContainerCfgError = "CreateContainerConfigError"
+	ReasonCreateContainerError    = "CreateContainerError"
+)
+
 // Statuses
 const (
 	True  = libcnd.True
@@ -93,6 +125,19 @@ func (r *Reconciler) validate(provider *api.Provider) error {
 	if err != nil {
 		return liberr.Wrap(err)
 	}
+
+	// Validate SSH readiness for vSphere providers when SSH method is enabled
+	err = r.validateSSHReadiness(provider, secret)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+
+	// Validate SMB CSI driver for HyperV providers
+	err = r.validateSMBCSI(provider)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+
 	if !provider.Status.HasBlockerCondition() {
 		provider.Status.SetCondition(
 			libcnd.Condition{
@@ -158,6 +203,20 @@ func (r *Reconciler) validateURL(provider *api.Provider) error {
 		}
 		return nil
 	}
+	if provider.Type() == api.HyperV {
+		if provider.Spec.URL == "" {
+			provider.Status.Phase = ValidationFailed
+			provider.Status.SetCondition(
+				libcnd.Condition{
+					Type:     UrlNotValid,
+					Status:   True,
+					Reason:   Malformed,
+					Category: Critical,
+					Message:  "The Hyper-V host address is required (e.g., '192.168.1.100')",
+				})
+		}
+		return nil
+	}
 	_, err := url.Parse(provider.Spec.URL)
 	if err != nil {
 		provider.Status.Phase = ValidationFailed
@@ -174,8 +233,8 @@ func (r *Reconciler) validateURL(provider *api.Provider) error {
 	return nil
 }
 
-func (r *Reconciler) validateConnectionStatus(provider *api.Provider, secret *core.Secret) {
-	if base.GetInsecureSkipVerifyFlag(secret) {
+func (r *Reconciler) validateTLSConnection(provider *api.Provider, secret *core.Secret, tlsURL string, insecureSkipVerify bool) {
+	if insecureSkipVerify {
 		provider.Status.SetCondition(libcnd.Condition{
 			Type:     ConnectionInsecure,
 			Status:   True,
@@ -183,18 +242,43 @@ func (r *Reconciler) validateConnectionStatus(provider *api.Provider, secret *co
 			Category: Warn,
 			Message:  "TLS is susceptible to machine-in-the-middle attacks when certificate verification is skipped.",
 		})
-	} else {
-		_, err := base.VerifyTLSConnection(provider.Spec.URL, secret)
-		if err != nil {
-			provider.Status.SetCondition(libcnd.Condition{
-				Type:     ConnectionTestFailed,
-				Status:   True,
-				Reason:   Tested,
-				Category: Critical,
-				Message:  err.Error(),
-			})
+		return
+	}
+
+	_, err := base.VerifyTLSConnection(tlsURL, secret)
+	if err != nil {
+		provider.Status.SetCondition(libcnd.Condition{
+			Type:     ConnectionTestFailed,
+			Status:   True,
+			Reason:   Tested,
+			Category: Critical,
+			Message:  err.Error(),
+		})
+	}
+}
+
+// buildTLSURL constructs https://host:port for non-standard HTTPS ports.
+func buildTLSURL(addr string, port int) string {
+	addr = strings.TrimSpace(addr)
+
+	addr = strings.TrimPrefix(addr, "https://")
+	addr = strings.TrimPrefix(addr, "http://")
+
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// No port - check for IPv6 brackets
+		if strings.HasPrefix(addr, "[") && strings.HasSuffix(addr, "]") {
+			host = addr[1 : len(addr)-1]
+		} else {
+			host = addr
 		}
 	}
+
+	// Handle IPv6 addresses
+	if strings.Contains(host, ":") {
+		return fmt.Sprintf("https://[%s]:%d", host, port)
+	}
+	return fmt.Sprintf("https://%s:%d", host, port)
 }
 
 // Validate secret (ref).
@@ -248,7 +332,17 @@ func (r *Reconciler) validateSecret(provider *api.Provider) (secret *core.Secret
 			"password",
 		}
 
-		r.validateConnectionStatus(provider, secret)
+		// Check insecure flag once and use it for both validation and connection status
+		insecureSkipVerify := base.GetInsecureSkipVerifyFlag(secret)
+
+		// Validate required keys based on TLS settings
+		if !insecureSkipVerify && !util.HasCACert(secret) {
+			keyList = append(keyList, "ca.crt")
+			break
+		}
+
+		// Validate connection status
+		r.validateTLSConnection(provider, secret, provider.Spec.URL, insecureSkipVerify)
 
 		var providerUrl *url.URL
 		providerUrl, err = url.Parse(provider.Spec.URL)
@@ -266,6 +360,8 @@ func (r *Reconciler) validateSecret(provider *api.Provider) (secret *core.Secret
 				Category: Critical,
 				Message:  err.Error(),
 			})
+			err = nil
+			//nolint:nilerr
 			return
 		}
 		provider.Status.Fingerprint = util.Fingerprint(crt)
@@ -283,13 +379,42 @@ func (r *Reconciler) validateSecret(provider *api.Provider) (secret *core.Secret
 				Category: Warn,
 				Message:  "TLS is susceptible to machine-in-the-middle attacks when certificate verification is skipped.",
 			})
-		} else {
-			keyList = append(keyList, "cacert")
+		} else if !util.HasCACert(secret) {
+			keyList = append(keyList, "ca.crt")
 		}
 	case api.Ova:
 		keyList = []string{
 			"url",
 		}
+	case api.HyperV:
+		keyList = []string{
+			hvutil.SecretFieldUsername,
+			hvutil.SecretFieldPassword,
+			hvutil.SecretFieldSMBUrl,
+		}
+
+		if smbUrl, found := secret.Data[hvutil.SecretFieldSMBUrl]; found {
+			if !isValidSMBPath(string(smbUrl)) {
+				provider.Status.Phase = ValidationFailed
+				provider.Status.SetCondition(
+					libcnd.Condition{
+						Type:     SecretNotValid,
+						Status:   True,
+						Reason:   DataErr,
+						Category: Critical,
+						Message:  "The smbUrl in secret is malformed. Expected format: //server/share, \\\\server\\share, or smb://server/share",
+					})
+				break
+			}
+		}
+
+		insecureSkipVerify := base.GetInsecureSkipVerifyFlag(secret)
+		if !insecureSkipVerify && !util.HasCACert(secret) {
+			keyList = append(keyList, "ca.crt")
+			break
+		}
+		tlsURL := buildTLSURL(provider.Spec.URL, hvutil.WinRMPort(provider.Spec.Settings))
+		r.validateTLSConnection(provider, secret, tlsURL, insecureSkipVerify)
 	}
 	for _, key := range keyList {
 		if _, found := secret.Data[key]; !found {
@@ -310,6 +435,21 @@ func (r *Reconciler) testConnection(provider *api.Provider, secret *core.Secret)
 	if provider.Status.HasBlockerCondition() {
 		return nil
 	}
+
+	// For OVA providers, check if the inventory service pod is ready before testing connection
+	if provider.Type() == api.Ova {
+		if ready := r.checkOVAServiceReady(provider); !ready {
+			return nil
+		}
+	}
+
+	// For HyperV providers, check if the provider-server pod (SMB mount) is ready
+	if provider.Type() == api.HyperV {
+		if !r.checkHyperVServiceReady(provider) {
+			return nil
+		}
+	}
+
 	rl := container.Build(nil, provider, secret)
 	status, err := rl.Test()
 	if err == nil {
@@ -360,6 +500,249 @@ func (r *Reconciler) testConnection(provider *api.Provider, secret *core.Secret)
 	return nil
 }
 
+func (r *Reconciler) checkOVAServiceReady(provider *api.Provider) bool {
+	pendingTimeout := providerServicePendingTimeout()
+
+	if provider.Status.Service == nil {
+		log.Info("Waiting for OVA inventory service to be created.")
+		provider.Status.SetCondition(
+			libcnd.Condition{
+				Type:     WaitingForService,
+				Status:   True,
+				Reason:   Started,
+				Category: Advisory,
+				Message:  "Waiting for OVA inventory service to be created.",
+			})
+		return false
+	}
+
+	// Service exists, check if the Deployment has ready replicas
+	labeler := ova.Labeler{}
+	deploymentList := &appsv1.DeploymentList{}
+	err := r.List(
+		context.TODO(),
+		deploymentList,
+		&client.ListOptions{
+			LabelSelector: labels.SelectorFromSet(labeler.ProviderLabels(provider)),
+			Namespace:     Settings.Namespace,
+		})
+
+	if err != nil {
+		// If we can't list deployments, log but don't fail - allow connection test to proceed
+		log.Error(err, "Failed to list deployments for OVA provider")
+		return true
+	}
+
+	if len(deploymentList.Items) == 0 {
+		// No deployment found yet, keep waiting
+		log.Info("Waiting for OVA inventory service deployment to be created.")
+		provider.Status.SetCondition(
+			libcnd.Condition{
+				Type:     WaitingForService,
+				Status:   True,
+				Reason:   Started,
+				Category: Advisory,
+				Message:  "Waiting for OVA inventory service deployment to be created.",
+			})
+		return false
+	}
+
+	deployment := &deploymentList.Items[0]
+	if deployment.Status.ReadyReplicas == 0 {
+		// Check if pods are in error state before just waiting
+		podList := &core.PodList{}
+		err := r.List(
+			context.TODO(),
+			podList,
+			&client.ListOptions{
+				LabelSelector: labels.SelectorFromSet(labeler.ProviderLabels(provider)),
+				Namespace:     Settings.Namespace,
+			})
+
+		if err != nil {
+			// If we can't list pods, log but continue waiting
+			log.Error(err, "Failed to list pods for OVA provider")
+		} else if len(podList.Items) > 0 {
+			pod := &podList.Items[0]
+
+			// Check for container errors
+			for _, containerStatus := range pod.Status.ContainerStatuses {
+				if waiting := containerStatus.State.Waiting; waiting != nil {
+					switch waiting.Reason {
+					case ReasonErrImagePull, ReasonImagePullBackOff, ReasonInvalidImageName:
+						provider.Status.Phase = ValidationFailed
+						provider.Status.SetCondition(
+							libcnd.Condition{
+								Type:     ConnectionTestFailed,
+								Status:   True,
+								Reason:   Tested,
+								Category: Critical,
+								Message:  fmt.Sprintf("OVA inventory service has image error: %s - %s", waiting.Reason, waiting.Message),
+							})
+						return false
+					case ReasonCrashLoopBackOff, ReasonCreateContainerCfgError, ReasonCreateContainerError:
+						provider.Status.Phase = ValidationFailed
+						provider.Status.SetCondition(
+							libcnd.Condition{
+								Type:     ConnectionTestFailed,
+								Status:   True,
+								Reason:   Tested,
+								Category: Critical,
+								Message:  fmt.Sprintf("OVA inventory service failed to start: %s - %s", waiting.Reason, waiting.Message),
+							})
+						return false
+					}
+				}
+			}
+
+			// Check for pods stuck in pending state (e.g., mount failures)
+			if pod.Status.Phase == core.PodPending {
+				if time.Since(pod.CreationTimestamp.Time) > pendingTimeout {
+					provider.Status.Phase = ValidationFailed
+					provider.Status.SetCondition(
+						libcnd.Condition{
+							Type:     ConnectionTestFailed,
+							Status:   True,
+							Reason:   Tested,
+							Category: Critical,
+							Message:  fmt.Sprintf("OVA inventory service '%s' has been pending for over %s. Check pod events for mount or configuration errors.", pod.Name, pendingTimeout),
+						})
+					return false
+				}
+			}
+		}
+
+		// No errors found, continue waiting
+		log.Info("Waiting for OVA inventory service to become ready.",
+			"deployment", deployment.Name,
+			"replicas", deployment.Status.Replicas,
+			"readyReplicas", deployment.Status.ReadyReplicas)
+		provider.Status.SetCondition(
+			libcnd.Condition{
+				Type:     WaitingForService,
+				Status:   True,
+				Reason:   Started,
+				Category: Advisory,
+				Message:  "Waiting for OVA inventory service to become ready.",
+			})
+		return false
+	}
+
+	// Deployment has ready replicas, proceed with connection test
+	log.Info("OVA inventory service pod is ready, proceeding with connection test.",
+		"deployment", deployment.Name,
+		"readyReplicas", deployment.Status.ReadyReplicas)
+	return true
+}
+
+func (r *Reconciler) checkHyperVServiceReady(provider *api.Provider) bool {
+	if provider.Status.Service == nil {
+		setWaitingForService(provider, "Waiting for Hyper-V provider service to be created.")
+		return false
+	}
+
+	pods, err := r.listHyperVProviderPods(provider)
+	if err != nil {
+		log.Error(err, "Failed to list pods for Hyper-V provider")
+		setWaitingForService(provider, "Failed to list Hyper-V provider server pods, will retry.")
+		return false
+	}
+
+	if len(pods) == 0 {
+		setWaitingForService(provider, "Waiting for Hyper-V provider server pod to be created.")
+		return false
+	}
+
+	if msg, stuck := findStuckSMBMount(pods); stuck {
+		log.Info("Hyper-V provider pod appears stuck on SMB mount", "detail", msg)
+		provider.Status.Phase = ValidationFailed
+		provider.Status.SetCondition(libcnd.Condition{
+			Type:     SMBMountFailed,
+			Status:   True,
+			Reason:   Tested,
+			Category: Critical,
+			Message:  fmt.Sprintf("Hyper-V provider server SMB mount failed: %s", msg),
+		})
+		return false
+	}
+
+	if !anyPodReady(pods) {
+		setWaitingForService(provider, "Waiting for Hyper-V provider server pod to become ready.")
+		return false
+	}
+
+	provider.Status.DeleteCondition(SMBMountFailed)
+	provider.Status.DeleteCondition(WaitingForService)
+	return true
+}
+
+func (r *Reconciler) listHyperVProviderPods(provider *api.Provider) ([]core.Pod, error) {
+	labeler := hvutil.Labeler{}
+	podList := &core.PodList{}
+	err := r.List(context.TODO(), podList, &client.ListOptions{
+		LabelSelector: labels.SelectorFromSet(labeler.ProviderLabels(provider)),
+		Namespace:     Settings.Namespace,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return podList.Items, nil
+}
+
+func setWaitingForService(provider *api.Provider, message string) {
+	provider.Status.SetCondition(libcnd.Condition{
+		Type:     WaitingForService,
+		Status:   True,
+		Reason:   Started,
+		Category: Advisory,
+		Message:  message,
+	})
+}
+
+func findStuckSMBMount(pods []core.Pod) (string, bool) {
+	for i := range pods {
+		if msg, stuck := smbMountBlocked(&pods[i]); stuck {
+			return msg, true
+		}
+	}
+	return "", false
+}
+
+func anyPodReady(pods []core.Pod) bool {
+	for i := range pods {
+		if isPodReady(&pods[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+func smbMountBlocked(pod *core.Pod) (string, bool) {
+	pendingTimeout := providerServicePendingTimeout()
+
+	// Only flag pods that have been scheduled to a node (NodeName set) — if a
+	// pod is unscheduled, the delay is a scheduling/resource issue, not a mount
+	// failure.
+	if pod.Status.Phase == core.PodPending && pod.Spec.NodeName != "" &&
+		time.Since(pod.CreationTimestamp.Time) > pendingTimeout {
+		return fmt.Sprintf("pod %s has been pending for over %s on node %s, check pod events for mount errors", pod.Name, pendingTimeout, pod.Spec.NodeName), true
+	}
+	return "", false
+}
+
+func providerServicePendingTimeout() time.Duration {
+	return time.Duration(Settings.Providers.ProviderPendingTimeoutSeconds) * time.Second
+}
+
+func isPodReady(pod *core.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == core.PodReady {
+			return c.Status == core.ConditionTrue
+		}
+	}
+	return false
+}
+
 // Validate inventory created.
 func (r *Reconciler) inventoryCreated(provider *api.Provider) error {
 	if provider.Status.HasBlockerCondition() {
@@ -385,28 +768,536 @@ func (r *Reconciler) inventoryCreated(provider *api.Provider) error {
 					Message:  "Loading the inventory.",
 				})
 		}
+	} else {
+		log.Info("No collector found", "provider", provider)
 	}
 
 	return nil
-}
-
-func (r *Reconciler) handleServerCreationFailure(provider *api.Provider, err error) {
-	provider.Status.Phase = ConnectionFailed
-	msg := fmt.Sprint("The OVA provider server creation failed: ", err)
-	provider.Status.SetCondition(
-		libcnd.Condition{
-			Type:     ConnectionFailed,
-			Status:   True,
-			Category: Critical,
-			Message:  msg,
-		})
-	if updateErr := r.Status().Update(context.TODO(), provider.DeepCopy()); updateErr != nil {
-		log.Error(updateErr, "Failed to update provider status")
-	}
 }
 
 func isValidNFSPath(nfsPath string) bool {
 	nfsRegex := `^[^:]+:\/[^:].*$`
 	re := regexp.MustCompile(nfsRegex)
 	return re.MatchString(nfsPath)
+}
+
+// hostInfo holds information about a host for SSH testing
+type hostInfo struct {
+	id   string
+	name string
+	ip   string
+}
+
+// getHostsForSSHValidation retrieves the list of hosts to test for SSH readiness
+// Returns a slice of hostInfo with name and IP, or sets a condition and returns nil on error
+func (r *Reconciler) getHostsForSSHValidation(provider *api.Provider) []hostInfo {
+	sdkEndpoint := provider.Spec.Settings[api.SDK]
+	isDirectESXi := (sdkEndpoint == api.ESXI)
+
+	r.Log.Info("SSH validation: provider connection type",
+		"provider", provider.Name,
+		"sdkEndpoint", sdkEndpoint,
+		"isDirectESXi", isDirectESXi)
+
+	if isDirectESXi {
+		// For direct ESXi connections, extract IP from provider URL
+		r.Log.Info("SSH validation: direct ESXi connection detected, extracting IP from provider URL",
+			"provider", provider.Name,
+			"providerURL", provider.Spec.URL)
+
+		providerURL, err := url.Parse(provider.Spec.URL)
+		if err != nil {
+			provider.Status.SetCondition(libcnd.Condition{
+				Type:     SSHNotReady,
+				Status:   True,
+				Reason:   "InvalidProviderURL",
+				Category: Warn,
+				Message:  fmt.Sprintf("Cannot validate SSH readiness (checked because 'esxiCloneMethod' setting is set to 'ssh'): failed to parse provider URL: %v", err),
+			})
+			return nil
+		}
+
+		// Extract hostname/IP from URL (could be hostname:port or just hostname)
+		hostIP := providerURL.Hostname()
+		if hostIP == "" {
+			provider.Status.SetCondition(libcnd.Condition{
+				Type:     SSHNotReady,
+				Status:   True,
+				Reason:   "NoHostIPInURL",
+				Category: Warn,
+				Message:  fmt.Sprintf("Cannot validate SSH readiness (checked because 'esxiCloneMethod' setting is set to 'ssh'): no host/IP found in provider URL: %s", provider.Spec.URL),
+			})
+			return nil
+		}
+
+		r.Log.Info("SSH validation: extracted IP from provider URL",
+			"provider", provider.Name,
+			"hostIP", hostIP)
+
+		// Single host for direct ESXi
+		return []hostInfo{{id: hostIP, name: "ESXi", ip: hostIP}}
+	}
+
+	// For vCenter connections, get ESXi hosts from inventory
+	r.Log.Info("SSH validation: vCenter connection, getting hosts from inventory", "provider", provider.Name, "namespace", provider.Namespace)
+
+	collector, found := r.container.Get(provider)
+	if !found {
+		r.Log.Error(nil, "SSH validation: collector not found", "provider", provider.Name)
+		return nil
+	}
+
+	// Get hosts from inventory
+	db := collector.DB()
+	var inventoryHosts []vsphere.Host
+	listOptions := model.ListOptions{Detail: model.MaxDetail}
+	err := db.List(&inventoryHosts, listOptions)
+	if err != nil {
+		r.Log.Error(err, "SSH validation: failed to list hosts from inventory", "provider", provider.Name)
+		provider.Status.SetCondition(libcnd.Condition{
+			Type:     SSHNotReady,
+			Status:   True,
+			Reason:   "HostListError",
+			Category: Warn,
+			Message:  fmt.Sprintf("Cannot validate SSH readiness (checked because 'esxiCloneMethod' setting is set to 'ssh'): failed to list hosts from inventory: %v", err),
+		})
+		return nil
+	}
+
+	r.Log.Info("SSH validation: found hosts in inventory",
+		"provider", provider.Name,
+		"hostCount", len(inventoryHosts))
+
+	if len(inventoryHosts) == 0 {
+		r.Log.Info("SSH validation: no hosts in inventory", "provider", provider.Name)
+		provider.Status.SetCondition(libcnd.Condition{
+			Type:     SSHNotReady,
+			Status:   True,
+			Reason:   "NoHostsFound",
+			Category: Warn,
+			Message:  "Cannot validate SSH readiness (checked because 'esxiCloneMethod' setting is set to 'ssh'): no ESXi hosts found in inventory.",
+		})
+		return nil
+	}
+
+	// Load Host CRDs to check for migration network IPs (optional override)
+	hostCRDIPs := r.loadHostIPs(provider)
+	r.Log.Info("SSH validation: loaded Host resources for migration network",
+		"provider", provider.Name,
+		"hostCRDCount", len(hostCRDIPs))
+
+	// Build list of hosts to test
+	var hostsToTest []hostInfo
+	hostsWithIP := 0
+	hostsWithoutIP := 0
+
+	for i := range inventoryHosts {
+		invHost := &inventoryHosts[i]
+		var hostIP string
+
+		// First check if there's a Host CRD with IpAddress (migration network)
+		if ip, found := hostCRDIPs[invHost.ID]; found && ip != "" {
+			hostIP = ip
+			r.Log.V(3).Info("SSH validation: using Host IpAddress (migration network)",
+				"hostName", invHost.Name,
+				"hostID", invHost.ID,
+				"ipAddress", hostIP)
+		} else if len(invHost.ManagementIPs) > 0 {
+			// Fall back to ManagementIPs from inventory
+			hostIP = invHost.ManagementIPs[0]
+			r.Log.V(3).Info("SSH validation: using ManagementIP from inventory",
+				"hostName", invHost.Name,
+				"hostID", invHost.ID,
+				"ipAddress", hostIP)
+		}
+
+		if hostIP != "" {
+			hostsWithIP++
+			hostsToTest = append(hostsToTest, hostInfo{id: invHost.ID, name: invHost.Name, ip: hostIP})
+		} else {
+			hostsWithoutIP++
+			r.Log.V(3).Info("SSH validation: host has no IP",
+				"hostName", invHost.Name,
+				"hostID", invHost.ID)
+		}
+	}
+
+	r.Log.Info("SSH validation: host summary",
+		"provider", provider.Name,
+		"totalHosts", len(inventoryHosts),
+		"hostsWithIP", hostsWithIP,
+		"hostsWithoutIP", hostsWithoutIP)
+
+	if hostsWithIP == 0 {
+		r.Log.Error(nil, "SSH validation: no hosts with IP found", "provider", provider.Name)
+		provider.Status.SetCondition(libcnd.Condition{
+			Type:     SSHNotReady,
+			Status:   True,
+			Reason:   "NoHostIP",
+			Category: Warn,
+			Message:  fmt.Sprintf("Cannot validate SSH readiness (checked because 'esxiCloneMethod' setting is set to 'ssh'): no ESXi hosts with IP address found (found %d hosts total).", len(inventoryHosts)),
+		})
+		return nil
+	}
+
+	return hostsToTest
+}
+
+// loadHostIPs loads Host CRDs for the provider and returns a map of host ID/Name to IpAddress
+func (r *Reconciler) loadHostIPs(provider *api.Provider) map[string]string {
+	result := make(map[string]string)
+
+	hostList := &api.HostList{}
+	err := r.List(
+		context.TODO(),
+		hostList,
+		&client.ListOptions{
+			Namespace: provider.Namespace,
+		},
+	)
+	if err != nil {
+		r.Log.V(3).Info("SSH validation: failed to list Host resources", "error", err)
+		return result
+	}
+
+	for i := range hostList.Items {
+		host := &hostList.Items[i]
+
+		// Skip hosts that don't belong to this provider
+		if !libref.Equals(&host.Spec.Provider, &core.ObjectReference{
+			Kind:      "Provider",
+			Namespace: provider.Namespace,
+			Name:      provider.Name,
+		}) {
+			continue
+		}
+
+		// Skip hosts that are not ready or have no IpAddress
+		if !host.Status.HasCondition(libcnd.Ready) || host.Spec.IpAddress == "" {
+			continue
+		}
+
+		// Map by ID for lookup
+		if host.Spec.ID != "" {
+			result[host.Spec.ID] = host.Spec.IpAddress
+		}
+	}
+
+	return result
+}
+
+// validateSSHReadiness validates SSH readiness for vSphere providers when SSH method is enabled
+func (r *Reconciler) validateSSHReadiness(provider *api.Provider, secret *core.Secret) error {
+	// Only validate SSH for vSphere providers
+	if provider.Type() != api.VSphere {
+		r.Log.V(3).Info("SSH validation: skipping non-vSphere provider",
+			"provider", provider.Name,
+			"providerType", provider.Type())
+		return nil
+	}
+
+	// Skip SSH validation if inventory is not ready yet
+	inventoryCondition := provider.Status.FindCondition(InventoryCreated)
+	if inventoryCondition == nil || inventoryCondition.Status != True {
+		r.Log.V(3).Info("SSH validation: skipping - inventory not ready yet",
+			"provider", provider.Name,
+			"hasInventoryCondition", inventoryCondition != nil)
+		return nil
+	}
+
+	// Check if ESXiCloneMethod is set to "ssh"
+	esxiCloneMethod, methodSet := provider.Spec.Settings[api.ESXiCloneMethod]
+	if !methodSet || esxiCloneMethod != api.ESXiCloneMethodSSH {
+		r.Log.V(3).Info("SSH validation: SSH method not enabled, skipping",
+			"provider", provider.Name,
+			"esxiCloneMethod", esxiCloneMethod,
+			"methodSet", methodSet)
+		// SSH method not enabled, remove any existing SSH readiness conditions
+		provider.Status.DeleteCondition(SSHReady)
+		provider.Status.DeleteCondition(SSHNotReady)
+		return nil
+	}
+
+	r.Log.Info("SSH validation: starting validation for vSphere provider with SSH method enabled",
+		"provider", provider.Name,
+		"namespace", provider.Namespace,
+		"providerType", provider.Type())
+
+	// Check if SSH keys exist (they should be created by ensureSSHKeys)
+	privateSecretName, err := util.GenerateSSHPrivateSecretName(provider.Name)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+	publicSecretName, err := util.GenerateSSHPublicSecretName(provider.Name)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+
+	// Try to get the SSH key secrets
+	privateSecret := &core.Secret{}
+	err = r.Get(context.TODO(), client.ObjectKey{
+		Namespace: provider.Namespace,
+		Name:      privateSecretName,
+	}, privateSecret)
+
+	publicSecret := &core.Secret{}
+	err2 := r.Get(context.TODO(), client.ObjectKey{
+		Namespace: provider.Namespace,
+		Name:      publicSecretName,
+	}, publicSecret)
+
+	if err != nil || err2 != nil {
+		// SSH keys don't exist yet - this is expected on first reconcile
+		// They will be created by ensureSSHKeys after validation
+		provider.Status.SetCondition(libcnd.Condition{
+			Type:     SSHNotReady,
+			Status:   True,
+			Reason:   "SSHKeysNotFound",
+			Category: Warn,
+			Message: fmt.Sprintf(
+				"SSH keys are being generated (checked because 'esxiCloneMethod' setting is set to 'ssh'). "+
+					"After keys are created, you must manually install the public key on each ESXi host. "+
+					"Expected secrets: %s, %s",
+				privateSecretName, publicSecretName),
+		})
+
+		//nolint:nilerr
+		return nil
+	}
+
+	// Get public key content
+	publicKeyBytes, ok := publicSecret.Data["public-key"]
+	if !ok {
+		provider.Status.SetCondition(libcnd.Condition{
+			Type:     SSHNotReady,
+			Status:   True,
+			Reason:   "SSHPublicKeyInvalid",
+			Category: Warn,
+			Message:  fmt.Sprintf("SSH public key secret '%s' does not contain 'public-key' data (checked because 'esxiCloneMethod' setting is set to 'ssh')", publicSecretName),
+		})
+		return nil
+	}
+	publicKey := string(publicKeyBytes)
+
+	publicKeyPreview := publicKey
+	if len(publicKey) > 60 {
+		publicKeyPreview = publicKey[:60] + "..."
+	}
+	r.Log.V(3).Info("SSH validation: loaded public key from secret",
+		"provider", provider.Name,
+		"publicKeyLength", len(publicKey),
+		"publicKeyPreview", publicKeyPreview)
+
+	// Get private key for testing
+	privateKeyBytes, ok := privateSecret.Data["private-key"]
+	if !ok {
+		provider.Status.SetCondition(libcnd.Condition{
+			Type:     SSHNotReady,
+			Status:   True,
+			Reason:   "SSHPrivateKeyInvalid",
+			Category: Warn,
+			Message:  fmt.Sprintf("SSH private key secret '%s' does not contain 'private-key' data (checked because 'esxiCloneMethod' setting is set to 'ssh')", privateSecretName),
+		})
+		return nil
+	}
+
+	privateKeyPreview := string(privateKeyBytes)
+	if len(privateKeyBytes) > 60 {
+		privateKeyPreview = string(privateKeyBytes[:60]) + "..."
+	}
+	r.Log.V(3).Info("SSH validation: loaded private key from secret",
+		"provider", provider.Name,
+		"privateKeyLength", len(privateKeyBytes),
+		"privateKeyPreview", privateKeyPreview)
+
+	// Get list of hosts to test based on provider connection type
+	hostsToTest := r.getHostsForSSHValidation(provider)
+	if hostsToTest == nil {
+		// Error condition already set by getHostsForSSHValidation
+		return nil
+	}
+
+	r.Log.Info("SSH validation: hosts to test",
+		"provider", provider.Name,
+		"hostCount", len(hostsToTest))
+
+	// Build the restricted key format with dynamic datastore routing
+	restrictedKey := fmt.Sprintf(`command="%s",no-port-forwarding,no-agent-forwarding,no-X11-forwarding %s`, util.RestrictedSSHCommandTemplate, publicKey)
+
+	// Log the keys being used
+	r.Log.V(3).Info("SSH validation: key details for testing",
+		"provider", provider.Name,
+		"publicKeyLength", len(publicKey),
+		"publicKeyPrefix", func() string {
+			if len(publicKey) > 40 {
+				return publicKey[:40] + "..."
+			}
+			return publicKey
+		}(),
+		"restrictedKeyLength", len(restrictedKey),
+		"privateKeyLength", len(privateKeyBytes))
+
+	// Test SSH connectivity on ALL hosts (don't stop early)
+	r.Log.Info("SSH validation: testing all hosts for complete status",
+		"provider", provider.Name,
+		"totalHosts", len(hostsToTest))
+	failedHosts := []string{}
+	successHosts := []string{}
+
+	// Test all hosts to provide complete status
+	for i := range hostsToTest {
+		host := &hostsToTest[i]
+		if host.ip == "" {
+			r.Log.Info("SSH validation: host has no management IP - marking as failed",
+				"provider", provider.Name,
+				"hostName", host.name)
+			failedHosts = append(failedHosts, fmt.Sprintf("%s (no management IP)", host.name))
+			continue
+		}
+		r.Log.V(3).Info("SSH validation: testing host",
+			"provider", provider.Name,
+			"hostName", host.name,
+			"hostIP", host.ip,
+			"hostIndex", i+1,
+			"totalHosts", len(hostsToTest))
+		hostResult := r.testSSHConnectivity(host.ip, privateKeyBytes)
+		r.Log.V(3).Info("SSH validation: host test result",
+			"provider", provider.Name,
+			"hostName", host.name,
+			"hostIP", host.ip,
+			"success", hostResult)
+
+		// Store as "id|name|ip" so Plan can parse and reformat
+		itemStr := fmt.Sprintf("%s|%s|%s", host.id, host.name, host.ip)
+		if hostResult {
+			successHosts = append(successHosts, itemStr)
+		} else {
+			failedHosts = append(failedHosts, itemStr)
+		}
+	}
+
+	r.Log.Info("SSH validation: all hosts tested",
+		"provider", provider.Name,
+		"successCount", len(successHosts),
+		"failedCount", len(failedHosts))
+
+	// If all hosts passed, remove all SSH conditions - everything is working fine
+	if len(failedHosts) == 0 {
+		r.Log.Info("SSH validation: all hosts have SSH working",
+			"provider", provider.Name,
+			"hostCount", len(hostsToTest))
+		provider.Status.DeleteCondition(SSHReady)
+		provider.Status.DeleteCondition(SSHNotReady)
+		return nil
+	}
+
+	// Handle successful hosts - set advisory condition only if there's a mix (some passed, some failed)
+	if len(successHosts) > 0 {
+		var successSuggestion strings.Builder
+		successSuggestion.WriteString("ESXi hosts with SSH connectivity validated:\n\n")
+		for _, item := range successHosts {
+			// Parse "id|name|ip" format for human-readable display
+			parts := strings.Split(item, "|")
+			if len(parts) == 3 {
+				successSuggestion.WriteString(fmt.Sprintf("  - %s (%s)\n", parts[1], parts[2]))
+			} else {
+				successSuggestion.WriteString(fmt.Sprintf("  - %s\n", item))
+			}
+		}
+		successSuggestion.WriteString("\nTo use the xcopy volume populator, ensure your VMs are located on these ESXi hosts before starting the migration.\n")
+
+		provider.Status.SetCondition(libcnd.Condition{
+			Type:       SSHReady,
+			Status:     True,
+			Reason:     "SSHConnectivityValidated",
+			Category:   Advisory,
+			Message:    "SSH connectivity validated (checked because 'esxiCloneMethod' setting is set to 'ssh'). See the suggestion field in the Provider's YAML for the list of available ESXi hosts.",
+			Suggestion: successSuggestion.String(),
+			Items:      successHosts,
+		})
+	} else {
+		provider.Status.DeleteCondition(SSHReady)
+	}
+
+	// Handle failed hosts - set warning condition
+	var failSuggestion strings.Builder
+	failSuggestion.WriteString("HOSTS REQUIRING SSH SETUP:\n\n")
+	for _, item := range failedHosts {
+		// Parse "id|name|ip" format for human-readable display
+		parts := strings.Split(item, "|")
+		if len(parts) == 3 {
+			failSuggestion.WriteString(fmt.Sprintf("  - %s (%s)\n", parts[1], parts[2]))
+		} else {
+			failSuggestion.WriteString(fmt.Sprintf("  - %s\n", item))
+		}
+	}
+	failSuggestion.WriteString("\n")
+
+	failSuggestion.WriteString("SETUP INSTRUCTIONS:\n\n")
+	failSuggestion.WriteString("1. Enable SSH on each ESXi host:\n")
+	failSuggestion.WriteString("   vim-cmd hostsvc/enable_ssh\n")
+	failSuggestion.WriteString("   vim-cmd hostsvc/start_ssh\n\n")
+	failSuggestion.WriteString("2. Add the following line to /etc/ssh/keys-root/authorized_keys on each ESXi host:\n\n")
+	failSuggestion.WriteString(restrictedKey + "\n\n")
+
+	provider.Status.SetCondition(libcnd.Condition{
+		Type:       SSHNotReady,
+		Status:     True,
+		Reason:     "SSHConnectivityFailed",
+		Category:   Warn,
+		Message:    "SSH readiness validation issue (checked because 'esxiCloneMethod' setting is set to 'ssh'). See the suggestion field in the Provider's YAML for details.",
+		Suggestion: failSuggestion.String(),
+		Items:      failedHosts,
+	})
+
+	return nil
+}
+
+// testSSHConnectivity tests SSH connectivity to an ESXi host
+// This matches the exact implementation from the populator's testSSHConnectivity
+func (r *Reconciler) testSSHConnectivity(hostIP string, privateKey []byte) bool {
+	return util.TestSSHConnectivity(context.Background(), hostIP, privateKey, r.Log)
+}
+
+func isValidSMBPath(smbPath string) bool {
+	// Normalize Windows UNC paths to //server/share format
+	normalized := smbPath
+	normalized = regexp.MustCompile(`\\`).ReplaceAllString(normalized, "/")
+
+	// Accept smb://server/share, //server/share, or \\server\share formats
+	// Must have at least server and share name
+	smbRegex := `^(smb:)?\/\/[^\/\s]+\/[^\/\s].*$`
+	re := regexp.MustCompile(smbRegex)
+	return re.MatchString(normalized)
+}
+
+// validateSMBCSI validates that the SMB CSI driver is installed for HyperV providers.
+// HyperV migrations require the SMB CSI driver (smb.csi.k8s.io) to mount SMB shares.
+func (r *Reconciler) validateSMBCSI(provider *api.Provider) error {
+	if provider.Type() != api.HyperV {
+		return nil
+	}
+
+	// Check if SMB CSI driver exists
+	csiDriver := &storagev1.CSIDriver{}
+	err := r.Get(context.TODO(), types.NamespacedName{Name: SMBCSIDriverName}, csiDriver)
+	if k8serrors.IsNotFound(err) {
+		provider.Status.Phase = ValidationFailed
+		provider.Status.SetCondition(libcnd.Condition{
+			Type:     SMBCSIDriverNotReady,
+			Status:   True,
+			Category: Critical,
+			Reason:   NotFound,
+			Message: "SMB CSI driver (smb.csi.k8s.io) is not available. " +
+				"Ensure the CIFS/SMB CSI Driver Operator is installed and that the ClusterCSIDriver CR for smb.csi.k8s.io exists.",
+		})
+		return nil
+	}
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+
+	// SMB CSI driver is installed - remove any previous condition
+	provider.Status.DeleteCondition(SMBCSIDriverNotReady)
+	return nil
 }

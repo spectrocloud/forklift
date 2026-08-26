@@ -17,6 +17,7 @@ import (
 	"github.com/kubev2v/forklift/pkg/forklift-api/webhooks/util"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
+	libutil "github.com/kubev2v/forklift/pkg/lib/util"
 	admissionv1 "k8s.io/api/admission/v1beta1"
 	core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -79,7 +80,19 @@ func (mutator *SecretMutator) mutateProviderSecret() *admissionv1.AdmissionRespo
 		}
 
 		certPool := x509.NewCertPool()
-		ok := certPool.AppendCertsFromPEM(mutator.secret.Data["cacert"])
+		existingCACert, hasCert := libutil.GetCACert(&mutator.secret)
+		if !hasCert {
+			err = liberr.Wrap(errors.New("CA certificate not found in secret"))
+			log.Error(err, "CA certificate is missing")
+			return &admissionv1.AdmissionResponse{
+				Allowed: false,
+				Result: &metav1.Status{
+					Message: "CA certificate is required for oVirt provider in secure mode (insecureSkipVerify=false).",
+					Code:    http.StatusBadRequest,
+				},
+			}
+		}
+		ok := certPool.AppendCertsFromPEM(existingCACert)
 		if !ok {
 			err = liberr.Wrap(errors.New("failed to parse certificate"))
 			log.Error(err, "Certificate is not valid")
@@ -106,9 +119,14 @@ func (mutator *SecretMutator) mutateProviderSecret() *admissionv1.AdmissionRespo
 			return util.ToAdmissionResponseError(err)
 		}
 
-		//check if the CA included in the secrete provided by the user and update it if needed
-		if !contains(mutator.secret.Data["cacert"], cert) {
-			mutator.secret.Data["cacert"] = appendCerts(mutator.secret.Data["cacert"], cert)
+		//check if the CA included in the secret provided by the user and update it if needed
+		if !contains(existingCACert, cert) {
+			// Normalize and migrate the CA cert to the new format.
+			mutator.secret.Data["ca.crt"] = appendCerts(existingCACert, cert)
+
+			// Optional: clean up the legacy field while we're here to accelerate migration.
+			delete(mutator.secret.Data, "cacert")
+
 			mutator.secret.Labels["ca-cert-updated"] = "true"
 			secretChanged = true
 			log.Info("Engine CA certificate was missing, updating the secret")
@@ -160,6 +178,7 @@ func (mutator *SecretMutator) mutateHostSecret() *admissionv1.AdmissionResponse 
 	if _, ok := mutator.secret.GetLabels()["createdForResource"]; ok { // checking this just because there's no point in mutating an invalid secret
 		var secretChanged bool
 		if user, ok := mutator.secret.Data["user"]; !ok || string(user) == "" {
+			// Fetch the provider secret if the user is not set
 			provider := &api.Provider{}
 			providerName := string(mutator.secret.Data["provider"])
 			providerNamespace := mutator.secret.Namespace
@@ -179,9 +198,36 @@ func (mutator *SecretMutator) mutateHostSecret() *admissionv1.AdmissionResponse 
 				secretChanged = true
 				log.Info("copied credentials from ESXi provider to its Host")
 			}
-			if secretChanged {
-				return mutator.patchSecret()
+		}
+
+		if _, hasInsecureSkipVerify := mutator.secret.Data["insecureSkipVerify"]; !hasInsecureSkipVerify {
+			// Fetch the provider to get the insecureSkipVerify setting
+			provider := &api.Provider{}
+			providerName := string(mutator.secret.Data["provider"])
+			providerNamespace := mutator.secret.Namespace
+			if err := mutator.Client.Get(context.TODO(), client.ObjectKey{Namespace: providerNamespace, Name: providerName}, provider); err != nil {
+				log.Error(err, "failed to find provider for insecureSkipVerify setting")
+				return util.ToAdmissionResponseError(err)
 			}
+
+			// Fetch the provider secret
+			ref := provider.Spec.Secret
+			providerSecret := &core.Secret{}
+			if err := mutator.Client.Get(context.TODO(), client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, providerSecret); err != nil {
+				log.Error(err, "failed to get provider secret for insecureSkipVerify setting")
+				return util.ToAdmissionResponseError(err)
+			}
+
+			// Copy the skip verify setting from the provider secret if it exists
+			if insecureSkipVerify, ok := providerSecret.Data["insecureSkipVerify"]; ok {
+				mutator.secret.Data["insecureSkipVerify"] = insecureSkipVerify
+				secretChanged = true
+				log.Info("copied insecureSkipVerify setting from provider secret to host secret")
+			}
+		}
+
+		if secretChanged {
+			return mutator.patchSecret()
 		}
 	}
 	return util.ToAdmissionResponseAllow()

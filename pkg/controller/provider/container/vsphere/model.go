@@ -12,14 +12,17 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 )
 
-// Bus types
+// Bus types — re-exported from the model package for backward compatibility.
 const (
-	NVME = "nvme"
-	USB  = "usb"
-	SATA = "sata"
-	SCSI = "scsi"
-	IDE  = "ide"
+	NVME = model.NVME
+	USB  = model.USB
+	SATA = model.SATA
+	SCSI = model.SCSI
+	IDE  = model.IDE
 )
+
+// CtkEnabledKey is the VMware ExtraConfig key for Changed Block Tracking (canonical form).
+const CtkEnabledKey = "ctkEnabled"
 
 // Model adapter.
 // Each adapter provides provider-specific management of a model.
@@ -96,7 +99,7 @@ func (b *Base) RefList(in types.AnyType) (list []model.Ref) {
 func (b *Base) Decoded(in types.AnyType) (s string) {
 	var cast bool
 	if s, cast = in.(string); cast {
-		decoded, err := url.QueryUnescape(s)
+		decoded, err := url.PathUnescape(s)
 		if err == nil {
 			s = decoded
 		}
@@ -278,6 +281,10 @@ func (v *HostAdapter) Apply(u types.ObjectUpdate) {
 				if b, cast := p.Val.(int16); cast {
 					v.model.CpuCores = b
 				}
+			case fHostMemorySize:
+				if n, cast := p.Val.(int64); cast {
+					v.model.MemoryBytes = n
+				}
 			case fProductName:
 				if s, cast := p.Val.(string); cast {
 					v.model.ProductName = s
@@ -354,15 +361,24 @@ func (v *HostAdapter) Apply(u types.ObjectUpdate) {
 							}
 							return
 						}
+						// Extract all IPv6 addresses
+						var ipv6Addresses []string
+						if nic.Spec.Ip.IpV6Config != nil {
+							for _, ipv6 := range nic.Spec.Ip.IpV6Config.IpV6Address {
+								ipv6Addresses = append(ipv6Addresses, ipv6.IpAddress)
+							}
+						}
 						network.VNICs = append(
 							network.VNICs,
 							model.VNIC{
-								Key:        nic.Key,
-								PortGroup:  nic.Portgroup,
-								DPortGroup: dGroup(),
-								IpAddress:  nic.Spec.Ip.IpAddress,
-								SubnetMask: nic.Spec.Ip.SubnetMask,
-								MTU:        nic.Spec.Mtu,
+								Key:         nic.Key,
+								Device:      nic.Device,
+								PortGroup:   nic.Portgroup,
+								DPortGroup:  dGroup(),
+								IpAddress:   nic.Spec.Ip.IpAddress,
+								IpV6Address: ipv6Addresses,
+								SubnetMask:  nic.Spec.Ip.SubnetMask,
+								MTU:         nic.Spec.Mtu,
 							})
 					}
 					sort.Slice(
@@ -370,6 +386,25 @@ func (v *HostAdapter) Apply(u types.ObjectUpdate) {
 						func(i, j int) bool {
 							return network.VNICs[i].MTU > network.VNICs[j].MTU
 						})
+				}
+			case fVirtualNicManagerNet:
+				if array, cast := p.Val.(types.ArrayOfVirtualNicManagerNetConfig); cast {
+					v.model.ManagementIPs = nil
+					for _, nc := range array.VirtualNicManagerNetConfig {
+						if nc.NicType != string(types.HostVirtualNicManagerNicTypeManagement) {
+							continue
+						}
+						for ix := range nc.CandidateVnic {
+							for _, selectedVnicKey := range nc.SelectedVnic {
+								if nc.CandidateVnic[ix].Key != selectedVnicKey {
+									continue
+								}
+								if nc.CandidateVnic[ix].Spec.Ip.IpAddress != "" {
+									v.model.ManagementIPs = append(v.model.ManagementIPs, nc.CandidateVnic[ix].Spec.Ip.IpAddress)
+								}
+							}
+						}
+					}
 				}
 			case fScsiLun:
 				if array, cast := p.Val.(types.ArrayOfScsiLun); cast {
@@ -579,16 +614,47 @@ func (v *DatastoreAdapter) Apply(u types.ObjectUpdate) {
 					v.model.MaintenanceMode = s
 				}
 			case fVmfsExtent:
-				if s, cast := p.Val.(types.VmfsDatastoreInfo); cast {
-					backingDevList := []string{}
-					for _, val := range s.Vmfs.Extent {
-						backingDevList = append(backingDevList, val.DiskName)
-					}
-					v.model.BackingDevicesNames = backingDevList
-				}
+				applyDatastoreInfoProperty(p.Val, &v.model)
 			}
 		}
 	}
+}
+
+// applyDatastoreInfoProperty decodes the datastore "info" property, which is either
+// VMFS (LUN extent names) or NAS (NfsDatastoreInfo with HostNasVolume details).
+func applyDatastoreInfoProperty(val types.AnyType, ds *model.Datastore) {
+	if val == nil {
+		return
+	}
+	switch t := val.(type) {
+	case types.VmfsDatastoreInfo:
+		backing := []string{}
+		if t.Vmfs != nil {
+			for _, e := range t.Vmfs.Extent {
+				backing = append(backing, e.DiskName)
+			}
+		}
+		ds.BackingDevicesNames = backing
+	case *types.VmfsDatastoreInfo:
+		if t != nil {
+			applyDatastoreInfoProperty(*t, ds)
+		}
+	case types.NasDatastoreInfo:
+		applyNasDatastoreNfsInfo(t, ds)
+	case *types.NasDatastoreInfo:
+		if t != nil {
+			applyNasDatastoreNfsInfo(*t, ds)
+		}
+	}
+}
+
+func applyNasDatastoreNfsInfo(info types.NasDatastoreInfo, ds *model.Datastore) {
+	if info.Nas == nil {
+		return
+	}
+	ds.NasRemoteHost = info.Nas.RemoteHost
+	ds.NasRemotePath = info.Nas.RemotePath
+	ds.NasRemoteHostNames = append([]string(nil), info.Nas.RemoteHostNames...)
 }
 
 // VM model adapter.
@@ -647,6 +713,10 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 			case fUUID:
 				if s, cast := p.Val.(string); cast {
 					v.model.UUID = s
+				}
+			case fInstanceUUID:
+				if s, cast := p.Val.(string); cast {
+					v.model.InstanceUUID = s
 				}
 			case fFirmware:
 				if s, cast := p.Val.(string); cast {
@@ -727,6 +797,12 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 				if s, cast := p.Val.(string); cast {
 					v.model.HostName = s
 				}
+			case fToolsStatus:
+				v.model.ToolsStatus = fmt.Sprint(p.Val)
+			case fToolsRunningStatus:
+				v.model.ToolsRunningStatus = fmt.Sprint(p.Val)
+			case fToolsVersionStatus:
+				v.model.ToolsVersionStatus = fmt.Sprint(p.Val)
 			case fTpmPresent:
 				if b, cast := p.Val.(bool); cast {
 					v.model.TpmEnabled = b
@@ -766,7 +842,7 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 							if s, cast := opt.Value.(string); cast {
 								v.model.NumaNodeAffinity = strings.Split(s, ",")
 							}
-						} else if opt.Key == "ctkEnabled" {
+						} else if strings.EqualFold(opt.Key, CtkEnabledKey) {
 							if s, cast := opt.Value.(string); cast {
 								boolVal, err := strconv.ParseBool(s)
 								if err != nil {
@@ -782,15 +858,16 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 								}
 								v.model.DiskEnableUuid = boolVal
 							}
-						} else if hasDiskPrefix(opt.Key) && strings.HasSuffix(opt.Key, ".ctkEnabled") {
-
+						} else if hasDiskPrefix(opt.Key) && strings.HasSuffix(strings.ToLower(opt.Key), "."+strings.ToLower(CtkEnabledKey)) {
 							if s, cast := opt.Value.(string); cast {
 								boolVal, err := strconv.ParseBool(s)
 								if err != nil {
 									return
 								}
 								if boolVal {
-									ctkPerDisk[strings.Split(opt.Key, ".")[0]] = true
+									// Normalize to lowercase so lookup in isCBTEnabledForDisks matches (disk.Bus is lowercase)
+									deviceKey := strings.ToLower(strings.Split(opt.Key, ".")[0])
+									ctkPerDisk[deviceKey] = true
 								}
 							}
 						}
@@ -807,23 +884,33 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 				}
 			case fGuestDisk:
 				if disks, cast := p.Val.(types.ArrayOfGuestDiskInfo); cast {
-					v.model.GuestDisks = make([]model.GuestDisk, len(disks.GuestDiskInfo))
-					for i, info := range disks.GuestDiskInfo {
-						v.model.GuestDisks[i] = model.GuestDisk{
+					var diskMountPoints []model.DiskMountPoint
+					for _, info := range disks.GuestDiskInfo {
+						// Default to 0 so the policy can flag missing mappings
+						guestDiskKey := int32(0)
+						if len(info.Mappings) > 0 {
+							// VMware guarantees at least one mapping when non-empty
+							guestDiskKey = info.Mappings[0].Key
+						}
+						diskMountPoint := model.DiskMountPoint{
 							DiskPath:       info.DiskPath,
 							Capacity:       info.Capacity,
 							FreeSpace:      info.FreeSpace,
 							FilesystemType: info.FilesystemType,
+							Key:            guestDiskKey,
 						}
-					}
 
-					// Update matching disk items with Windows drive letters based on index
-					for i, guestDisk := range v.model.GuestDisks {
-						if i < len(v.model.Disks) {
-							winDriveLetter := v.extractWinDriveLetter(guestDisk.DiskPath)
-							v.model.Disks[i].WinDriveLetter = winDriveLetter
+						// Check for m.model.Disks with the same key (disk keys are expected to be unique)
+						for i, disk := range v.model.Disks {
+							if disk.Key == diskMountPoint.Key {
+								// Update the Disk's WinDriveLetter using the new DiskMountPoint's DiskPath
+								v.model.Disks[i].WinDriveLetter = extractWindowsDriveLetter(diskMountPoint.DiskPath)
+								break
+							}
 						}
+						diskMountPoints = append(diskMountPoints, diskMountPoint)
 					}
+					v.model.GuestDisks = diskMountPoints
 				}
 			case fGuestNet:
 				if nics, cast := p.Val.(types.ArrayOfGuestNicInfo); cast {
@@ -838,12 +925,14 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 								dnsList = info.DnsConfig.IpAddress
 							}
 							guestNetworksList = append(guestNetworksList, model.GuestNetwork{
-								MAC:          strings.ToLower(info.MacAddress),
-								IP:           ip.IpAddress,
-								Origin:       ip.Origin,
-								PrefixLength: ip.PrefixLength,
-								DNS:          dnsList,
-								Device:       strconv.Itoa(index),
+								MAC:            strings.ToLower(info.MacAddress),
+								IP:             ip.IpAddress,
+								Origin:         ip.Origin,
+								PrefixLength:   ip.PrefixLength,
+								DNS:            dnsList,
+								Device:         strconv.Itoa(index),
+								DeviceConfigId: info.DeviceConfigId,
+								Network:        info.Network,
 							})
 						}
 					}
@@ -909,6 +998,8 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 							nic = &device.VirtualEthernetCard
 						case *types.VirtualVmxnet3:
 							nic = &device.VirtualEthernetCard
+						case *types.VirtualPCNet32:
+							nic = &device.VirtualEthernetCard
 						}
 
 						if nic != nil && nic.Backing != nil {
@@ -933,8 +1024,9 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 							nicList = append(
 								nicList,
 								model.NIC{
-									MAC:   strings.ToLower(nic.MacAddress),
-									Index: nicsIndex,
+									MAC:       strings.ToLower(nic.MacAddress),
+									Index:     nicsIndex,
+									DeviceKey: nic.Key,
 									Network: model.Ref{
 										Kind: model.NetKind,
 										ID:   network,
@@ -955,16 +1047,57 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 						SortNICsByGuestNetworkOrder(&v.model)
 					}
 				}
+			case fAvailableField:
+				if customFields, cast := p.Val.(types.ArrayOfCustomFieldDef); cast {
+					customDef := []model.CustomFieldDef{}
+					for _, f := range customFields.CustomFieldDef {
+						customDef = append(customDef, model.CustomFieldDef{
+							Name:              f.Name,
+							Key:               f.Key,
+							ManagedObjectType: f.ManagedObjectType,
+						})
+					}
+
+					v.model.CustomDef = customDef
+				}
+			case fCustomValue:
+				customValues := []model.CustomFieldValue{}
+				switch cv := p.Val.(type) {
+				case []types.BaseCustomFieldValue:
+					for _, field := range cv {
+						if strVal, ok := field.(*types.CustomFieldStringValue); ok {
+							customValues = append(customValues, model.CustomFieldValue{
+								Key:   strVal.Key,
+								Value: strVal.Value,
+							})
+						}
+					}
+				case types.ArrayOfCustomFieldValue:
+					for _, field := range cv.CustomFieldValue {
+						if strVal, ok := field.(*types.CustomFieldStringValue); ok {
+							customValues = append(customValues, model.CustomFieldValue{
+								Key:   strVal.Key,
+								Value: strVal.Value,
+							})
+						}
+					}
+				}
+				v.model.CustomValues = customValues
+			case fConsolidationNeeded:
+				if b, cast := p.Val.(bool); cast {
+					v.model.ConsolidationNeeded = b
+				}
 			}
 		}
 	}
 }
 
 func hasDiskPrefix(key string) bool {
-	return strings.HasPrefix(key, SCSI) ||
-		strings.HasPrefix(key, SATA) ||
-		strings.HasPrefix(key, IDE) ||
-		strings.HasPrefix(key, NVME)
+	keyLower := strings.ToLower(key)
+	return strings.HasPrefix(keyLower, SCSI) ||
+		strings.HasPrefix(keyLower, SATA) ||
+		strings.HasPrefix(keyLower, IDE) ||
+		strings.HasPrefix(keyLower, NVME)
 }
 
 func isCBTEnabledForDisks(ctkPerDisk map[string]bool, disks []model.Disk) {
@@ -976,7 +1109,7 @@ func isCBTEnabledForDisks(ctkPerDisk map[string]bool, disks []model.Disk) {
 		// then subtract it from the ControllerKey. For example, 16001 → controllerIndex 1 (16001 - 16000).
 		baseKey := (disk.ControllerKey / 100) * 100
 		controllerIndex := disk.ControllerKey - baseKey
-		deviceKey := fmt.Sprintf("%s%d:%d", disk.Bus, controllerIndex, disk.UnitNumber)
+		deviceKey := strings.ToLower(fmt.Sprintf("%s%d:%d", disk.Bus, controllerIndex, disk.UnitNumber))
 
 		if ctkPerDisk[deviceKey] {
 			disk.ChangeTrackingEnabled = true
@@ -984,6 +1117,18 @@ func isCBTEnabledForDisks(ctkPerDisk map[string]bool, disks []model.Disk) {
 			disk.ChangeTrackingEnabled = false
 		}
 	}
+}
+
+// extractWindowsDriveLetter extracts the drive letter from a Windows disk path.
+// Returns the lowercase drive letter if the path is a Windows path (e.g., "C:\\"),
+// otherwise returns an empty string.
+func extractWindowsDriveLetter(diskPath string) string {
+	// Check if this looks like a Windows drive letter (e.g., "C:\\")
+	if len(diskPath) == 3 && diskPath[1] == ':' && (diskPath[2] == '\\' || diskPath[2] == '/') {
+		// Extract the drive letter and convert to lowercase
+		return strings.ToLower(string(diskPath[0]))
+	}
+	return ""
 }
 
 // Update virtual disk devices.
@@ -1055,6 +1200,17 @@ func (v *VmAdapter) getDiskController(key int32) *model.Controller {
 	return nil
 }
 
+// getDiskGuestInfo retrieves the guest disk information for a given device key.
+func (v *VmAdapter) getDiskGuestInfo(deviceKey int32) *model.DiskMountPoint {
+	for i := range v.model.GuestDisks {
+		if v.model.GuestDisks[i].Key == deviceKey {
+			return &v.model.GuestDisks[i]
+		}
+	}
+
+	return nil
+}
+
 // Update virtual disk devices.
 func (v *VmAdapter) updateDisks(devArray *types.ArrayOfVirtualDevice) {
 	disks := []model.Disk{}
@@ -1063,17 +1219,31 @@ func (v *VmAdapter) updateDisks(devArray *types.ArrayOfVirtualDevice) {
 		case *types.VirtualDisk:
 			disk := dev.(*types.VirtualDisk)
 			controller := v.getDiskController(disk.ControllerKey)
+			guestDiskInfo := v.getDiskGuestInfo(disk.Key)
+
+			// If controller is not nil, get the disk bus from the controller
+			bus := ""
+			if controller != nil {
+				bus = controller.Bus
+			}
+
+			// Try to extract the Windows drive letter from the guest disk info
+			winDriveLetter := ""
+			if guestDiskInfo != nil {
+				winDriveLetter = extractWindowsDriveLetter(guestDiskInfo.DiskPath)
+			}
 
 			switch backing := disk.Backing.(type) {
 			case *types.VirtualDiskFlatVer1BackingInfo:
 				md := model.Disk{
-					Key:           disk.Key,
-					UnitNumber:    *disk.UnitNumber,
-					ControllerKey: disk.ControllerKey,
-					File:          backing.FileName,
-					Capacity:      disk.CapacityInBytes,
-					Mode:          backing.DiskMode,
-					Bus:           controller.Bus,
+					Key:            disk.Key,
+					UnitNumber:     *disk.UnitNumber,
+					ControllerKey:  disk.ControllerKey,
+					File:           backing.FileName,
+					Capacity:       disk.CapacityInBytes,
+					Mode:           backing.DiskMode,
+					Bus:            bus,
+					WinDriveLetter: winDriveLetter,
 				}
 				if backing.Datastore != nil {
 					datastoreId, _ := sanitize(backing.Datastore.Value)
@@ -1082,18 +1252,25 @@ func (v *VmAdapter) updateDisks(devArray *types.ArrayOfVirtualDevice) {
 						ID:   datastoreId,
 					}
 				}
+				if backing.Parent != nil {
+					md.ParentFile = backing.Parent.FileName
+				}
 				disks = append(disks, md)
 			case *types.VirtualDiskFlatVer2BackingInfo:
 				md := model.Disk{
-					Key:           disk.Key,
-					UnitNumber:    *disk.UnitNumber,
-					ControllerKey: disk.ControllerKey,
-					File:          backing.FileName,
-					Capacity:      disk.CapacityInBytes,
-					Shared:        backing.Sharing != "sharingNone" && backing.Sharing != "",
-					Mode:          backing.DiskMode,
-					Bus:           controller.Bus,
-					Serial:        backing.Uuid,
+					Key:            disk.Key,
+					UnitNumber:     *disk.UnitNumber,
+					ControllerKey:  disk.ControllerKey,
+					File:           backing.FileName,
+					Capacity:       disk.CapacityInBytes,
+					Shared:         backing.Sharing != "sharingNone" && backing.Sharing != "",
+					Mode:           backing.DiskMode,
+					Bus:            bus,
+					Serial:         backing.Uuid,
+					WinDriveLetter: winDriveLetter,
+				}
+				if backing.Parent != nil {
+					md.ParentFile = backing.Parent.FileName
 				}
 				if backing.Datastore != nil {
 					datastoreId, _ := sanitize(backing.Datastore.Value)
@@ -1105,16 +1282,19 @@ func (v *VmAdapter) updateDisks(devArray *types.ArrayOfVirtualDevice) {
 				disks = append(disks, md)
 			case *types.VirtualDiskRawDiskMappingVer1BackingInfo:
 				md := model.Disk{
-					Key:           disk.Key,
-					UnitNumber:    *disk.UnitNumber,
-					ControllerKey: disk.ControllerKey,
-					File:          backing.FileName,
-					Capacity:      disk.CapacityInBytes,
-					Shared:        backing.Sharing != "sharingNone" && backing.Sharing != "",
-					Mode:          backing.DiskMode,
-					RDM:           true,
-					Bus:           controller.Bus,
-					Serial:        backing.Uuid,
+					Key:            disk.Key,
+					UnitNumber:     *disk.UnitNumber,
+					ControllerKey:  disk.ControllerKey,
+					File:           backing.FileName,
+					Capacity:       disk.CapacityInBytes,
+					Shared:         backing.Sharing != "sharingNone" && backing.Sharing != "",
+					Mode:           backing.DiskMode,
+					RDM:            true,
+					PhysicalMode:   backing.CompatibilityMode == string(types.VirtualDiskCompatibilityModePhysicalMode),
+					Bus:            bus,
+					Serial:         backing.Uuid,
+					WinDriveLetter: winDriveLetter,
+					DeviceName:     backing.DeviceName,
 				}
 				if backing.Datastore != nil {
 					datastoreId, _ := sanitize(backing.Datastore.Value)
@@ -1133,31 +1313,18 @@ func (v *VmAdapter) updateDisks(devArray *types.ArrayOfVirtualDevice) {
 					Capacity:      disk.CapacityInBytes,
 					Shared:        backing.Sharing != "sharingNone" && backing.Sharing != "",
 					RDM:           true,
-					Bus:           controller.Bus,
+					// VirtualDiskRawDiskVer2BackingInfo represents direct pass-through
+					// to a physical device without SCSI virtualization, so it is
+					// always treated as physical mode.
+					PhysicalMode:   true,
+					Bus:            bus,
+					WinDriveLetter: winDriveLetter,
+					DeviceName:     backing.DeviceName,
 				}
 				disks = append(disks, md)
 			}
 		}
 	}
 
-	// Update Windows drive letters for all disks based on guest disk information
-	for i := range disks {
-		if i < len(v.model.GuestDisks) {
-			winDriveLetter := v.extractWinDriveLetter(v.model.GuestDisks[i].DiskPath)
-			disks[i].WinDriveLetter = winDriveLetter
-		}
-	}
-
 	v.model.Disks = disks
-}
-
-// extractWinDriveLetter extracts the Windows drive letter from a disk path.
-// For example: "C:\\" returns "c", "/home" returns ""
-func (v *VmAdapter) extractWinDriveLetter(diskPath string) string {
-	// Check if this looks like a Windows drive letter (e.g., "C:\\")
-	if len(diskPath) >= 3 && diskPath[1] == ':' && diskPath[2] == '\\' {
-		// Extract the drive letter and convert to lowercase
-		return strings.ToLower(string(diskPath[0]))
-	}
-	return ""
 }

@@ -1,9 +1,9 @@
 package vsphere
 
 import (
-	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	"github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
+	"github.com/kubev2v/forklift/pkg/controller/plan/ensurer"
 )
 
 // vSphere adapter.
@@ -20,13 +20,16 @@ func (r *Adapter) Builder(ctx *plancontext.Context) (builder base.Builder, err e
 	return
 }
 
+// Constructs a ensurer.
+func (r *Adapter) Ensurer(ctx *plancontext.Context) (ensure base.Ensurer, err error) {
+	e := &ensurer.Ensurer{Context: ctx}
+	ensure = e
+	return
+}
+
 // Constructs a vSphere validator.
-func (r *Adapter) Validator(plan *api.Plan) (validator base.Validator, err error) {
-	v := &Validator{plan: plan}
-	err = v.Load()
-	if err != nil {
-		return
-	}
+func (r *Adapter) Validator(ctx *plancontext.Context) (validator base.Validator, err error) {
+	v := &Validator{Context: ctx}
 	validator = v
 	return
 }

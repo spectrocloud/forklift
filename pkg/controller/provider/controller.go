@@ -18,6 +18,10 @@ package provider
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,10 +42,12 @@ import (
 	libweb "github.com/kubev2v/forklift/pkg/lib/inventory/web"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
 	libref "github.com/kubev2v/forklift/pkg/lib/ref"
+	"github.com/kubev2v/forklift/pkg/lib/util"
 	"github.com/kubev2v/forklift/pkg/settings"
-	appsv1 "k8s.io/api/apps/v1"
+	"golang.org/x/crypto/ssh"
 	v1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apiserver/pkg/storage/names"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -70,7 +76,7 @@ var Settings = &settings.Settings
 func Add(mgr manager.Manager) error {
 	libfb.WorkingDir = Settings.WorkingDir
 	container := libcontainer.New()
-	web := libweb.New(container, web.All(container)...)
+	web := libweb.New(container, web.All(container, mgr.GetClient())...)
 	web.Port = Settings.Inventory.Port
 	if Settings.Inventory.TLS.Key != "" {
 		web.TLS.Enabled = true
@@ -97,7 +103,7 @@ func Add(mgr manager.Manager) error {
 		Name,
 		mgr,
 		controller.Options{
-			MaxConcurrentReconciles: 10,
+			MaxConcurrentReconciles: Settings.MaxConcurrentReconciles,
 			Reconciler:              reconciler,
 		})
 	if err != nil {
@@ -121,7 +127,20 @@ func Add(mgr manager.Manager) error {
 		log.Trace(err)
 		return err
 	}
-
+	err = cnt.Watch(
+		source.Kind(mgr.GetCache(), &api.OVAProviderServer{},
+			libref.TypedHandler[*api.OVAProviderServer](&api.Provider{})))
+	if err != nil {
+		log.Trace(err)
+		return err
+	}
+	err = cnt.Watch(
+		source.Kind(mgr.GetCache(), &api.HyperVProviderServer{},
+			libref.TypedHandler[*api.HyperVProviderServer](&api.Provider{})))
+	if err != nil {
+		log.Trace(err)
+		return err
+	}
 	return nil
 }
 
@@ -168,7 +187,6 @@ func (r Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (r
 		return
 	} else {
 		r.catalog.add(request, provider)
-
 	}
 
 	defer func() {
@@ -192,70 +210,58 @@ func (r Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (r
 		}
 	}
 
-	if provider.Type() == api.Ova && provider.DeletionTimestamp == nil {
-
-		deploymentName := fmt.Sprintf("%s-deployment-%s", ovaServer, provider.Name)
-
-		deployment := &appsv1.Deployment{}
-		err = r.Get(context.TODO(), client.ObjectKey{
-			Namespace: provider.Namespace,
-			Name:      deploymentName},
-			deployment)
-
-		// If the deployment does not exist
-		if err != nil {
-			if k8serr.IsNotFound(err) {
-				err = r.CreateOVAServerDeployment(provider, ctx)
-				if err != nil {
-					r.handleServerCreationFailure(provider, err)
-					return
-				}
-				provider.Status.Phase = Staging
-				provider.Status.SetCondition(
-					libcnd.Condition{
-						Type:     Staging,
-						Status:   True,
-						Category: Required,
-						Message:  "The OVA server is being inizialized.",
-					})
-				err = r.Status().Update(context.TODO(), provider.DeepCopy())
-				result.RequeueAfter = OvaReconcilerRetry
-				return
-			}
-			return
-		}
-
-		// The ova server pod is not running yet
-		if deployment.Status.AvailableReplicas == 0 {
-			if provider.CreationTimestamp.Add(OvaTimeout).After(time.Now()) {
-				result.RequeueAfter = OvaReconcilerRetry
-				return
-			} else { // Timeout reached
-				err = fmt.Errorf("the OVA provider server creation timed out. Please ensure that the NFS export is set correctly")
-				r.handleServerCreationFailure(provider, err)
-				return
-			}
-		}
-	}
-
-	if provider.DeletionTimestamp != nil && k8sutil.ContainsFinalizer(provider, api.OvaProviderFinalizer) {
-		err = r.removeVolumeOfOVAServer(provider)
-		if err != nil {
-			return
-		}
-	}
-
 	// Begin staging conditions.
 	provider.Status.Phase = Staging
 	provider.Status.BeginStagingConditions()
 
+	defer func() {
+		// This must be called before updateProviderStatus to clean up unstaged conditions
+		provider.Status.EndStagingConditions()
+
+		if err == nil {
+			if err = r.updateProviderStatus(provider); err != nil {
+				err = liberr.Wrap(err)
+			}
+		}
+	}()
+
+	// Provider server lifecycle management (OVA, HyperV)
+	if provider.Type() == api.Ova || provider.Type() == api.HyperV {
+		if provider.DeletionTimestamp == nil {
+			// Ensure provider server exists
+			if !provider.HasReconciled() {
+				// Provider has changed, delete old deployment to redeploy
+				err = r.deleteProviderServer(ctx, provider)
+				if err != nil {
+					return
+				}
+			}
+			err = r.ensureProviderServer(ctx, provider)
+			if err != nil {
+				return
+			}
+		} else {
+			// Cleanup during provider deletion
+			err = r.cleanupProviderServer(ctx, provider)
+			if err != nil {
+				return
+			}
+		}
+	}
+
 	// Validations.
 	err = r.validate(provider)
 	if err != nil {
-		if err = r.updateProviderStatus(provider); err != nil {
-			r.Log.Error(err, "failed to update provider status")
-		}
 		return
+	}
+
+	// Ensure SSH keys for vSphere providers
+	if provider.Type() == api.VSphere {
+		err = r.ensureSSHKeys(provider)
+		if err != nil {
+			r.Log.Error(err, "failed to ensure SSH keys for vSphere provider")
+			return
+		}
 	}
 
 	// Update the container.
@@ -277,14 +283,6 @@ func (r Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (r
 			})
 	}
 
-	// End staging conditions.
-	provider.Status.EndStagingConditions()
-
-	if err = r.updateProviderStatus(provider); err != nil {
-		r.Log.Error(err, "failed to update provider status")
-		return
-	}
-
 	// Update the DB.
 	err = r.updateProvider(provider)
 	if err != nil {
@@ -296,6 +294,9 @@ func (r Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (r
 		r.Log.Info(
 			"Waiting connection tested or inventory created.")
 		result.RequeueAfter = base.SlowReQ
+	} else {
+		// requeue so that connections are re-tested periodically
+		result.RequeueAfter = base.LongReQ
 	}
 
 	// Done
@@ -310,6 +311,7 @@ func (r *Reconciler) updateProviderStatus(provider *api.Provider) error {
 	provider.Status.ObservedGeneration = provider.Generation
 
 	if err := r.Status().Update(context.TODO(), provider); err != nil {
+		r.Log.Error(err, "Failed to update provider status", "provider", provider)
 		return err
 	}
 
@@ -328,41 +330,60 @@ func (r *Reconciler) updateProvider(provider *api.Provider) (err error) {
 
 // Update the container.
 func (r *Reconciler) updateContainer(provider *api.Provider) (err error) {
-	if _, found := r.container.Get(provider); found {
-		if provider.HasReconciled() {
-			r.Log.V(1).Info(
-				"Provider not reconciled, postponing.")
-			return
-		}
-	}
-	if provider.Status.HasBlockerCondition() ||
-		!provider.Status.HasCondition(ConnectionTestSucceeded) {
-		r.Log.V(1).Info(
-			"Provider not ready, postponing.")
-		return
-	}
-	log.Info("Update container.")
-	if current, found := r.container.Get(provider); found {
-		current.Shutdown()
-		_ = current.DB().Close(true)
-		r.Log.V(2).Info(
-			"Shutdown found collector.")
-	}
-	db := r.getDB(provider)
+	// Get the secret first to check if credentials have changed
 	secret, err := r.getSecret(provider)
 	if err != nil {
 		return
 	}
+	secretChanged := secret.ResourceVersion != provider.Status.SecretResourceVersion
+
+	if !secretChanged {
+		if _, found := r.container.Get(provider); found {
+			// Don't update if provider hasn't changed
+			if provider.HasReconciled() {
+				r.Log.V(1).Info(
+					"Provider already reconciled and secret unchanged, postponing.")
+				return
+			}
+		}
+
+		// Only build a new collector if connection test succeeded
+		if provider.Status.HasBlockerCondition() ||
+			!provider.Status.HasCondition(ConnectionTestSucceeded) {
+			r.Log.V(1).Info(
+				"Provider not ready, postponing.")
+			return
+		}
+
+	} else {
+		r.Log.V(1).Info(
+			"Detected Secret change.",
+			"old", provider.Status.SecretResourceVersion,
+			"new", secret.ResourceVersion)
+	}
+
+	log.Info("Update container.")
+	db := r.getDB(provider)
 	err = db.Open(true)
 	if err != nil {
 		return
 	}
 
 	collector := container.Build(db, provider, secret)
-	err = r.container.Add(collector)
+	// `Replace` is necessary to remove stale collectors if the secret has changed.
+	old, found, err := r.container.Replace(collector)
 	if err != nil {
 		return
 	}
+	if found {
+		_ = old.DB().Close(true)
+		r.Log.V(2).Info("Replaced collector.")
+	} else {
+		r.Log.V(2).Info("Added new collector.")
+	}
+
+	// Update the secret ResourceVersion in status to track for future changes
+	provider.Status.SecretResourceVersion = secret.ResourceVersion
 
 	r.Log.V(2).Info(
 		"Data collector added/started.")
@@ -452,11 +473,196 @@ func (r *Reconciler) removeVolumeOfOVAServer(provider *api.Provider) error {
 				return err
 			}
 		}
-		clonedProvider := provider.DeepCopy()
-		k8sutil.RemoveFinalizer(provider, api.OvaProviderFinalizer)
-		if err := r.Patch(context.TODO(), provider, client.MergeFrom(clonedProvider)); err != nil {
-			r.Log.Error(err, "Failed to remove finalizer", "provider", provider)
+	}
+	return nil
+}
+
+// ensureSSHKeys generates and stores SSH keys for vSphere providers if they don't exist
+func (r *Reconciler) ensureSSHKeys(provider *api.Provider) error {
+	if provider.Type() != api.VSphere {
+		return nil
+	}
+
+	// Use provider name for SSH key naming
+	providerName := provider.Name
+	if providerName == "" {
+		return fmt.Errorf("provider name is empty")
+	}
+
+	// Check if SSH keys already exist
+	privateSecretName, err := util.GenerateSSHPrivateSecretName(providerName)
+	if err != nil {
+		return fmt.Errorf("failed to generate SSH private secret name: %w", err)
+	}
+	publicSecretName, err := util.GenerateSSHPublicSecretName(providerName)
+	if err != nil {
+		return fmt.Errorf("failed to generate SSH public secret name: %w", err)
+	}
+
+	_, err = r.getSSHKeySecret(provider.Namespace, privateSecretName)
+	if err == nil {
+		// SSH keys already exist, skip generation
+		r.Log.V(1).Info("SSH keys already exist for provider", "provider", provider.Name)
+		return nil
+	}
+
+	if !k8serr.IsNotFound(err) {
+		return fmt.Errorf("failed to check for existing SSH private key secret: %w", err)
+	}
+
+	// Generate new SSH key pair
+	r.Log.Info("Generating SSH keys for vSphere provider", "provider", provider.Name)
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return fmt.Errorf("failed to generate RSA key: %w", err)
+	}
+
+	// Convert private key to PEM format
+	privateKeyPEM := &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	}
+	privateKeyBytes := pem.EncodeToMemory(privateKeyPEM)
+
+	// Convert public key to SSH format
+	publicKey, err := ssh.NewPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return fmt.Errorf("failed to create SSH public key: %w", err)
+	}
+	publicKeyBytes := ssh.MarshalAuthorizedKey(publicKey)
+
+	// Store SSH keys in secrets
+	err = r.storeSSHKeySecret(provider.Namespace, privateSecretName, "private-key", privateKeyBytes, provider)
+	if err != nil {
+		return fmt.Errorf("failed to store private key: %w", err)
+	}
+
+	err = r.storeSSHKeySecret(provider.Namespace, publicSecretName, "public-key", publicKeyBytes, provider)
+	if err != nil {
+		return fmt.Errorf("failed to store public key: %w", err)
+	}
+
+	r.Log.Info("SSH keys generated and stored successfully", "provider", provider.Name)
+	return nil
+}
+
+// getSSHKeySecret retrieves an SSH key secret
+func (r *Reconciler) getSSHKeySecret(namespace, secretName string) (*v1.Secret, error) {
+	secret := &v1.Secret{}
+	key := client.ObjectKey{
+		Namespace: namespace,
+		Name:      secretName,
+	}
+	err := r.Get(context.TODO(), key, secret)
+	return secret, err
+}
+
+// storeSSHKeySecret creates or updates an SSH key secret
+func (r *Reconciler) storeSSHKeySecret(namespace, secretName, keyName string, keyData []byte, provider *api.Provider) error {
+	providerLabel, err := util.SanitizeProviderName(provider.Name)
+	if err != nil {
+		return fmt.Errorf("failed to sanitize provider name for secret label: %w", err)
+	}
+
+	secret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":        "forklift",
+				"app.kubernetes.io/component":   "ssh-keys",
+				"app.kubernetes.io/managed-by":  "forklift-controller",
+				"forklift.konveyor.io/provider": providerLabel,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         provider.APIVersion,
+					Kind:               provider.Kind,
+					Name:               provider.Name,
+					UID:                provider.UID,
+					Controller:         &[]bool{true}[0],
+					BlockOwnerDeletion: &[]bool{true}[0],
+				},
+			},
+		},
+		Type: v1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			keyName: keyData,
+		},
+	}
+
+	err = r.Create(context.TODO(), secret)
+	if err != nil && !k8serr.IsAlreadyExists(err) {
+		return fmt.Errorf("failed to create secret %s: %w", secretName, err)
+	}
+
+	return nil
+}
+
+// ensureProviderServer ensures the provider server deployment exists for OVA/HyperV providers.
+func (r *Reconciler) ensureProviderServer(ctx context.Context, provider *api.Provider) error {
+	switch provider.Type() {
+	case api.Ova:
+		return r.EnsureOVAProviderServer(ctx, provider)
+	case api.HyperV:
+		return r.EnsureHyperVProviderServer(ctx, provider)
+	}
+	return nil
+}
+
+// deleteProviderServer deletes the provider server deployment for OVA/HyperV providers.
+func (r *Reconciler) deleteProviderServer(ctx context.Context, provider *api.Provider) error {
+	switch provider.Type() {
+	case api.Ova:
+		return r.DeleteOVAProviderServer(ctx, provider)
+	case api.HyperV:
+		return r.DeleteHyperVProviderServer(ctx, provider)
+	}
+	return nil
+}
+
+// cleanupProviderServer handles cleanup during provider deletion, including finalizer removal.
+func (r *Reconciler) cleanupProviderServer(ctx context.Context, provider *api.Provider) error {
+	var finalizer string
+	var legacyCleanup func(*api.Provider) error
+
+	switch provider.Type() {
+	case api.Ova:
+		finalizer = api.OvaProviderFinalizer
+		// Legacy OVA PV cleanup (for PVs created before OVAProviderServer CR pattern)
+		// Searches for PVs with old labels (provider name instead of UID)
+		legacyCleanup = r.removeVolumeOfOVAServer
+	case api.HyperV:
+		finalizer = api.HyperVProviderFinalizer
+		legacyCleanup = nil // HyperV uses SMB CSI, no legacy cleanup needed
+	default:
+		return nil
+	}
+
+	// Check if finalizer exists
+	if !k8sutil.ContainsFinalizer(provider, finalizer) {
+		return nil
+	}
+
+	// Legacy cleanup (OVA only)
+	if legacyCleanup != nil {
+		if err := legacyCleanup(provider); err != nil {
+			return err
 		}
 	}
+
+	// Delete provider server
+	if err := r.deleteProviderServer(ctx, provider); err != nil {
+		return err
+	}
+
+	// Remove finalizer
+	clonedProvider := provider.DeepCopy()
+	k8sutil.RemoveFinalizer(provider, finalizer)
+	if err := r.Patch(context.TODO(), provider, client.MergeFrom(clonedProvider)); err != nil {
+		r.Log.Error(err, "Failed to remove finalizer", "provider", provider)
+		return err
+	}
+
 	return nil
 }

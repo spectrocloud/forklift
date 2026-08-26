@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
@@ -12,41 +13,86 @@ import (
 
 // Environment variables.
 const (
-	MaxVmInFlight                  = "MAX_VM_INFLIGHT"
-	HookRetry                      = "HOOK_RETRY"
-	ImporterRetry                  = "IMPORTER_RETRY"
-	VirtV2vImage                   = "VIRT_V2V_IMAGE"
-	vddkImage                      = "VDDK_IMAGE"
-	PrecopyInterval                = "PRECOPY_INTERVAL"
-	VirtV2vDontRequestKVM          = "VIRT_V2V_DONT_REQUEST_KVM"
-	SnapshotRemovalTimeout         = "SNAPSHOT_REMOVAL_TIMEOUT"
-	SnapshotStatusCheckRate        = "SNAPSHOT_STATUS_CHECK_RATE"
-	CDIExportTokenTTL              = "CDI_EXPORT_TOKEN_TTL"
-	FileSystemOverhead             = "FILESYSTEM_OVERHEAD"
-	BlockOverhead                  = "BLOCK_OVERHEAD"
-	CleanupRetries                 = "CLEANUP_RETRIES"
-	DvStatusCheckRetries           = "DV_STATUS_CHECK_RETRIES"
-	SnapshotRemovalCheckRetries    = "SNAPSHOT_REMOVAL_CHECK_RETRIES"
-	OvirtOsConfigMap               = "OVIRT_OS_MAP"
-	VsphereOsConfigMap             = "VSPHERE_OS_MAP"
-	VirtCustomizeConfigMap         = "VIRT_CUSTOMIZE_MAP"
-	VddkJobActiveDeadline          = "VDDK_JOB_ACTIVE_DEADLINE"
-	VirtV2vExtraArgs               = "VIRT_V2V_EXTRA_ARGS"
-	VirtV2vExtraConfConfigMap      = "VIRT_V2V_EXTRA_CONF_CONFIG_MAP"
-	VirtV2vContainerLimitsCpu      = "VIRT_V2V_CONTAINER_LIMITS_CPU"
-	VirtV2vContainerLimitsMemory   = "VIRT_V2V_CONTAINER_LIMITS_MEMORY"
-	VirtV2vContainerRequestsCpu    = "VIRT_V2V_CONTAINER_REQUESTS_CPU"
-	VirtV2vContainerRequestsMemory = "VIRT_V2V_CONTAINER_REQUESTS_MEMORY"
-	HooksContainerLimitsCpu        = "HOOKS_CONTAINER_LIMITS_CPU"
-	HooksContainerLimitsMemory     = "HOOKS_CONTAINER_LIMITS_MEMORY"
-	HooksContainerRequestsCpu      = "HOOKS_CONTAINER_REQUESTS_CPU"
-	HooksContainerRequestsMemory   = "HOOKS_CONTAINER_REQUESTS_MEMORY"
-	OvaContainerLimitsCpu          = "OVA_CONTAINER_LIMITS_CPU"
-	OvaContainerLimitsMemory       = "OVA_CONTAINER_LIMITS_MEMORY"
-	OvaContainerRequestsCpu        = "OVA_CONTAINER_REQUESTS_CPU"
-	OvaContainerRequestsMemory     = "OVA_CONTAINER_REQUESTS_MEMORY"
-	TlsConnectionTimeout           = "TLS_CONNECTION_TIMEOUT"
+	MaxVmInFlight                          = "MAX_VM_INFLIGHT"
+	MaxPopulatorInFlight                   = "MAX_POPULATOR_INFLIGHT"
+	HookRetry                              = "HOOK_RETRY"
+	ImporterRetry                          = "IMPORTER_RETRY"
+	VirtV2vImage                           = "VIRT_V2V_IMAGE"
+	VirtV2vImageXFS                        = "VIRT_V2V_IMAGE_XFS"
+	DeepInspectionImage                    = "DEEP_INSPECTION_IMAGE"
+	DeepInspectionImageXFS                 = "DEEP_INSPECTION_IMAGE_XFS"
+	vddkImage                              = "VDDK_IMAGE"
+	PrecopyInterval                        = "PRECOPY_INTERVAL"
+	BlockerGracePeriodMinutes              = "BLOCKER_GRACE_PERIOD_MINUTES"
+	VirtV2vDontRequestKVM                  = "VIRT_V2V_DONT_REQUEST_KVM"
+	SnapshotRemovalTimeout                 = "SNAPSHOT_REMOVAL_TIMEOUT"
+	SnapshotStatusCheckRate                = "SNAPSHOT_STATUS_CHECK_RATE"
+	CDIExportTokenTTL                      = "CDI_EXPORT_TOKEN_TTL"
+	FileSystemOverhead                     = "FILESYSTEM_OVERHEAD"
+	BlockOverhead                          = "BLOCK_OVERHEAD"
+	CleanupRetries                         = "CLEANUP_RETRIES"
+	SnapshotRemovalCheckRetries            = "SNAPSHOT_REMOVAL_CHECK_RETRIES"
+	OvirtOsConfigMap                       = "OVIRT_OS_MAP"
+	VsphereOsConfigMap                     = "VSPHERE_OS_MAP"
+	VirtCustomizeConfigMap                 = "VIRT_CUSTOMIZE_MAP"
+	NAAOUIMapConfigMap                     = "NAA_OUI_MAP"
+	VddkJobActiveDeadline                  = "VDDK_JOB_ACTIVE_DEADLINE"
+	VirtV2vExtraArgs                       = "VIRT_V2V_EXTRA_ARGS"
+	VirtV2vInspectorExtraArgs              = "VIRT_V2V_INSPECTOR_EXTRA_ARGS"
+	VirtV2vExtraConfConfigMap              = "VIRT_V2V_EXTRA_CONF_CONFIG_MAP"
+	VirtV2vMemSize                         = "VIRT_V2V_MEMSIZE"
+	VirtV2vSmp                             = "VIRT_V2V_SMP"
+	VirtV2vContainerLimitsCpu              = "VIRT_V2V_CONTAINER_LIMITS_CPU"
+	VirtV2vContainerLimitsMemory           = "VIRT_V2V_CONTAINER_LIMITS_MEMORY"
+	VirtV2vContainerRequestsCpu            = "VIRT_V2V_CONTAINER_REQUESTS_CPU"
+	VirtV2vContainerRequestsMemory         = "VIRT_V2V_CONTAINER_REQUESTS_MEMORY"
+	HooksContainerLimitsCpu                = "HOOKS_CONTAINER_LIMITS_CPU"
+	HooksContainerLimitsMemory             = "HOOKS_CONTAINER_LIMITS_MEMORY"
+	HooksContainerRequestsCpu              = "HOOKS_CONTAINER_REQUESTS_CPU"
+	HooksContainerRequestsMemory           = "HOOKS_CONTAINER_REQUESTS_MEMORY"
+	OvaContainerLimitsCpu                  = "OVA_CONTAINER_LIMITS_CPU"
+	OvaContainerLimitsMemory               = "OVA_CONTAINER_LIMITS_MEMORY"
+	OvaContainerRequestsCpu                = "OVA_CONTAINER_REQUESTS_CPU"
+	OvaContainerRequestsMemory             = "OVA_CONTAINER_REQUESTS_MEMORY"
+	HyperVContainerLimitsCpu               = "HYPERV_CONTAINER_LIMITS_CPU"
+	HyperVContainerLimitsMemory            = "HYPERV_CONTAINER_LIMITS_MEMORY"
+	HyperVContainerRequestsCpu             = "HYPERV_CONTAINER_REQUESTS_CPU"
+	HyperVContainerRequestsMemory          = "HYPERV_CONTAINER_REQUESTS_MEMORY"
+	PopulatorContainerLimitsCpu            = "POPULATOR_CONTAINER_LIMITS_CPU"
+	PopulatorContainerLimitsMemory         = "POPULATOR_CONTAINER_LIMITS_MEMORY"
+	PopulatorContainerRequestsCpu          = "POPULATOR_CONTAINER_REQUESTS_CPU"
+	PopulatorContainerRequestsMemory       = "POPULATOR_CONTAINER_REQUESTS_MEMORY"
+	TlsConnectionTimeout                   = "TLS_CONNECTION_TIMEOUT"
+	ControllerWindowsRebootTimeout         = "CONTROLLER_WINDOWS_REBOOT_TIMEOUT"
+	MaxConcurrentReconciles                = "MAX_CONCURRENT_RECONCILES"
+	MaxParentBackingRetries                = "MAX_PARENT_BACKING_RETRIES"
+	HostLeaseNamespace                     = "HOST_LEASE_NAMESPACE"
+	HostLeaseDurationSeconds               = "HOST_LEASE_DURATION_SECONDS"
+	MigrationServiceAccount                = "MIGRATION_SERVICE_ACCOUNT"
+	NetAppShiftDiskPermsInitRequestsCpu    = "NETAPP_SHIFT_DISK_PERMS_INIT_REQUESTS_CPU"
+	NetAppShiftDiskPermsInitRequestsMemory = "NETAPP_SHIFT_DISK_PERMS_INIT_REQUESTS_MEMORY"
+	NetAppShiftDiskPermsInitLimitsCpu      = "NETAPP_SHIFT_DISK_PERMS_INIT_LIMITS_CPU"
+	NetAppShiftDiskPermsInitLimitsMemory   = "NETAPP_SHIFT_DISK_PERMS_INIT_LIMITS_MEMORY"
+	AAPURL                                 = "AAP_URL"
+	AAPTokenSecretName                     = "AAP_TOKEN_SECRET_NAME"
+	AAPTimeout                             = "AAP_TIMEOUT"
+	AAPInsecureSkipVerify                  = "AAP_INSECURE_SKIP_VERIFY"
+	AAPCASecretName                        = "AAP_CA_SECRET_NAME"
+	WaitForFinalSnapshotConsolidation      = "WAIT_FOR_FINAL_SNAPSHOT_CONSOLIDATION"
+	ConversionPodPendingTimeout            = "CONVERSION_POD_PENDING_TIMEOUT"
 )
+
+// Default values for populator container resources
+var (
+	DefaultPopulatorContainerLimitsCpu      = resource.NewQuantity(1000, resource.DecimalSI)
+	DefaultPopulatorContainerLimitsMemory   = resource.NewQuantity(1024, resource.BinarySI)
+	DefaultPopulatorContainerRequestsCpu    = resource.NewQuantity(100, resource.DecimalSI)
+	DefaultPopulatorContainerRequestsMemory = resource.NewQuantity(512, resource.BinarySI)
+)
+
+// DefaultPendingPodTimeoutMinutes is the default number of minutes a
+// conversion pod may stay in Pending before the controller fails it.
+const DefaultPendingPodTimeoutMinutes = 5
 
 // Migration settings
 type Migration struct {
@@ -58,12 +104,20 @@ type Migration struct {
 	ImporterRetry int
 	// Warm migration precopy interval in minutes
 	PrecopyInterval int
+	// How long Critical/Error blocker conditions must persist before failing an active migration
+	BlockerGracePeriodMinutes int
 	// Snapshot removal timeout in minutes
 	SnapshotRemovalTimeout int
 	// Snapshot status check rate in seconds
 	SnapshotStatusCheckRate int
 	// Virt-v2v image for guest conversion
 	VirtV2vImage string
+	// Virt-v2v image for guest conversion with XFSv4 support
+	VirtV2vImageXFS string
+	// Default image for deep inspection pods when Conversion spec.Image is empty
+	DeepInspectionImage string
+	// Deep inspection image built on RHEL9, used when XfsCompatibility is requested
+	DeepInspectionImageXFS string
 	// Virt-v2v require KVM flags for guest conversion
 	VirtV2vDontRequestKVM bool
 	// OCP Export token TTL minutes
@@ -74,8 +128,6 @@ type Migration struct {
 	BlockOverhead int64
 	// Cleanup retries
 	CleanupRetries int
-	// DvStatusCheckRetries retries
-	DvStatusCheckRetries int
 	// SnapshotRemovalCheckRetries retries
 	SnapshotRemovalCheckRetries int
 	// oVirt OS config map name
@@ -84,28 +136,72 @@ type Migration struct {
 	VsphereOsConfigMap string
 	// vSphere OS config map name
 	VirtCustomizeConfigMap string
+	// NAA OUI map config map name (optional, for custom vendor→NAA mappings)
+	NAAOUIMapConfigMap string
 	// Active deadline for VDDK validation job
 	VddkJobActiveDeadline int
 	// Additional arguments for virt-v2v
 	VirtV2vExtraArgs string
+	// Additional arguments for virt-v2v-inspector
+	VirtV2vInspectorExtraArgs string
 	// Additional configuration for virt-v2v
-	VirtV2vExtraConfConfigMap      string
-	VirtV2vContainerLimitsCpu      string
-	VirtV2vContainerLimitsMemory   string
-	VirtV2vContainerRequestsCpu    string
-	VirtV2vContainerRequestsMemory string
-	HooksContainerLimitsCpu        string
-	HooksContainerLimitsMemory     string
-	HooksContainerRequestsCpu      string
-	HooksContainerRequestsMemory   string
-	OvaContainerLimitsCpu          string
-	OvaContainerLimitsMemory       string
-	OvaContainerRequestsCpu        string
-	OvaContainerRequestsMemory     string
+	VirtV2vExtraConfConfigMap string
+	// Memory (in MB) allocated for the virt-v2v conversion appliance
+	VirtV2vMemSize int
+	// Number of virtual CPUs used for the virt-v2v conversion appliance
+	VirtV2vSmp                       int
+	VirtV2vContainerLimitsCpu        string
+	VirtV2vContainerLimitsMemory     string
+	VirtV2vContainerRequestsCpu      string
+	VirtV2vContainerRequestsMemory   string
+	HooksContainerLimitsCpu          string
+	HooksContainerLimitsMemory       string
+	HooksContainerRequestsCpu        string
+	HooksContainerRequestsMemory     string
+	OvaContainerLimitsCpu            string
+	OvaContainerLimitsMemory         string
+	OvaContainerRequestsCpu          string
+	OvaContainerRequestsMemory       string
+	PopulatorContainerLimitsCpu      resource.Quantity
+	PopulatorContainerLimitsMemory   resource.Quantity
+	PopulatorContainerRequestsCpu    resource.Quantity
+	PopulatorContainerRequestsMemory resource.Quantity
 	// VDDK image for guest conversion
 	VddkImage string
 	// TlsConnectionTimeout is the timeout for TLS connections in seconds
 	TlsConnectionTimeout int
+	// WindowsRebootTimeout is the timeout in seconds for the Windows wait-for-reboot migration step.
+	WindowsRebootTimeout int
+	// MaxConcurrentReconciles is the limit of how many reconciles can run at once
+	MaxConcurrentReconciles int
+	// MaxParentBackingRetries is the limit of how many retries can happen while getting parent backing of a disk
+	MaxParentBackingRetries int
+	// HostLeaseNamespace is the namespace for host lease objects used in copy offload
+	HostLeaseNamespace string
+	// HostLeaseDurationSeconds is the host lease duration in seconds used in copy offload
+	HostLeaseDurationSeconds string
+	// ServiceAccount is the cluster-wide default ServiceAccount for migration pods
+	ServiceAccount string
+	// NetAppShiftDiskPermsInit* are CPU/memory for the privileged NetApp Shift disk-perms init on virt-v2v conversion pods
+	NetAppShiftDiskPermsInitRequestsCpu    string
+	NetAppShiftDiskPermsInitRequestsMemory string
+	NetAppShiftDiskPermsInitLimitsCpu      string
+	NetAppShiftDiskPermsInitLimitsMemory   string
+	// AAPURL is the Ansible Automation Platform base URL (ForkliftController aap_url).
+	AAPURL string
+	// AAPTokenSecretName is the name of the Secret in the controller namespace holding the AAP API token (key "token").
+	AAPTokenSecretName string
+	// AAPTimeoutSeconds is the default wall-clock timeout in seconds for AAP job polling when not set on the Hook.
+	AAPTimeoutSeconds int
+	// AAPInsecureSkipVerify skips TLS certificate verification when connecting to AAP.
+	AAPInsecureSkipVerify bool
+	// AAPCASecretName is the name of the Secret in the controller namespace holding a custom CA cert (key "ca.crt").
+	AAPCASecretName string
+	// Whether or not to wait for final snapshot removal and consolidation before finishing Plan.
+	WaitForFinalSnapshotConsolidation bool
+	// ConversionPodPendingTimeout is how long (in minutes) a conversion pod may stay
+	// in Pending phase before the controller fails it. 0 means no timeout.
+	ConversionPodPendingTimeout int
 }
 
 // Load settings.
@@ -122,6 +218,9 @@ func (r *Migration) Load() (err error) {
 	if r.PrecopyInterval, err = getPositiveEnvLimit(PrecopyInterval, 60); err != nil {
 		return liberr.Wrap(err)
 	}
+	if r.BlockerGracePeriodMinutes, err = getPositiveEnvLimit(BlockerGracePeriodMinutes, 5); err != nil {
+		return liberr.Wrap(err)
+	}
 	if r.SnapshotRemovalTimeout, err = getPositiveEnvLimit(SnapshotRemovalTimeout, 120); err != nil {
 		return liberr.Wrap(err)
 	}
@@ -133,10 +232,10 @@ func (r *Migration) Load() (err error) {
 	} else if Settings.Role.Has(MainRole) {
 		return liberr.Wrap(fmt.Errorf("failed to find environment variable %s", VirtCustomizeConfigMap))
 	}
-	if r.CleanupRetries, err = getPositiveEnvLimit(CleanupRetries, 10); err != nil {
-		return liberr.Wrap(err)
+	if val, found := os.LookupEnv(NAAOUIMapConfigMap); found {
+		r.NAAOUIMapConfigMap = val
 	}
-	if r.DvStatusCheckRetries, err = getPositiveEnvLimit(DvStatusCheckRetries, 10); err != nil {
+	if r.CleanupRetries, err = getPositiveEnvLimit(CleanupRetries, 10); err != nil {
 		return liberr.Wrap(err)
 	}
 	if r.SnapshotRemovalCheckRetries, err = getPositiveEnvLimit(SnapshotRemovalCheckRetries, 20); err != nil {
@@ -146,6 +245,14 @@ func (r *Migration) Load() (err error) {
 		r.VirtV2vImage = virtV2vImage
 	} else if Settings.Role.Has(MainRole) {
 		return liberr.Wrap(fmt.Errorf("failed to find environment variable %s", VirtV2vImage))
+	}
+	if virtV2vImageXFS, ok := os.LookupEnv(VirtV2vImageXFS); ok {
+		r.VirtV2vImageXFS = virtV2vImageXFS
+	} else if Settings.Role.Has(MainRole) {
+		return liberr.Wrap(fmt.Errorf("failed to find environment variable %s", VirtV2vImageXFS))
+	}
+	if r.VirtV2vImageXFS == "" && Settings.Role.Has(MainRole) {
+		return liberr.Wrap(fmt.Errorf("environment variable %s was empty", VirtV2vImageXFS))
 	}
 	r.VirtV2vDontRequestKVM = getEnvBool(VirtV2vDontRequestKVM, false)
 
@@ -184,16 +291,33 @@ func (r *Migration) Load() (err error) {
 	if r.TlsConnectionTimeout, err = getPositiveEnvLimit(TlsConnectionTimeout, 5); err != nil {
 		return liberr.Wrap(err)
 	}
+	if r.WindowsRebootTimeout, err = getPositiveEnvLimit(ControllerWindowsRebootTimeout, 1800); err != nil {
+		return liberr.Wrap(err)
+	}
 	r.VirtV2vExtraArgs = "[]"
 	if val, found := os.LookupEnv(VirtV2vExtraArgs); found && len(val) > 0 {
 		if encoded, jsonErr := json.Marshal(strings.Fields(val)); jsonErr == nil {
 			r.VirtV2vExtraArgs = string(encoded)
 		} else {
-			return liberr.Wrap(err)
+			return liberr.Wrap(jsonErr)
+		}
+	}
+	r.VirtV2vInspectorExtraArgs = "[]"
+	if val, found := os.LookupEnv(VirtV2vInspectorExtraArgs); found && len(val) > 0 {
+		if encoded, jsonErr := json.Marshal(strings.Fields(val)); jsonErr == nil {
+			r.VirtV2vInspectorExtraArgs = string(encoded)
+		} else {
+			return liberr.Wrap(jsonErr)
 		}
 	}
 	if val, found := os.LookupEnv(VirtV2vExtraConfConfigMap); found {
 		r.VirtV2vExtraConfConfigMap = val
+	}
+	if r.VirtV2vMemSize, err = getNonNegativeEnvLimit(VirtV2vMemSize, 0); err != nil {
+		return liberr.Wrap(err)
+	}
+	if r.VirtV2vSmp, err = getNonNegativeEnvLimit(VirtV2vSmp, 0); err != nil {
+		return liberr.Wrap(err)
 	}
 	// Containers configurations
 	if val, found := os.LookupEnv(VirtV2vContainerLimitsCpu); found {
@@ -204,6 +328,8 @@ func (r *Migration) Load() (err error) {
 	if val, found := os.LookupEnv(VirtV2vContainerLimitsMemory); found {
 		r.VirtV2vContainerLimitsMemory = val
 	} else {
+		// Spectro: 8Gi upstream. virt-v2v converting large Windows guests was
+		// OOM-killed at 8Gi.
 		r.VirtV2vContainerLimitsMemory = "12Gi"
 	}
 	if val, found := os.LookupEnv(VirtV2vContainerRequestsCpu); found {
@@ -254,7 +380,90 @@ func (r *Migration) Load() (err error) {
 	if val, found := os.LookupEnv(OvaContainerRequestsMemory); found {
 		r.OvaContainerRequestsMemory = val
 	} else {
-		r.OvaContainerRequestsMemory = "150Mi"
+		r.OvaContainerRequestsMemory = "512Mi"
+	}
+	if val, found := os.LookupEnv(PopulatorContainerLimitsCpu); found {
+		r.PopulatorContainerLimitsCpu, err = resource.ParseQuantity(val)
+		if err != nil {
+			return fmt.Errorf("invalid Populator CPU limit %q: %w", val, err)
+		}
+	} else {
+		r.PopulatorContainerLimitsCpu = *DefaultPopulatorContainerLimitsCpu
+	}
+	if val, found := os.LookupEnv(PopulatorContainerLimitsMemory); found {
+		r.PopulatorContainerLimitsMemory, err = resource.ParseQuantity(val)
+		if err != nil {
+			return fmt.Errorf("invalid Populator memory limit %q: %w", val, err)
+		}
+	} else {
+		r.PopulatorContainerLimitsMemory = *DefaultPopulatorContainerLimitsMemory
+	}
+	if val, found := os.LookupEnv(PopulatorContainerRequestsCpu); found {
+		r.PopulatorContainerRequestsCpu, err = resource.ParseQuantity(val)
+		if err != nil {
+			return fmt.Errorf("invalid Populator CPU request %q: %w", val, err)
+		}
+	} else {
+		r.PopulatorContainerRequestsCpu = *DefaultPopulatorContainerRequestsCpu
+	}
+	if val, found := os.LookupEnv(PopulatorContainerRequestsMemory); found {
+		r.PopulatorContainerRequestsMemory, err = resource.ParseQuantity(val)
+		if err != nil {
+			return fmt.Errorf("invalid Populator memory request %q: %w", val, err)
+		}
+	} else {
+		r.PopulatorContainerRequestsMemory = *DefaultPopulatorContainerRequestsMemory
+	}
+	r.MaxConcurrentReconciles, err = getPositiveEnvLimit(MaxConcurrentReconciles, 10)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+	r.MaxParentBackingRetries, err = getPositiveEnvLimit(MaxParentBackingRetries, 10)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+	// Host lease settings for copy offload
+	r.HostLeaseNamespace = Lookup(HostLeaseNamespace, "openshift-mtv")
+	r.HostLeaseDurationSeconds = Lookup(HostLeaseDurationSeconds, "10")
+	if val, found := os.LookupEnv(MigrationServiceAccount); found {
+		r.ServiceAccount = val
+	}
+	r.NetAppShiftDiskPermsInitRequestsCpu = Lookup(NetAppShiftDiskPermsInitRequestsCpu, "10m")
+	r.NetAppShiftDiskPermsInitRequestsMemory = Lookup(NetAppShiftDiskPermsInitRequestsMemory, "32Mi")
+	r.NetAppShiftDiskPermsInitLimitsCpu = Lookup(NetAppShiftDiskPermsInitLimitsCpu, "200m")
+	r.NetAppShiftDiskPermsInitLimitsMemory = Lookup(NetAppShiftDiskPermsInitLimitsMemory, "64Mi")
+	if val, found := os.LookupEnv(AAPURL); found {
+		r.AAPURL = strings.TrimSpace(val)
+	}
+	if val, found := os.LookupEnv(AAPTokenSecretName); found {
+		r.AAPTokenSecretName = strings.TrimSpace(val)
+	}
+	if val, found := os.LookupEnv(AAPTimeout); found {
+		val = strings.TrimSpace(val)
+		if val != "" {
+			n, perr := strconv.Atoi(val)
+			if perr != nil {
+				return fmt.Errorf("invalid %s %q: %w", AAPTimeout, val, perr)
+			}
+			if n < 0 {
+				return fmt.Errorf("%s must be non-negative, got %q", AAPTimeout, val)
+			}
+			r.AAPTimeoutSeconds = n
+		}
+	}
+	r.AAPInsecureSkipVerify = getEnvBool(AAPInsecureSkipVerify, false)
+	if val, found := os.LookupEnv(AAPCASecretName); found {
+		r.AAPCASecretName = strings.TrimSpace(val)
+	}
+	if val, found := os.LookupEnv(DeepInspectionImage); found {
+		r.DeepInspectionImage = strings.TrimSpace(val)
+	}
+	if val, found := os.LookupEnv(DeepInspectionImageXFS); found {
+		r.DeepInspectionImageXFS = strings.TrimSpace(val)
+	}
+	r.WaitForFinalSnapshotConsolidation = getEnvBool(WaitForFinalSnapshotConsolidation, true)
+	if r.ConversionPodPendingTimeout, err = getEnvLimit(ConversionPodPendingTimeout, DefaultPendingPodTimeoutMinutes, 0); err != nil {
+		return liberr.Wrap(err)
 	}
 	return
 }

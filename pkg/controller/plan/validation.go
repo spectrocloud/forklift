@@ -4,20 +4,28 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
-	"path"
+	"os"
 	"strconv"
+	"strings"
 
 	k8snet "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
+	apisplan "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
 	refapi "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
+	hookutil "github.com/kubev2v/forklift/pkg/controller/hook"
 	"github.com/kubev2v/forklift/pkg/controller/plan/adapter"
+	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
+	modelbase "github.com/kubev2v/forklift/pkg/controller/provider/model/base"
+	model "github.com/kubev2v/forklift/pkg/controller/provider/model/ocp"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web"
-	"github.com/kubev2v/forklift/pkg/controller/provider/web/ova"
+	"github.com/kubev2v/forklift/pkg/controller/provider/web/vsphere"
 	"github.com/kubev2v/forklift/pkg/controller/validation"
+	libaap "github.com/kubev2v/forklift/pkg/lib/aap"
 	ocp "github.com/kubev2v/forklift/pkg/lib/client/openshift"
 	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
@@ -26,7 +34,7 @@ import (
 	"github.com/kubev2v/forklift/pkg/templateutil"
 	batchv1 "k8s.io/api/batch/v1"
 	core "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,43 +47,76 @@ import (
 
 // Types
 const (
-	WarmMigrationNotReady         = "WarmMigrationNotReady"
-	NamespaceNotValid             = "NamespaceNotValid"
-	TransferNetNotValid           = "TransferNetworkNotValid"
-	NetRefNotValid                = "NetworkMapRefNotValid"
-	NetMapNotReady                = "NetworkMapNotReady"
-	DsMapNotReady                 = "StorageMapNotReady"
-	DsRefNotValid                 = "StorageRefNotValid"
-	VMRefNotValid                 = "VMRefNotValid"
-	VMNotFound                    = "VMNotFound"
-	VMAlreadyExists               = "VMAlreadyExists"
-	VMNetworksNotMapped           = "VMNetworksNotMapped"
-	VMStorageNotMapped            = "VMStorageNotMapped"
-	VMStorageNotSupported         = "VMStorageNotSupported"
-	VMMultiplePodNetworkMappings  = "VMMultiplePodNetworkMappings"
-	VMMissingGuestIPs             = "VMMissingGuestIPs"
-	VMMissingChangedBlockTracking = "VMMissingChangedBlockTracking"
-	HostNotReady                  = "HostNotReady"
-	DuplicateVM                   = "DuplicateVM"
-	SharedDisks                   = "SharedDisks"
-	SharedWarnDisks               = "SharedWarnDisks"
-	NameNotValid                  = "TargetNameNotValid"
-	HookNotValid                  = "HookNotValid"
-	HookNotReady                  = "HookNotReady"
-	HookStepNotValid              = "HookStepNotValid"
-	Executing                     = "Executing"
-	Succeeded                     = "Succeeded"
-	Failed                        = "Failed"
-	Canceled                      = "Canceled"
-	Deleted                       = "Deleted"
-	Paused                        = "Paused"
-	Archived                      = "Archived"
-	unsupportedVersion            = "UnsupportedVersion"
-	VDDKInvalid                   = "VDDKInvalid"
-	ValidatingVDDK                = "ValidatingVDDK"
-	VDDKInitImageNotReady         = "VDDKInitImageNotReady"
-	VDDKInitImageUnavailable      = "VDDKInitImageUnavailable"
-	UnsupportedOvaSource          = "UnsupportedOvaSource"
+	WarmMigrationNotReady           = "WarmMigrationNotReady"
+	MigrationTypeNotValid           = "MigrationTypeNotValid"
+	NamespaceNotValid               = "NamespaceNotValid"
+	TransferNetNotValid             = "TransferNetworkNotValid"
+	TransferNetMissingDefaultRoute  = "TransferNetworkMissingDefaultRoute"
+	NetRefNotValid                  = "NetworkMapRefNotValid"
+	NetMapNotReady                  = "NetworkMapNotReady"
+	NetMapPreservingIPsOnPodNetwork = "NetMapPreservingIPsOnPodNetwork"
+	DsMapNotReady                   = "StorageMapNotReady"
+	DsRefNotValid                   = "StorageRefNotValid"
+	VMRefNotValid                   = "VMRefNotValid"
+	VMNotFound                      = "VMNotFound"
+	VMAlreadyExists                 = "VMAlreadyExists"
+	VMNetworksNotMapped             = "VMNetworksNotMapped"
+	VMStorageNotMapped              = "VMStorageNotMapped"
+	VMStorageNotSupported           = "VMStorageNotSupported"
+	VMMultiplePodNetworkMappings    = "VMMultiplePodNetworkMappings"
+	VMDuplicateNADMappings          = "VMDuplicateNADMappings"
+	VMMissingGuestIPs               = "VMMissingGuestIPs"
+	VMIpNotMatchingUdnSubnet        = "VMIpNotMatchingUdnSubnet"
+	VMMissingChangedBlockTracking   = "VMMissingChangedBlockTracking"
+	VMHasSnapshots                  = "VMHasSnapshots"
+	VMConsolidationNeeded           = "VMConsolidationNeeded"
+	HostNotReady                    = "HostNotReady"
+	DuplicateVM                     = "DuplicateVM"
+	SharedDisks                     = "SharedDisks"
+	SharedWarnDisks                 = "SharedWarnDisks"
+	NameNotValid                    = "TargetNameNotValid"
+	HookNotValid                    = "HookNotValid"
+	HookNotReady                    = "HookNotReady"
+	HookStepNotValid                = "HookStepNotValid"
+	Executing                       = "Executing"
+	Succeeded                       = "Succeeded"
+	Failed                          = "Failed"
+	Canceled                        = "Canceled"
+	ConversionHasWarnings           = "ConversionHasWarnings"
+	InspectionHasConcerns           = "InspectionHasConcerns"
+	Deleted                         = "Deleted"
+	Paused                          = "Paused"
+	Archived                        = "Archived"
+	InvalidDiskSizes                = "InvalidDiskSizes"
+	MacConflicts                    = "MacConflicts"
+	MissingPvcForOnlyConversion     = "MissingPvcForOnlyConversion"
+	LuksAndClevisIncompatibility    = "LuksAndClevisIncompatibility"
+	UnsupportedUdn                  = "UnsupportedUserDefinedNetwork"
+	unsupportedVersion              = "UnsupportedVersion"
+	VirtV2vImageNotValid            = "VirtV2vImageNotValid"
+	VDDKInvalid                     = "VDDKInvalid"
+	ValidatingVDDK                  = "ValidatingVDDK"
+	VDDKInitImageNotReady           = "VDDKInitImageNotReady"
+	VDDKInitImageUnavailable        = "VDDKInitImageUnavailable"
+	UnsupportedOVFExportSource      = "UnsupportedOVFExportSource"
+	VMPowerStateUnsupported         = "VMPowerStateUnsupported"
+	VMMigrationTypeUnsupported      = "VMMigrationTypeUnsupported"
+	GuestToolsIssue                 = "GuestToolsIssue"
+	VDDKAndOffloadMixedUsage        = "VDDKAndOffloadMixedUsage"
+	ServiceAccountNotValid          = "ServiceAccountNotValid"
+	HookServiceAccountNotValid      = "HookServiceAccountNotValid"
+	RestrictedPodSecurity           = "RestrictedPodSecurity"
+	NetMapDestinationNADNotValid    = "NetMapDestinationNADNotValid"
+	VMCriticalConcerns              = "VMCriticalConcerns"
+	RDMDiskWarning                  = "RDMDiskWarning"
+	IndependentDiskWarning          = "IndependentDiskWarning"
+	// NetAppShift (Advisory) reports whether the plan's storage map uses a NetApp Shift/Trident class.
+	NetAppShift = "NetAppShift"
+	// NetAppShiftWarmNotSupported (Critical) blocks warm migration when the storage map uses NetApp Shift.
+	NetAppShiftWarmNotSupported = "NetAppShiftWarmNotSupported"
+	// NetAppShiftDatastoreNASMissing (Critical) blocks when a disk maps to NetApp Shift but the source
+	// datastore lacks NAS export details in inventory (required for MTV annotations).
+	NetAppShiftDatastoreNASMissing = "NetAppShiftDatastoreNASMissing"
 )
 
 // Categories
@@ -85,6 +126,13 @@ const (
 	Critical = libcnd.Critical
 	Error    = libcnd.Error
 	Warn     = libcnd.Warn
+)
+
+// Network types
+const (
+	Pod     = "pod"
+	Multus  = "multus"
+	Ignored = "ignored"
 )
 
 // Reasons
@@ -101,6 +149,7 @@ const (
 	InMaintenanceMode           = "InMaintenanceMode"
 	MissingGuestInfo            = "MissingGuestInformation"
 	MissingChangedBlockTracking = "MissingChangedBlockTracking"
+	ConsolidationNeeded         = "ConsolidationNeeded"
 )
 
 // Statuses
@@ -130,78 +179,108 @@ func (r *Reconciler) validate(plan *api.Plan) error {
 	plan.Referenced.Provider.Source = pv.Referenced.Source
 	plan.Referenced.Provider.Destination = pv.Referenced.Destination
 
-	if err := r.ensureSecretForProvider(plan); err != nil {
+	if err = r.ensureSecretForProvider(plan); err != nil {
 		return err
 	}
 
-	if err := r.validateTargetNamespace(plan); err != nil {
+	if err = r.validateTargetNamespace(plan); err != nil {
 		return err
 	}
 
-	if err := r.validateNetworkMap(plan); err != nil {
+	if err = r.validateNetworkMap(plan); err != nil {
 		return err
 	}
 
-	if err := r.validateStorageMap(plan); err != nil {
+	if err = r.validateStorageMap(plan); err != nil {
 		return err
 	}
 
-	if err := r.validateWarmMigration(plan); err != nil {
+	// If critical conditions were found (e.g. missing network/storage maps),
+	// context may not be available, skip the validations that require context.
+	// The blocker conditions have already been set, reconciler will not try to execute the plan.
+	if plan.Status.HasBlockerCondition() {
+		return nil
+	}
+
+	var ctx *plancontext.Context
+	ctx, err = plancontext.New(r, plan, r.Log)
+	if err != nil {
 		return err
 	}
 
-	if err := r.validateVM(plan); err != nil {
+	if err = r.validateUserDefinedNetwork(ctx); err != nil {
 		return err
 	}
 
-	if err := r.validateTransferNetwork(plan); err != nil {
+	err = r.validateNetAppShift(ctx)
+	if err != nil {
 		return err
 	}
 
-	if err := r.validateHooks(plan); err != nil {
+	if err = r.validateWarmMigration(ctx); err != nil {
 		return err
 	}
 
-	if err := r.validateVddkImage(plan); err != nil {
+	if err = r.validateMigrationType(ctx); err != nil {
 		return err
+	}
+
+	if err = r.validateVM(plan, ctx); err != nil {
+		return err
+	}
+
+	if err = r.validateTransferNetwork(plan); err != nil {
+		return err
+	}
+
+	if err = r.validateServiceAccount(plan); err != nil {
+		return err
+	}
+
+	if err = r.validateHooks(plan); err != nil {
+		return err
+	}
+
+	if err = r.validateVirtV2vImage(plan); err != nil {
+		return err
+	}
+
+	// Skip VDDK validation when VirtV2vImage is invalid to avoid creating unnecessary jobs.
+	if !plan.Status.HasCondition(VirtV2vImageNotValid) {
+		if err = r.validateVddkImage(plan); err != nil {
+			return err
+		}
 	}
 
 	// Validate version only if migration is OCP to OCP
-	if err := r.validateOpenShiftVersion(plan); err != nil {
-		return err
-	}
-
-	// Validate PVC name template
-	if err := r.validatePVCNameTemplate(plan); err != nil {
+	if err = r.validateOpenShiftVersion(plan); err != nil {
 		return err
 	}
 
 	// Validate volume name template
-	if err := r.validateVolumeNameTemplate(plan); err != nil {
+	if err = r.validateVolumeNameTemplate(plan); err != nil {
 		return err
 	}
 
 	// Validate network name template
-	if err := r.validateNetworkNameTemplate(plan); err != nil {
+	if err = r.validateNetworkNameTemplate(plan); err != nil {
 		return err
 	}
 
-	return nil
-}
+	// Validate SSH readiness for plans using xcopy with SSH-enabled providers
+	if err = r.validateSSHReadiness(plan); err != nil {
+		return err
+	}
 
-func (r *Reconciler) validatePVCNameTemplate(plan *api.Plan) error {
-	if err := r.IsValidPVCNameTemplate(plan.Spec.PVCNameTemplate); err != nil {
-		invalidPVCNameTemplate := libcnd.Condition{
-			Type:     NotValid,
-			Status:   True,
-			Category: api.CategoryCritical,
-			Message:  "PVC name template is invalid.",
-			Items:    []string{},
-		}
+	// Validate conversion temp storage configuration
+	if err = r.validateConversionTempStorage(plan); err != nil {
+		return err
+	}
 
-		plan.Status.SetCondition(invalidPVCNameTemplate)
-
-		r.Log.Info("PVC name template is invalid", "error", err.Error(), "plan", plan.Name, "namespace", plan.Namespace)
+	// Validate pod security policies (non-blocking warning)
+	if err = r.validatePodSecurity(plan); err != nil {
+		// Log error but don't block validation
+		r.Log.V(1).Info("Failed to validate pod security policies", "error", err)
 	}
 
 	return nil
@@ -293,12 +372,73 @@ func (r *Reconciler) ensureSecretForProvider(plan *api.Plan) error {
 	return nil
 }
 
+// validateNetAppShift checks plan-level NetApp Shift constraints (warm migration blocker)
+// and returns whether the plan uses Shift storage so callers can pass the flag forward.
+func (r *Reconciler) validateNetAppShift(ctx *plancontext.Context) (err error) {
+	plan := ctx.Plan
+	src := plan.Referenced.Provider.Source
+	if src == nil || src.Type() != api.VSphere || plan.Map.Storage == nil {
+		return nil
+	}
+	shift, err := plan.Map.Storage.HasNetAppShiftDestination(ctx.Destination.Client)
+	if err != nil {
+		return liberr.Wrap(err, "check NetApp Shift storage")
+	}
+	if !shift {
+		return nil
+	}
+	if plan.IsWarm() {
+		plan.Status.SetCondition(libcnd.Condition{
+			Type:     NetAppShiftWarmNotSupported,
+			Status:   True,
+			Category: api.CategoryCritical,
+			Reason:   NotSupported,
+			Message:  "NetApp Shift/Trident destination storage is not supported for warm migration. Use a cold migration plan, or map disks to a non-Shift StorageClass.",
+		})
+	}
+	return nil
+}
+
+// hasShiftDiskMissingNAS checks whether any Shift-mapped disk on the VM lacks NAS export
+// details on its backing datastore. Returns true on the first missing entry found.
+func hasShiftDiskMissingNAS(vm *vsphere.VM, storageMap *api.StorageMap, inventory web.Client, destClient client.Client) (string, error) {
+	for _, disk := range vm.SortedDisksAsVmware() {
+		pair, found := storageMap.FindStorage(disk.Datastore.ID)
+		if !found {
+			continue
+		}
+		diskShift, err := pair.Destination.IsNetAppShiftStorageClass(destClient)
+		if err != nil {
+			return "", err
+		}
+		if !diskShift {
+			continue
+		}
+		ds := &vsphere.Datastore{}
+		if err := inventory.Find(ds, refapi.Ref{ID: disk.Datastore.ID}); err != nil {
+			return "", liberr.Wrap(err, "datastore", disk.Datastore.ID)
+		}
+		nfsServer := ds.NasRemoteHost
+		if hn := len(ds.NasRemoteHostNames); hn > 0 {
+			nfsServer = ds.NasRemoteHostNames[hn-1]
+		}
+		if ds.NasRemotePath == "" || nfsServer == "" {
+			label := ds.Name
+			if label == "" {
+				label = disk.Datastore.ID
+			}
+			return label, nil
+		}
+	}
+	return "", nil
+}
+
 // Validate that warm migration is supported from the source provider.
-func (r *Reconciler) validateWarmMigration(plan *api.Plan) (err error) {
-	if !plan.Spec.Warm {
+func (r *Reconciler) validateWarmMigration(ctx *plancontext.Context) (err error) {
+	if !ctx.Plan.IsWarm() {
 		return
 	}
-	provider := plan.Referenced.Provider.Source
+	provider := ctx.Plan.Referenced.Provider.Source
 	if provider == nil {
 		return nil
 	}
@@ -306,17 +446,42 @@ func (r *Reconciler) validateWarmMigration(plan *api.Plan) (err error) {
 	if err != nil {
 		return err
 	}
-	validator, err := pAdapter.Validator(plan)
+	validator, err := pAdapter.Validator(ctx)
 	if err != nil {
 		return err
 	}
 	if !validator.WarmMigration() {
-		plan.Status.SetCondition(libcnd.Condition{
+		ctx.Plan.Status.SetCondition(libcnd.Condition{
 			Type:     WarmMigrationNotReady,
 			Status:   True,
 			Category: api.CategoryCritical,
 			Reason:   NotSupported,
 			Message:  "Warm migration from the source provider is not supported.",
+		})
+	}
+	return
+}
+
+func (r *Reconciler) validateMigrationType(ctx *plancontext.Context) (err error) {
+	provider := ctx.Plan.Referenced.Provider.Source
+	if provider == nil {
+		return nil
+	}
+	pAdapter, err := adapter.New(provider)
+	if err != nil {
+		return err
+	}
+	validator, err := pAdapter.Validator(ctx)
+	if err != nil {
+		return err
+	}
+	if !validator.MigrationType() {
+		ctx.Plan.Status.SetCondition(libcnd.Condition{
+			Type:     MigrationTypeNotValid,
+			Status:   True,
+			Category: Critical,
+			Reason:   NotSupported,
+			Message:  fmt.Sprintf("`%s` migration from the source provider is not supported.", ctx.Plan.Spec.Type),
 		})
 	}
 	return
@@ -340,6 +505,51 @@ func (r *Reconciler) validateTargetNamespace(plan *api.Plan) (err error) {
 		plan.Status.SetCondition(newCnd)
 	}
 	return
+}
+
+// Validate unsupported User Defined Network configurations in the destination namespace.
+func (r *Reconciler) validateUserDefinedNetwork(ctx *plancontext.Context) (err error) {
+	nads, err := r.getDestinationNamespaceNads(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, nad := range nads.Items {
+		var networkConfig model.NetworkConfig
+		err = json.Unmarshal([]byte(nad.Spec.Config), &networkConfig)
+		if err != nil {
+			r.Log.Info("Skipping NAD: failed to parse network config", "namespace", nad.Namespace, "name", nad.Name, "error", err.Error())
+			continue
+		}
+		if networkConfig.Type != model.OvnOverlayType {
+			continue
+		}
+		if networkConfig.Topology == model.TopologyLayer3 {
+			// CNV does not support l3
+			ctx.Plan.Status.SetCondition(libcnd.Condition{
+				Type:     UnsupportedUdn,
+				Status:   True,
+				Reason:   NotSupported,
+				Category: api.CategoryCritical,
+				Message:  "UserDefinedNetwork Layer3 is not supported, please use Layer2",
+			})
+		}
+	}
+	return
+}
+
+func (r *Reconciler) getDestinationNamespaceNads(ctx *plancontext.Context) (*k8snet.NetworkAttachmentDefinitionList, error) {
+	nadList := &k8snet.NetworkAttachmentDefinitionList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(ctx.Plan.Spec.TargetNamespace),
+		client.MatchingLabels{"k8s.ovn.org/user-defined-network": ""},
+	}
+
+	err := ctx.Destination.Client.List(context.TODO(), nadList, listOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return nadList, nil
 }
 
 // Validate network mapping ref.
@@ -380,7 +590,49 @@ func (r *Reconciler) validateNetworkMap(plan *api.Plan) (err error) {
 			Message:  "Map.Network does not have Ready condition.",
 		})
 	}
+	// Check if we are preserving static IPs and give warning if we are mapping to Pod Network.
+	// The Pod network has different subnet than the source provider so the VMs might not be accessible.
+	if plan.Referenced.Provider.Source.SupportsPreserveStaticIps() && plan.Spec.PreserveStaticIPs {
+		var hasMappingToPodNetwork bool
+		for _, networkMap := range mp.Spec.Map {
+			if networkMap.Destination.Type == Pod {
+				hasMappingToPodNetwork = true
+				break
+			}
+		}
+		// The UDNs can be valid network for which there are additional validations to check the subnet ranges per VM
+		if hasMappingToPodNetwork && !plan.DestinationHasUdnNetwork(r.Client) {
+			plan.Status.SetCondition(libcnd.Condition{
+				Type:     NetMapPreservingIPsOnPodNetwork,
+				Status:   True,
+				Category: api.CategoryWarn,
+				Message:  "Your migration plan preserves the static IPs of VMs and uses Pod Networking target network mapping. This combination isn't supported, because VM IPs aren't preserved in Pod Networking migrations.",
+			})
+		}
+	}
 
+	for _, pair := range mp.Spec.Map {
+		if pair.Destination.Type != Multus {
+			continue
+		}
+
+		if pair.Destination.Namespace != plan.Spec.TargetNamespace &&
+			pair.Destination.Namespace != core.NamespaceDefault {
+			plan.Status.SetCondition(libcnd.Condition{
+				Type:     NetMapDestinationNADNotValid,
+				Status:   True,
+				Category: api.CategoryCritical,
+				Reason:   NotValid,
+				Message: fmt.Sprintf(
+					"Destination NAD %s/%s must be in either the target namespace (%s) or the default namespace. "+
+						"Pods cannot reference network attachment definitions from other namespaces.",
+					pair.Destination.Namespace,
+					pair.Destination.Name,
+					plan.Spec.TargetNamespace),
+			})
+			return
+		}
+	}
 	plan.Referenced.Map.Network = mp
 
 	return
@@ -394,6 +646,10 @@ func (r *Reconciler) validateStorageMap(plan *api.Plan) (err error) {
 		Status:   True,
 		Category: api.CategoryCritical,
 		Message:  "Map.Storage is not valid.",
+	}
+	// Ignore mapping for only conversion mode
+	if plan.Spec.Type == api.MigrationOnlyConversion {
+		return
 	}
 	if !libref.RefSet(&ref) {
 		newCnd.Reason = NotSet
@@ -430,8 +686,37 @@ func (r *Reconciler) validateStorageMap(plan *api.Plan) (err error) {
 	return
 }
 
+// aggregateCriticalConcerns appends critical-category concerns from an
+// inventory VM to the vmCriticalConcerns condition.
+func aggregateCriticalConcerns(v interface{}, vmRef string, vmCriticalConcerns *libcnd.Condition) {
+	ch, ok := v.(modelbase.ConcernHolder)
+	if !ok {
+		return
+	}
+	for _, concern := range ch.GetConcerns() {
+		if concern.Category == "Critical" {
+			vmCriticalConcerns.Items = append(vmCriticalConcerns.Items,
+				fmt.Sprintf("%s (%s)", vmRef, concern.Label))
+		}
+	}
+}
+
+// aggregateWarningConcerns appends well-known warning concerns from an
+// inventory VM to the matching conditions (e.g. unsupported OVA source).
+func aggregateWarningConcerns(v interface{}, vmRef string, unsupportedOVFExportSource *libcnd.Condition) {
+	ch, ok := v.(modelbase.ConcernHolder)
+	if !ok {
+		return
+	}
+	for _, concern := range ch.GetConcerns() {
+		if concern.Id == "ova.source.unsupported" {
+			unsupportedOVFExportSource.Items = append(unsupportedOVFExportSource.Items, vmRef)
+		}
+	}
+}
+
 // Validate listed VMs.
-func (r *Reconciler) validateVM(plan *api.Plan) error {
+func (r *Reconciler) validateVM(plan *api.Plan, ctx *plancontext.Context) error {
 	if plan.Status.HasCondition(Executing) {
 		return nil
 	}
@@ -515,12 +800,28 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		Message:  "VM has more than one interface mapped to the pod network.",
 		Items:    []string{},
 	}
+	duplicateNADMappings := libcnd.Condition{
+		Type:     VMDuplicateNADMappings,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "Multiple VM NICs mapped to the same Multus NAD. Add additional NetworkMap entries with different destination NADs for the same source network.",
+		Items:    []string{},
+	}
 	missingStaticIPs := libcnd.Condition{
 		Type:     VMMissingGuestIPs,
 		Status:   True,
 		Reason:   MissingGuestInfo,
 		Category: api.CategoryWarn,
-		Message:  "Guest information on vNICs is missing, cannot preserve static IPs. If this machine has static IP, make sure VMware tools are installed and the VM is running.",
+		Message:  missingStaticIPsMessage(plan),
+		Items:    []string{},
+	}
+	vmIpDoesNotMatchUdnSubnet := libcnd.Condition{
+		Type:     VMIpNotMatchingUdnSubnet,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryWarn,
+		Message:  "VM IP does not match with the primary UDN subnet",
 		Items:    []string{},
 	}
 	missingCbtForWarm := libcnd.Condition{
@@ -529,6 +830,14 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		Reason:   MissingChangedBlockTracking,
 		Category: api.CategoryCritical,
 		Message:  "Changed Block Tracking (CBT) has not been enabled on some VM. This feature is a prerequisite for VM warm migration.",
+		Items:    []string{},
+	}
+	vmHasSnapshotsForWarm := libcnd.Condition{
+		Type:     VMHasSnapshots,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "VM has pre-existing snapshots which are incompatible with warm migration.",
 		Items:    []string{},
 	}
 	pvcNameInvalid := libcnd.Condition{
@@ -567,21 +876,157 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		Message:  "Duplicate targetName.",
 		Items:    []string{},
 	}
-	unsupportedOvaSource := libcnd.Condition{
-		Type:     UnsupportedOvaSource,
+	unsupportedOVFExportSource := libcnd.Condition{
+		Type:     UnsupportedOVFExportSource,
 		Status:   True,
 		Category: api.CategoryWarn,
-		Message:  "OVA appears to have been exported from an unsupported source, and may have issues during import.",
+		Message:  "VM appears to have been exported from an unsupported OVF source, and may have issues during import.",
+		Items:    []string{},
+	}
+	powerStateUnsupported := libcnd.Condition{
+		Type:     VMPowerStateUnsupported,
+		Status:   True,
+		Reason:   NotSupported,
+		Category: api.CategoryCritical,
+		Message:  "VM power state is incompatible with the selected migration type.",
+		Items:    []string{},
+	}
+	vmMigrationTypeUnsupported := libcnd.Condition{
+		Type:     VMMigrationTypeUnsupported,
+		Status:   True,
+		Reason:   NotSupported,
+		Category: api.CategoryCritical,
+		Message:  "VM is incompatible with the selected migration type.",
+		Items:    []string{},
+	}
+	guestToolsIssue := libcnd.Condition{
+		Type:     GuestToolsIssue,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "VMware Tools issues detected. This may impact migration performance, guest OS detection, and network configuration. Ensure VMware Tools are properly installed and running before migration. If this is an encrypted VM, please turn the VM off manually before migration.",
+		Items:    []string{},
+	}
+	invalidDiskSizes := libcnd.Condition{
+		Type:     InvalidDiskSizes,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "VM has disks with invalid sizes.",
+		Items:    []string{},
+	}
+	macConflicts := libcnd.Condition{
+		Type:     MacConflicts,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "",
+	}
+	missingPvcForOnlyConversion := libcnd.Condition{
+		Type:     MissingPvcForOnlyConversion,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "Missing required PVCs for conversion-only mode. Ensure vendor-provided PVCs exist in the target namespace and are labeled with vmID and vmUUID.",
+		Items:    []string{},
+	}
+	luksAndClevisIncompatibility := libcnd.Condition{
+		Type:     LuksAndClevisIncompatibility,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryWarn,
+		Message:  "LUKS keys and Clevis cannot be configured together; Clevis will be used.",
+		Items:    []string{},
+	}
+	vddkAndOffloadMixedUsage := libcnd.Condition{
+		Type:     VDDKAndOffloadMixedUsage,
+		Status:   True,
+		Reason:   NotSupported,
+		Category: api.CategoryCritical,
+		Message:  "Copy offload is enabled. MTV does not support mixed copy methods. Each migration plan can use one migration strategy, either VDDK or copy offload. Check your storage map and VMs to ensure they are using the same migration strategy.",
+		Items:    []string{},
+	}
+	vmCriticalConcerns := libcnd.Condition{
+		Type:     VMCriticalConcerns,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "One or more VMs in the plan have critical concerns that block migration.",
+		Items:    []string{},
+	}
+	consolidationNeeded := libcnd.Condition{
+		Type:     VMConsolidationNeeded,
+		Status:   True,
+		Reason:   ConsolidationNeeded,
+		Category: api.CategoryWarn,
+		Message:  "VM has snapshots that require consolidation. This may cause long delays between precopies.",
+		Items:    []string{},
+	}
+	rdmDiskWarning := libcnd.Condition{
+		Type:     RDMDiskWarning,
+		Status:   True,
+		Reason:   NotSupported,
+		Category: api.CategoryWarn,
+		Message:  "VM has RDM disks which are not supported with VDDK transfer. Enable copy-offload (XCOPY) in the storage mapping to migrate RDM disks.",
+		Items:    []string{},
+	}
+	independentDiskWarning := libcnd.Condition{
+		Type:     IndependentDiskWarning,
+		Status:   True,
+		Reason:   NotSupported,
+		Category: api.CategoryWarn,
+		Message:  "VM has independent disks which are not supported with VDDK transfer. Enable copy-offload (XCOPY) in the storage mapping to migrate independent disks, or change them to 'Dependent' mode in VMware.",
+		Items:    []string{},
+	}
+
+	shiftSnapshotVMs := libcnd.Condition{
+		Type:     VMHasSnapshots,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "NetApp Shift plans require VMs to have no VMware snapshots. Remove snapshots before migration.",
+		Items:    []string{},
+	}
+	shiftNASMissing := libcnd.Condition{
+		Type:     NetAppShiftDatastoreNASMissing,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "Datastore is missing NAS export details required for NetApp Shift.",
 		Items:    []string{},
 	}
 	var sharedDisksConditions []libcnd.Condition
 	setOf := map[string]bool{}
 	setOfTargetName := map[string]bool{}
-	//
+
+	// Check if plan uses storage offload (vSphere only)
+	source := plan.Referenced.Provider.Source
+	checkMixedUsage := source != nil && source.Type() == api.VSphere && settings.Settings.Features.CopyOffload
+	planUsesOffload := checkMixedUsage && plan.IsUsingOffloadPlugin()
+	netAppShift := false
+	var err error
+	if source != nil && source.Type() == api.VSphere && plan.Map.Storage != nil {
+		netAppShift, err = plan.Map.Storage.HasNetAppShiftDestination(ctx.Destination.Client)
+		if err != nil {
+			return liberr.Wrap(err, "check NetApp Shift storage")
+		}
+	}
+	if err != nil {
+		return liberr.Wrap(err, "check NetApp Shift storage")
+	}
+
 	// Referenced VMs.
 	for i := range plan.Spec.VMs {
 		vm := &plan.Spec.VMs[i]
 		ref := &vm.Ref
+
+		// Skip VMs that have already succeeded - no validation needed
+		if status, found := plan.Status.Migration.FindVM(*ref); found {
+			if status.HasCondition(api.ConditionSucceeded) {
+				continue
+			}
+		}
+
 		if ref.NotSet() {
 			plan.Status.SetCondition(libcnd.Condition{
 				Type:     VMRefNotValid,
@@ -638,12 +1083,45 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 				setOfTargetName[vm.TargetName] = true
 			}
 		}
-		// check for supported OVA source
-		if ova, ok := v.(*ova.VM); ok {
-			for _, concern := range ova.Concerns {
-				// match label from ova/export_source.rego
-				if concern.Id == "ova.source.unsupported" {
-					unsupportedOvaSource.Items = append(unsupportedOvaSource.Items, ref.String())
+		aggregateCriticalConcerns(v, ref.String(), &vmCriticalConcerns)
+		aggregateWarningConcerns(v, ref.String(), &unsupportedOVFExportSource)
+		if netAppShift {
+			if vsphereVM, ok := v.(*vsphere.VM); ok {
+				if vsphereVM.Snapshot.ID != "" {
+					shiftSnapshotVMs.Items = append(shiftSnapshotVMs.Items, ref.String())
+				}
+				if label, sErr := hasShiftDiskMissingNAS(vsphereVM, plan.Map.Storage, inventory, ctx.Destination.Client); sErr != nil {
+					return sErr
+				} else if label != "" {
+					shiftNASMissing.Items = append(shiftNASMissing.Items, label)
+				}
+			}
+		}
+		if plan.Spec.Type == api.MigrationOnlyConversion {
+			if vm, ok := v.(*vsphere.VM); ok {
+				pvcs, err := r.getVmPVCs(plan, vm)
+				if err != nil {
+					return err
+				}
+				if len(pvcs) != len(vm.Disks) {
+					missingPvcForOnlyConversion.Items = append(missingPvcForOnlyConversion.Items, ref.String())
+				}
+			}
+		}
+
+		// Check for mixed VDDK/Offload usage (vSphere only)
+		// If plan uses offload, add VMs with VDDK disks to the condition
+		if planUsesOffload {
+			if vsphereVM, ok := v.(*vsphere.VM); ok {
+				storageMap := plan.Referenced.Map.Storage
+				if storageMap != nil {
+					curVMHasVddk, err := r.vmUsesVddk(storageMap, vsphereVM, vm.Name)
+					if err != nil {
+						return err
+					}
+					if curVMHasVddk {
+						vddkAndOffloadMixedUsage.Items = append(vddkAndOffloadMixedUsage.Items, ref.String())
+					}
 				}
 			}
 		}
@@ -651,7 +1129,12 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		if err != nil {
 			return err
 		}
-		validator, err := pAdapter.Validator(plan)
+		var ctx *plancontext.Context
+		ctx, err = plancontext.New(r, plan, r.Log)
+		if err != nil {
+			return err
+		}
+		validator, err := pAdapter.Validator(ctx)
 		if err != nil {
 			return err
 		}
@@ -663,12 +1146,16 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 			if !ok {
 				unmappedNetwork.Items = append(unmappedNetwork.Items, ref.String())
 			}
-			ok, err = validator.PodNetwork(*ref)
-			if err != nil {
-				return err
+			nicRefs, nErr := validator.NICNetworkRefs(*ref)
+			if nErr != nil {
+				return nErr
 			}
-			if !ok {
+			foundNadDup, foundPodDup := planbase.ValidateNetworkDuplicates(nicRefs, plan.Referenced.Map.Network)
+			if foundPodDup {
 				multiplePodNetworkMappings.Items = append(multiplePodNetworkMappings.Items, ref.String())
+			}
+			if foundNadDup {
+				duplicateNADMappings.Items = append(duplicateNADMappings.Items, ref.String())
 			}
 		}
 		if plan.Referenced.Map.Storage != nil {
@@ -701,12 +1188,81 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		if !ok {
 			missingStaticIPs.Items = append(missingStaticIPs.Items, ref.String())
 		}
-
-		var ctx *plancontext.Context
-		ctx, err = plancontext.New(r, plan, r.Log)
+		ok, err = validator.PowerState(*ref)
 		if err != nil {
 			return err
 		}
+		if !ok {
+			powerStateUnsupported.Items = append(powerStateUnsupported.Items, ref.String())
+		}
+		ok, err = validator.VMMigrationType(*ref)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			vmMigrationTypeUnsupported.Items = append(vmMigrationTypeUnsupported.Items, ref.String())
+		}
+		if vm.LUKS.Name != "" && vm.NbdeClevis {
+			luksAndClevisIncompatibility.Items = append(luksAndClevisIncompatibility.Items, ref.String())
+		}
+		// Guest tools validation (provider-specific)
+		ok, err = validator.GuestToolsInstalled(*ref)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			guestToolsIssue.Items = append(guestToolsIssue.Items, ref.String())
+		}
+		invalidSizes, err := validator.InvalidDiskSizes(*ref)
+		if err != nil {
+			return err
+		}
+		if len(invalidSizes) > 0 {
+			invalidDiskSizes.Items = append(invalidDiskSizes.Items, ref.String())
+		}
+
+		conflicts, err := validator.MacConflicts(*ref)
+		if err != nil {
+			return err
+		}
+		if len(conflicts) > 0 {
+			macConflicts.Items = append(macConflicts.Items, ref.String())
+			// Group conflicts by destination VM for this specific source VM
+			vmConflictsByVM := make(map[string][]string)
+			for _, conflict := range conflicts {
+				vmConflictsByVM[conflict.DestinationVM] = append(vmConflictsByVM[conflict.DestinationVM], conflict.MAC)
+			}
+
+			// Build detailed message with grouped conflicts
+			var conflictDetails []string
+			for destinationVM, macs := range vmConflictsByVM {
+				conflictDetails = append(conflictDetails, fmt.Sprintf("MACs %s conflict with destination VM %s", strings.Join(macs, ", "), destinationVM))
+			}
+			if macConflicts.Message != "" {
+				macConflicts.Message += "; "
+			}
+			macConflicts.Message += fmt.Sprintf("VM %s has MAC address conflicts: %s", ref.String(), strings.Join(conflictDetails, "; "))
+		}
+
+		// RDM and independent disk checks (vSphere only)
+		if !planUsesOffload {
+			if vsphereVM, ok := v.(*vsphere.VM); ok {
+				isWarm := plan.IsWarm()
+				for _, disk := range vsphereVM.Disks {
+					if disk.RDM && (!isWarm || disk.PhysicalMode) {
+						rdmDiskWarning.Items = append(rdmDiskWarning.Items, ref.String())
+						break
+					}
+				}
+				for _, disk := range vsphereVM.Disks {
+					if disk.Mode == "independent_persistent" || disk.Mode == "independent_nonpersistent" {
+						independentDiskWarning.Items = append(independentDiskWarning.Items, ref.String())
+						break
+					}
+				}
+			}
+		}
+
 		ok, msg, category, err := validator.SharedDisks(*ref, ctx.Destination.Client)
 		if err != nil {
 			return err
@@ -730,6 +1286,15 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 			sharedDisks.Type = fmt.Sprintf("%s-%s", sharedDisks.Type, ref.ID)
 			sharedDisksConditions = append(sharedDisksConditions, sharedDisks)
 		}
+		if settings.Settings.StaticUdnIpAddresses && plan.Spec.PreserveStaticIPs && plan.DestinationHasUdnNetwork(r.Client) {
+			ok, err = validator.UdnStaticIPs(*ref, ctx.Destination.Client)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				vmIpDoesNotMatchUdnSubnet.Items = append(vmIpDoesNotMatchUdnSubnet.Items, ref.String())
+			}
+		}
 		// Destination.
 		provider = plan.Referenced.Provider.Destination
 		if provider == nil {
@@ -739,16 +1304,16 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		if pErr != nil {
 			return liberr.Wrap(pErr)
 		}
-		id := path.Join(
-			plan.Spec.TargetNamespace,
-			ref.Name)
+		vmName := ref.Name
 		if vm.TargetName != "" {
 			// if target name is provided, use it to look for existing VMs
-			id = path.Join(
-				plan.Spec.TargetNamespace,
-				vm.TargetName)
+			vmName = vm.TargetName
 		}
-		_, pErr = inventory.VM(&refapi.Ref{Name: id})
+		vmRef := &refapi.Ref{
+			Name:      vmName,
+			Namespace: plan.Spec.TargetNamespace,
+		}
+		_, pErr = inventory.VM(vmRef)
 		if pErr == nil {
 			if _, found := plan.Status.Migration.FindVM(*ref); !found {
 				// This VM is preexisting or is being managed by a
@@ -763,7 +1328,7 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 			}
 		}
 		// Warm migration.
-		if plan.Spec.Warm {
+		if plan.IsWarm() {
 			enabled, err := validator.ChangeTrackingEnabled(*ref)
 			if err != nil {
 				return err
@@ -771,11 +1336,41 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 			if !enabled {
 				missingCbtForWarm.Items = append(missingCbtForWarm.Items, ref.String())
 			}
+
+			ok, msg, _, err := validator.HasSnapshot(*ref)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				vmHasSnapshotsForWarm.Items = append(vmHasSnapshotsForWarm.Items, ref.String())
+				if msg != "" {
+					vmHasSnapshotsForWarm.Message = msg
+				}
+			}
+
+			// Check for "consolidation needed"
+			consolidation, err := validator.ConsolidationNeeded(*ref)
+			if err != nil {
+				return err
+			}
+			if consolidation {
+				consolidationNeeded.Items = append(consolidationNeeded.Items, ref.String())
+			}
 		}
 		// is valid vm pvc name template
-		if vm.PVCNameTemplate != "" {
-			if err := r.IsValidPVCNameTemplate(vm.PVCNameTemplate); err != nil {
-				pvcNameInvalid.Items = append(pvcNameInvalid.Items, ref.String())
+		if plan.Spec.PVCNameTemplate != "" || vm.PVCNameTemplate != "" {
+			// if vm level pvc name template is set, use it, otherwise use plan level pvc name template
+			pvcNameTemplate := plan.Spec.PVCNameTemplate
+			if vm.PVCNameTemplate != "" {
+				pvcNameTemplate = vm.PVCNameTemplate
+			}
+
+			// validate pvc name template for the vm
+			if _, err := validator.PVCNameTemplate(vm.Ref, pvcNameTemplate); err != nil {
+				r.Log.Info("PVC name template is invalid", "error", err.Error(), "template", pvcNameTemplate, "plan", plan.Name, "namespace", plan.Namespace)
+
+				conditionItem := fmt.Sprintf("%s template:%s error:%s", ref.String(), pvcNameTemplate, err.Error())
+				pvcNameInvalid.Items = append(pvcNameInvalid.Items, conditionItem)
 			}
 		}
 		// is valid vm pvc name template
@@ -821,6 +1416,9 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 	if len(multiplePodNetworkMappings.Items) > 0 {
 		plan.Status.SetCondition(multiplePodNetworkMappings)
 	}
+	if len(duplicateNADMappings.Items) > 0 {
+		plan.Status.SetCondition(duplicateNADMappings)
+	}
 	if len(missingStaticIPs.Items) > 0 {
 		plan.Status.SetCondition(missingStaticIPs)
 	}
@@ -829,6 +1427,12 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 	}
 	if len(missingCbtForWarm.Items) > 0 {
 		plan.Status.SetCondition(missingCbtForWarm)
+	}
+	if len(vmIpDoesNotMatchUdnSubnet.Items) > 0 {
+		plan.Status.SetCondition(vmIpDoesNotMatchUdnSubnet)
+	}
+	if len(vmHasSnapshotsForWarm.Items) > 0 {
+		plan.Status.SetCondition(vmHasSnapshotsForWarm)
 	}
 	if len(pvcNameInvalid.Items) > 0 {
 		plan.Status.SetCondition(pvcNameInvalid)
@@ -845,11 +1449,91 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 	if len(targetNameNotUnique.Items) > 0 {
 		plan.Status.SetCondition(targetNameNotUnique)
 	}
-	if len(unsupportedOvaSource.Items) > 0 {
-		plan.Status.SetCondition(unsupportedOvaSource)
+	if len(unsupportedOVFExportSource.Items) > 0 {
+		plan.Status.SetCondition(unsupportedOVFExportSource)
+	}
+	if len(powerStateUnsupported.Items) > 0 {
+		plan.Status.SetCondition(powerStateUnsupported)
+	}
+	if len(vmMigrationTypeUnsupported.Items) > 0 {
+		plan.Status.SetCondition(vmMigrationTypeUnsupported)
+	}
+	if len(guestToolsIssue.Items) > 0 {
+		plan.Status.SetCondition(guestToolsIssue)
+	}
+	if len(invalidDiskSizes.Items) > 0 {
+		plan.Status.SetCondition(invalidDiskSizes)
+	}
+	if len(macConflicts.Items) > 0 {
+		plan.Status.SetCondition(macConflicts)
+	}
+	if len(missingPvcForOnlyConversion.Items) > 0 {
+		plan.Status.SetCondition(missingPvcForOnlyConversion)
+	}
+	if len(luksAndClevisIncompatibility.Items) > 0 {
+		plan.Status.SetCondition(luksAndClevisIncompatibility)
+	}
+
+	// Set the condition if any VMs with VDDK disks were found when plan uses offload
+	if len(vddkAndOffloadMixedUsage.Items) > 0 {
+		plan.Status.SetCondition(vddkAndOffloadMixedUsage)
+	}
+	if len(vmCriticalConcerns.Items) > 0 {
+		plan.Status.SetCondition(vmCriticalConcerns)
+	}
+	if len(consolidationNeeded.Items) > 0 {
+		plan.Status.SetCondition(consolidationNeeded)
+	}
+	if len(shiftSnapshotVMs.Items) > 0 {
+		plan.Status.SetCondition(shiftSnapshotVMs)
+	}
+	if len(shiftNASMissing.Items) > 0 {
+		plan.Status.SetCondition(shiftNASMissing)
+	}
+	if len(rdmDiskWarning.Items) > 0 {
+		plan.Status.SetCondition(rdmDiskWarning)
+	}
+	if len(independentDiskWarning.Items) > 0 {
+		plan.Status.SetCondition(independentDiskWarning)
 	}
 
 	return nil
+}
+
+// Return PersistentVolumeClaims associated with a VM.
+func (r *Reconciler) getVmPVCs(plan *api.Plan, vm *vsphere.VM) (pvcs []*core.PersistentVolumeClaim, err error) {
+	// Add VM uuid
+	labelSelector := map[string]string{
+		kVM:     vm.ID,
+		kVmUuid: vm.UUID,
+	}
+	var ctx *plancontext.Context
+	ctx, err = plancontext.New(r, plan, r.Log)
+	if err != nil {
+		return
+	}
+	pvcsList := &core.PersistentVolumeClaimList{}
+	err = ctx.Destination.Client.List(
+		context.TODO(),
+		pvcsList,
+		&client.ListOptions{
+			LabelSelector: labels.SelectorFromSet(labelSelector),
+			Namespace:     plan.Spec.TargetNamespace,
+		},
+	)
+
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+	pvcs = make([]*core.PersistentVolumeClaim, len(pvcsList.Items))
+	for i, pvc := range pvcsList.Items {
+		// loopvar
+		pvc := pvc
+		pvcs[i] = &pvc
+	}
+
+	return
 }
 
 // Validate transfer network selection.
@@ -871,6 +1555,13 @@ func (r *Reconciler) validateTransferNetwork(plan *api.Plan) (err error) {
 		Reason:   NotValid,
 		Message:  "Transfer network default route annotation is not a valid IP address.",
 	}
+	missingDefaultRoute := libcnd.Condition{
+		Type:     TransferNetMissingDefaultRoute,
+		Status:   True,
+		Category: api.CategoryWarn,
+		Reason:   NotValid,
+		Message:  "Transfer network missing default route annotation.",
+	}
 	key := client.ObjectKey{
 		Namespace: plan.Spec.TransferNetwork.Namespace,
 		Name:      plan.Spec.TransferNetwork.Name,
@@ -886,16 +1577,136 @@ func (r *Reconciler) validateTransferNetwork(plan *api.Plan) (err error) {
 		err = liberr.Wrap(err)
 		return
 	}
-	route, found := netAttachDef.Annotations[AnnForkliftNetworkRoute]
-	if !found {
+
+	if plan.Spec.TransferNetwork.Namespace != plan.Spec.TargetNamespace &&
+		plan.Spec.TransferNetwork.Namespace != core.NamespaceDefault {
+		plan.Status.SetCondition(libcnd.Condition{
+			Type:     TransferNetNotValid,
+			Status:   True,
+			Category: api.CategoryCritical,
+			Reason:   NotValid,
+			Message: fmt.Sprintf(
+				"Transfer network %s/%s is in a different namespace than the target namespace %s. "+
+					"Pods cannot reference network attachment definitions across namespaces.",
+				plan.Spec.TransferNetwork.Namespace,
+				plan.Spec.TransferNetwork.Name,
+				plan.Spec.TargetNamespace),
+		})
 		return
 	}
-	ip := net.ParseIP(route)
-	if ip == nil {
-		plan.Status.SetCondition(notValid)
+	route, found := netAttachDef.Annotations[AnnForkliftNetworkRoute]
+	if !found {
+		plan.Status.SetCondition(missingDefaultRoute)
+		return
+	}
+	// Handle case where user explicitly requested not to have a default route
+	if route != AnnForkliftRouteValueNone {
+		ip := net.ParseIP(route)
+		if ip == nil {
+			plan.Status.SetCondition(notValid)
+		}
 	}
 
 	return
+}
+
+// Validate that the specified ServiceAccount exists in the target namespace
+// and, when the plan has hooks, also in the plan namespace (where hook pods run).
+func (r *Reconciler) validateServiceAccount(plan *api.Plan) (err error) {
+	sa := resolveServiceAccount(plan)
+	if sa == "" {
+		return
+	}
+	key := client.ObjectKey{
+		Namespace: plan.Spec.TargetNamespace,
+		Name:      sa,
+	}
+	serviceAccount := &core.ServiceAccount{}
+	err = r.Get(context.TODO(), key, serviceAccount)
+	if k8serr.IsNotFound(err) {
+		err = nil
+		plan.Status.SetCondition(libcnd.Condition{
+			Type:     ServiceAccountNotValid,
+			Status:   True,
+			Category: api.CategoryCritical,
+			Reason:   NotFound,
+			Message: fmt.Sprintf(
+				"ServiceAccount '%s' not found in target namespace '%s'.",
+				sa, plan.Spec.TargetNamespace),
+		})
+		return
+	}
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+
+	if r.planHasLocalHookPods(plan) && plan.Namespace != plan.Spec.TargetNamespace {
+		key.Namespace = plan.Namespace
+		err = r.Get(context.TODO(), key, serviceAccount)
+		if k8serr.IsNotFound(err) {
+			err = nil
+			plan.Status.SetCondition(libcnd.Condition{
+				Type:     ServiceAccountNotValid,
+				Status:   True,
+				Category: api.CategoryCritical,
+				Reason:   NotFound,
+				Message: fmt.Sprintf(
+					"ServiceAccount '%s' not found in plan namespace '%s' (required for hook pods).",
+					sa, plan.Namespace),
+			})
+		} else if err != nil {
+			err = liberr.Wrap(err)
+		}
+	}
+	return
+}
+
+// planHasLocalHookPods returns true if any referenced hook runs a workload in the cluster
+// (local image hook). AAP-only hooks do not need a ServiceAccount in the plan namespace.
+func (r *Reconciler) planHasLocalHookPods(plan *api.Plan) bool {
+	for _, vm := range plan.Spec.VMs {
+		for _, href := range vm.Hooks {
+			if !libref.RefSet(&href.Hook) {
+				continue
+			}
+			hook := &api.Hook{}
+			err := r.Get(
+				context.TODO(),
+				client.ObjectKey{Namespace: href.Hook.Namespace, Name: href.Hook.Name},
+				hook)
+			if err != nil {
+				continue
+			}
+			if hook.Spec.AAP != nil {
+				continue
+			}
+			if strings.TrimSpace(hook.Spec.Image) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// planHookValidSteps is the set of pipeline steps that may reference a Hook.
+var planHookValidSteps = map[string]struct{}{
+	api.PhasePreHook:  {},
+	api.PhasePostHook: {},
+}
+
+const (
+	planHookStepDescriptionFmt  = "VM: %s step: %s"
+	planHookVMRefDescriptionFmt = "VM: %s hook: %s"
+	planHookVMOnlyFmt           = "VM: %s"
+)
+
+func planHookStepDescription(vm apisplan.VM, step string) string {
+	return fmt.Sprintf(planHookStepDescriptionFmt, vm.String(), step)
+}
+
+func planHookVMRefDescription(vm apisplan.VM, href apisplan.HookRef) string {
+	return fmt.Sprintf(planHookVMRefDescriptionFmt, vm.String(), href.Hook.String())
 }
 
 // Validate referenced hooks.
@@ -932,27 +1743,31 @@ func (r *Reconciler) validateHooks(plan *api.Plan) (err error) {
 		Message:  "Hook step not valid.",
 		Items:    []string{},
 	}
+	hookNotExecutable := libcnd.Condition{
+		Type:     HookNotValid,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "Hook must set spec.aap or spec.image for a local hook (playbook optional).",
+		Items:    []string{},
+	}
+	hookSANotFound := libcnd.Condition{
+		Type:     HookServiceAccountNotValid,
+		Status:   True,
+		Reason:   NotFound,
+		Category: api.CategoryCritical,
+		Message:  "Hook ServiceAccount not found in plan namespace.",
+		Items:    []string{},
+	}
 	for _, vm := range plan.Spec.VMs {
 		for _, ref := range vm.Hooks {
-			// Step not valid.
-			if _, found := map[string]int{api.PhasePreHook: 1, api.PhasePostHook: 1}[ref.Step]; !found {
-				description := fmt.Sprintf(
-					"VM: %s step: %s",
-					vm.String(),
-					ref.Step)
-				stepNotValid.Items = append(
-					stepNotValid.Items,
-					description)
+			if _, ok := planHookValidSteps[ref.Step]; !ok {
+				stepNotValid.Items = append(stepNotValid.Items, planHookStepDescription(vm, ref.Step))
 			}
-			// Not Set.
 			if !libref.RefSet(&ref.Hook) {
-				description := fmt.Sprintf("VM: %s", vm.String())
-				notSet.Items = append(
-					notSet.Items,
-					description)
+				notSet.Items = append(notSet.Items, fmt.Sprintf(planHookVMOnlyFmt, vm.String()))
 				continue
 			}
-			// Not Found.
 			hook := &api.Hook{}
 			err = r.Get(
 				context.TODO(),
@@ -962,36 +1777,41 @@ func (r *Reconciler) validateHooks(plan *api.Plan) (err error) {
 				},
 				hook)
 			if err != nil {
-				if k8serr.IsNotFound(err) {
-					description := fmt.Sprintf(
-						"VM: %s hook: %s",
-						vm.String(),
-						ref.Hook.String())
-					notFound.Items = append(
-						notFound.Items,
-						description)
-					continue
-				} else {
+				if !k8serr.IsNotFound(err) {
 					return
 				}
-			} else {
-				plan.Referenced.Hooks = append(
-					plan.Referenced.Hooks,
-					hook)
+				notFound.Items = append(notFound.Items, planHookVMRefDescription(vm, ref))
+				continue
 			}
-			// Not Ready.
+			plan.Referenced.Hooks = append(plan.Referenced.Hooks, hook)
+			hookRefDesc := planHookVMRefDescription(vm, ref)
+			if !api.HookExecutionConfigValid(hook) {
+				hookNotExecutable.Items = append(hookNotExecutable.Items, hookRefDesc)
+			} else if hook.Spec.AAP != nil && !libaap.HookAAPRunnableFromMigrationSettings(hook) {
+				hookNotExecutable.Items = append(hookNotExecutable.Items, hookRefDesc)
+			}
 			if !hook.Status.HasCondition(libcnd.Ready) {
-				description := fmt.Sprintf(
-					"VM: %s hook: %s",
-					vm.String(),
-					ref.Hook.String())
-				notReady.Items = append(
-					notReady.Items,
-					description)
+				notReady.Items = append(notReady.Items, hookRefDesc)
+			}
+			if sa := hook.Spec.ServiceAccount; sa != "" && hook.Spec.AAP == nil {
+				saKey := client.ObjectKey{
+					Namespace: plan.Namespace,
+					Name:      sa,
+				}
+				if saErr := r.Get(context.TODO(), saKey, &core.ServiceAccount{}); saErr != nil {
+					if k8serr.IsNotFound(saErr) {
+						hookSANotFound.Items = append(hookSANotFound.Items,
+							fmt.Sprintf("VM: %s hook: %s ServiceAccount '%s' not found in namespace '%s'",
+								vm.String(), ref.Hook.String(), sa, plan.Namespace))
+					} else {
+						err = liberr.Wrap(saErr)
+						return
+					}
+				}
 			}
 		}
 	}
-	for _, cnd := range []libcnd.Condition{} {
+	for _, cnd := range []libcnd.Condition{notSet, notFound, notReady, stepNotValid, hookNotExecutable, hookSANotFound} {
 		if len(cnd.Items) > 0 {
 			plan.Status.SetCondition(cnd)
 		}
@@ -1023,7 +1843,7 @@ func (r *Reconciler) validateVddkImage(plan *api.Plan) (err error) {
 		}
 		err = r.validateVddkImageJob(job, plan)
 	}
-	if plan.Spec.Warm && vddkImage == "" {
+	if plan.IsWarm() && vddkImage == "" {
 		plan.Status.SetCondition(libcnd.Condition{
 			Type:     VDDKInitImageUnavailable,
 			Status:   True,
@@ -1032,8 +1852,31 @@ func (r *Reconciler) validateVddkImage(plan *api.Plan) (err error) {
 			Message:  "VDDK image not set on the provider, this is required for the warm migration",
 		})
 	}
+	if plan.Spec.SkipGuestConversion && vddkImage == "" && !plan.IsUsingOffloadPlugin() {
+		plan.Status.SetCondition(libcnd.Condition{
+			Type:     VDDKInitImageUnavailable,
+			Status:   True,
+			Reason:   NotSet,
+			Category: api.CategoryCritical,
+			Message:  "VDDK image not set on the provider, this is required for the raw copy mode migration",
+		})
+	}
 
 	return
+}
+
+func missingStaticIPsMessage(plan *api.Plan) string {
+	guestTools := "guest tools"
+	source := plan.Referenced.Provider.Source
+	if source != nil {
+		switch source.Type() {
+		case api.VSphere:
+			guestTools = "VMware Tools"
+		case api.HyperV:
+			guestTools = "Hyper-V Integration Services"
+		}
+	}
+	return fmt.Sprintf("Guest information on vNICs is missing, cannot preserve static IPs. Make sure %s is installed and the VM is running.", guestTools)
 }
 
 func jobExceedsDeadline(job *batchv1.Job) bool {
@@ -1082,7 +1925,13 @@ func (r *Reconciler) validateVddkImageJob(job *batchv1.Job, plan *api.Plan) (err
 	if len(pods.Items) > 0 {
 		pod := pods.Items[0]
 		if len(pod.Status.InitContainerStatuses) == 0 {
-			return liberr.New("Validation pod doesn't contain expected init container", "pod", pod)
+			// Pod exists but init container statuses haven't been populated yet.
+			// This is normal when the pod was just created. Log it and
+			// let the next reconcile check again.
+			r.Log.Info("Validation pod init container statuses not yet available, will requeue",
+				"pod", pod.Name, "phase", pod.Status.Phase)
+			plan.Status.SetCondition(vddkValidationInProgress)
+			return
 		}
 		waiting := pod.Status.InitContainerStatuses[0].State.Waiting
 		if waiting != nil {
@@ -1284,7 +2133,7 @@ func createVddkCheckJob(plan *api.Plan) *batchv1.Job {
 		psc.RunAsNonRoot = ptr.To(true)
 		psc.RunAsUser = ptr.To(qemuUser)
 	}
-	return &batchv1.Job{
+	job := &batchv1.Job{
 		ObjectMeta: meta.ObjectMeta{
 			GenerateName: fmt.Sprintf("vddk-validator-%s", plan.Name),
 			Namespace:    plan.Spec.TargetNamespace,
@@ -1316,7 +2165,7 @@ func createVddkCheckJob(plan *api.Plan) *batchv1.Job {
 									core.ResourceMemory: resource.MustParse("500Mi"),
 								},
 							},
-							Image: Settings.Migration.VirtV2vImage,
+							Image: getVirtV2vImage(plan),
 							SecurityContext: &core.SecurityContext{
 								AllowPrivilegeEscalation: ptr.To(false),
 								Capabilities: &core.Capabilities{
@@ -1332,6 +2181,10 @@ func createVddkCheckJob(plan *api.Plan) *batchv1.Job {
 			},
 		},
 	}
+	if sa := resolveServiceAccount(plan); sa != "" {
+		job.Spec.Template.Spec.ServiceAccountName = sa
+	}
+	return job
 }
 
 func (r *Reconciler) setupSecret(plan *api.Plan) (err error) {
@@ -1340,7 +2193,7 @@ func (r *Reconciler) setupSecret(plan *api.Plan) (err error) {
 		Name:      plan.Referenced.Provider.Source.Spec.Secret.Name,
 	}
 
-	secret := v1.Secret{}
+	secret := core.Secret{}
 	err = r.Get(context.TODO(), key, &secret)
 	if err != nil {
 		return
@@ -1378,46 +2231,15 @@ func (r *Reconciler) IsValidTemplate(templateStr string, testData interface{}) (
 	// Execute the template with test data
 	result, err := templateutil.ExecuteTemplate(templateStr, testData)
 	if err != nil {
-		return "", liberr.Wrap(err, "Template execution failed")
+		return "", liberr.Wrap(err, "template", templateStr)
 	}
 
 	// Empty output is not valid
 	if result == "" {
-		return "", liberr.New("Template output is empty")
+		return "", liberr.New("Template output is empty", "template", templateStr)
 	}
 
 	return result, nil
-}
-
-func (r *Reconciler) IsValidPVCNameTemplate(pvcNameTemplate string) error {
-	if pvcNameTemplate == "" {
-		return nil
-	}
-
-	// Test template with sample data
-	testData := api.PVCNameTemplateData{
-		VmName:         "test-vm",
-		PlanName:       "test-plan",
-		DiskIndex:      0,
-		RootDiskIndex:  0,
-		Shared:         false,
-		FileName:       "[test07_ds1] test_sp/test-000001.vmdk",
-		WinDriveLetter: "c",
-	}
-
-	result, err := r.IsValidTemplate(pvcNameTemplate, testData)
-	if err != nil {
-		return err
-	}
-
-	// Validate that template output is a valid k8s label
-	errs := k8svalidation.IsDNS1123Label(result)
-	if len(errs) > 0 {
-		errMsg := fmt.Sprintf("Template output is not a valid k8s label [%s]", result)
-		return liberr.New(errMsg, errs)
-	}
-
-	return nil
 }
 
 func (r *Reconciler) IsValidVolumeNameTemplate(volumeNameTemplate string) error {
@@ -1439,7 +2261,7 @@ func (r *Reconciler) IsValidVolumeNameTemplate(volumeNameTemplate string) error 
 	errs := k8svalidation.IsDNS1123Label(result)
 	if len(errs) > 0 {
 		errMsg := fmt.Sprintf("Template output is not a valid k8s label [%s]", result)
-		return liberr.New(errMsg, errs)
+		return liberr.New(errMsg, "template", volumeNameTemplate, "errors", errs)
 	}
 
 	return nil
@@ -1466,7 +2288,7 @@ func (r *Reconciler) IsValidNetworkNameTemplate(networkNameTemplate string) erro
 	errs := k8svalidation.IsDNS1123Label(result)
 	if len(errs) > 0 {
 		errMsg := fmt.Sprintf("Template output is not a valid k8s label [%s]", result)
-		return liberr.New(errMsg, errs)
+		return liberr.New(errMsg, "template", networkNameTemplate, "errors", errs)
 	}
 
 	return nil
@@ -1484,4 +2306,238 @@ func (r *Reconciler) IsValidTargetName(targetName string) error {
 	}
 
 	return nil
+}
+
+func (r *Reconciler) validateConversionTempStorage(plan *api.Plan) error {
+	storageClass := plan.Spec.ConversionTempStorageClass
+	storageSize := plan.Spec.ConversionTempStorageSize
+
+	// If neither is set, that's fine
+	if storageClass == "" && storageSize == "" {
+		return nil
+	}
+
+	// If only one is set, that's an error
+	if storageClass == "" || storageSize == "" {
+		conversionTempStorageIncomplete := libcnd.Condition{
+			Type:     NotValid,
+			Status:   True,
+			Category: api.CategoryCritical,
+			Message:  "Both ConversionTempStorageClass and ConversionTempStorageSize must be specified together.",
+			Items:    []string{},
+		}
+		plan.Status.SetCondition(conversionTempStorageIncomplete)
+		return nil
+	}
+
+	// Validate that storageSize is a valid Kubernetes resource quantity
+	requestedQty, err := resource.ParseQuantity(storageSize)
+	if err != nil {
+		conversionTempStorageSizeInvalid := libcnd.Condition{
+			Type:     NotValid,
+			Status:   True,
+			Category: api.CategoryCritical,
+			Message:  fmt.Sprintf("ConversionTempStorageSize '%s' is not a valid Kubernetes resource quantity: %v", storageSize, err),
+			Items:    []string{},
+		}
+		plan.Status.SetCondition(conversionTempStorageSizeInvalid)
+		r.Log.Info("Conversion temp storage size is invalid", "error", err.Error(), "size", storageSize, "plan", plan.Name, "namespace", plan.Namespace)
+		return nil
+	}
+
+	// Validate that the StorageClass exists in the cluster (conversion runs on destination/target)
+	sc := &storagev1.StorageClass{}
+	if err := r.Client.Get(context.Background(), client.ObjectKey{Name: storageClass}, sc); err != nil {
+		if k8serr.IsNotFound(err) {
+			plan.Status.SetCondition(libcnd.Condition{
+				Type:     NotValid,
+				Status:   True,
+				Category: api.CategoryCritical,
+				Message:  fmt.Sprintf("ConversionTempStorageClass %q not found in the cluster. The conversion PVC will remain Pending and the migration will hang.", storageClass),
+				Items:    []string{},
+			})
+			r.Log.Info("Conversion temp storage class not found", "storageClass", storageClass, "plan", plan.Name, "namespace", plan.Namespace)
+			return nil
+		}
+		return liberr.Wrap(err, "failed to get StorageClass", "storageClass", storageClass)
+	}
+
+	// Check CSIStorageCapacity when available: block migration if storage class
+	// reports insufficient capacity for the requested conversion temp volume size.
+	if err := r.validateConversionTempStorageCapacity(plan, storageClass, requestedQty); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateConversionTempStorageCapacity checks CSIStorageCapacity for the given
+// storage class. If any entry reports capacity sufficient for the requested size
+// (MaximumVolumeSize or Capacity >= requested), the check passes. If entries exist
+// but none have sufficient capacity, a blocking condition is set. If no entries
+// exist for the storage class, an advisory warning is set.
+func (r *Reconciler) validateConversionTempStorageCapacity(plan *api.Plan, storageClassName string, requested resource.Quantity) error {
+	ctx := context.Background()
+	list := &storagev1.CSIStorageCapacityList{}
+	if err := r.Client.List(ctx, list, client.InNamespace(core.NamespaceAll)); err != nil {
+		r.Log.Info("Could not list CSIStorageCapacity (capacity check skipped)", "error", err.Error(), "storageClass", storageClassName)
+		plan.Status.SetCondition(libcnd.Condition{
+			Type:     NotValid,
+			Status:   True,
+			Category: api.CategoryAdvisory,
+			Message:  fmt.Sprintf("Storage capacity for ConversionTempStorageClass %q could not be verified. Ensure sufficient space is available.", storageClassName),
+			Items:    []string{},
+		})
+		return nil
+	}
+
+	var matching []storagev1.CSIStorageCapacity
+	for i := range list.Items {
+		if list.Items[i].StorageClassName == storageClassName {
+			matching = append(matching, list.Items[i])
+		}
+	}
+
+	if len(matching) == 0 {
+		plan.Status.SetCondition(libcnd.Condition{
+			Type:     NotValid,
+			Status:   True,
+			Category: api.CategoryAdvisory,
+			Message:  fmt.Sprintf("No capacity information found for ConversionTempStorageClass %q. Ensure sufficient space is available.", storageClassName),
+			Items:    []string{},
+		})
+		return nil
+	}
+
+	for _, cap := range matching {
+		// Prefer MaximumVolumeSize (largest single volume); fall back to Capacity (available space).
+		if cap.MaximumVolumeSize != nil && cap.MaximumVolumeSize.Cmp(requested) >= 0 {
+			return nil
+		}
+		if cap.MaximumVolumeSize == nil && cap.Capacity != nil && cap.Capacity.Cmp(requested) >= 0 {
+			return nil
+		}
+	}
+
+	// Have capacity info but no entry can satisfy the requested size
+	plan.Status.SetCondition(libcnd.Condition{
+		Type:     NotValid,
+		Status:   True,
+		Category: api.CategoryCritical,
+		Message:  fmt.Sprintf("Insufficient space in storage class %q for conversion temp storage (requested %s). Migration may fail.", storageClassName, requested.String()),
+		Items:    []string{},
+	})
+	r.Log.Info("Conversion temp storage capacity insufficient", "storageClass", storageClassName, "requested", requested.String(), "plan", plan.Name, "namespace", plan.Namespace)
+	return nil
+}
+
+// validatePodSecurity checks if the controller namespace has restrictive pod security policies
+// that may cause migration failures. This is a non-blocking warning.
+func (r *Reconciler) validatePodSecurity(plan *api.Plan) error {
+	// Get controller namespace from environment variable
+	// POD_NAMESPACE should be set via fieldRef in the deployment template
+	controllerNamespace := os.Getenv("POD_NAMESPACE")
+	if controllerNamespace == "" {
+		// Fallback to settings if available (loaded from POD_NAMESPACE env var)
+		controllerNamespace = settings.Settings.Inventory.Namespace
+	}
+	if controllerNamespace == "" {
+		// Can't check if we don't know the controller namespace
+		// POD_NAMESPACE should be set via fieldRef.fieldPath: metadata.namespace in the deployment
+		r.Log.Info("Skipping pod security check: POD_NAMESPACE not set in controller pod",
+			"plan", plan.Name,
+			"planNamespace", plan.GetNamespace())
+		return nil
+	}
+
+	// Log which namespace we're checking (for debugging)
+	r.Log.Info("Checking pod security policy for controller namespace",
+		"controllerNamespace", controllerNamespace,
+		"plan", plan.Name,
+		"planNamespace", plan.GetNamespace())
+
+	// Read the namespace object
+	ns := &core.Namespace{}
+	err := r.Client.Get(context.TODO(), client.ObjectKey{Name: controllerNamespace}, ns)
+	if err != nil {
+		if k8serr.IsNotFound(err) {
+			// Namespace not found, skip check
+			r.Log.Info("Skipping pod security check: namespace not found",
+				"namespace", controllerNamespace)
+			return nil
+		}
+		return liberr.Wrap(err, "failed to get controller namespace", "namespace", controllerNamespace)
+	}
+
+	// Check pod-security.kubernetes.io/enforce label
+	enforceLabel := ns.Labels["pod-security.kubernetes.io/enforce"]
+	isRestricted := false
+
+	r.Log.Info("Checking pod security policy",
+		"namespace", controllerNamespace,
+		"enforceLabel", enforceLabel,
+		"plan", plan.Name)
+
+	if enforceLabel == "restricted" {
+		isRestricted = true
+		r.Log.Info("Detected restricted pod security policy from namespace label",
+			"namespace", controllerNamespace,
+			"label", "pod-security.kubernetes.io/enforce",
+			"value", enforceLabel,
+			"plan", plan.Name)
+	}
+
+	// If restricted policies detected, add a warning condition (non-blocking)
+	if isRestricted {
+		restrictedPodSecurity := libcnd.Condition{
+			Type:     RestrictedPodSecurity,
+			Status:   True,
+			Category: Warn, // Non-blocking warning
+			Message:  fmt.Sprintf("Namespace '%s' where MTV is installed may be restricted, causing migration to fail. Disable SCC label synchronization and apply the privileged label.", controllerNamespace),
+			Items:    []string{},
+		}
+		plan.Status.SetCondition(restrictedPodSecurity)
+		r.Log.Info("Restricted pod security policy detected - warning condition added",
+			"namespace", controllerNamespace,
+			"plan", plan.Name)
+	} else {
+		r.Log.Info("No restricted pod security policy detected",
+			"namespace", controllerNamespace,
+			"enforceLabel", enforceLabel,
+			"plan", plan.Name)
+	}
+
+	return nil
+}
+
+func (r *Reconciler) validateVirtV2vImage(plan *api.Plan) error {
+	if plan.Spec.VirtV2vImage == "" {
+		return nil
+	}
+	img := plan.Spec.VirtV2vImage
+	if !hookutil.ReferenceRegexp.MatchString(img) || !strings.Contains(img, "/") {
+		plan.Status.SetCondition(libcnd.Condition{
+			Type:     VirtV2vImageNotValid,
+			Status:   True,
+			Reason:   NotValid,
+			Category: Critical,
+			Message:  "VirtV2vImage is not a valid container image reference. A fully-qualified image is required (e.g. quay.io/kubev2v/forklift-virt-v2v:latest).",
+		})
+	}
+	return nil
+}
+
+// vmUsesVddk checks if the VM requires VDDK for migration (i.e., if any disk doesn't use storage offload)
+func (r *Reconciler) vmUsesVddk(storageMap *api.StorageMap, vsphereVM *vsphere.VM, vmName string) (bool, error) {
+	for _, disk := range vsphereVM.Disks {
+		mapping, found := storageMap.FindStorage(disk.Datastore.ID)
+		if !found {
+			continue // Another validation will handle this
+		}
+		if mapping.OffloadPlugin == nil || mapping.OffloadPlugin.VSphereXcopyPluginConfig == nil {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }

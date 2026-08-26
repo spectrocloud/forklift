@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	cnv "kubevirt.io/api/core/v1"
 	instancetype "kubevirt.io/api/instancetype/v1beta1"
+	cdi "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 )
 
 // Errors
@@ -147,10 +148,81 @@ func (m *ClusterInstanceType) With(i *instancetype.VirtualMachineClusterInstance
 // VM
 type VM struct {
 	Base
-	Object cnv.VirtualMachine `sql:""`
+	Object   cnv.VirtualMachine          `sql:""`
+	Instance *cnv.VirtualMachineInstance `sql:""`
 }
 
 func (m *VM) With(v *cnv.VirtualMachine) {
 	m.Base.With(v)
 	m.Object = *v
+}
+
+func (m *VM) WithVMI(vmi *cnv.VirtualMachineInstance) {
+	m.Instance = vmi
+}
+
+// PersistentVolumeClaim
+type PersistentVolumeClaim struct {
+	Base
+	Object core.PersistentVolumeClaim `sql:""`
+}
+
+func (m *PersistentVolumeClaim) With(pvc *core.PersistentVolumeClaim) {
+	m.Base.With(pvc)
+	m.Object = *pvc
+}
+
+// DataVolume
+type DataVolume struct {
+	Base
+	Object cdi.DataVolume `sql:""`
+}
+
+func (m *DataVolume) With(dv *cdi.DataVolume) {
+	m.Base.With(dv)
+	m.Object = *dv
+}
+
+// KubeVirt
+type KubeVirt struct {
+	Base
+	Object cnv.KubeVirt `sql:""`
+}
+
+func (m *KubeVirt) With(kv *cnv.KubeVirt) {
+	m.Base.With(kv)
+	m.Object = *kv
+}
+
+type TopologyType string
+type RoleType string
+type NadType string
+
+// Constants for the supported TopologyType values.
+const (
+	TopologyLayer2 TopologyType = "layer2"
+	TopologyLayer3 TopologyType = "layer3"
+	RolePrimary    RoleType     = "primary"
+	RoleSecondary  RoleType     = "secondary"
+	OvnOverlayType NadType      = "ovn-k8s-cni-overlay"
+)
+
+// NetworkConfig represents the structure of the OVN-Kubernetes CNI configuration JSON.
+// The `json:"..."` tags are used by the encoding/json package to map the JSON keys
+// to the struct fields during marshalling and unmarshalling.
+type NetworkConfig struct {
+	AllowPersistentIPs bool         `json:"allowPersistentIPs"`
+	CNIVersion         string       `json:"cniVersion"`
+	JoinSubnet         string       `json:"joinSubnet"`
+	Name               string       `json:"name"`
+	NetAttachDefName   string       `json:"netAttachDefName"`
+	Role               RoleType     `json:"role"`
+	Subnets            string       `json:"subnets"`
+	Topology           TopologyType `json:"topology"`
+	Type               NadType      `json:"type"`
+}
+
+func (m *NetworkConfig) IsUnsupportedUdn() bool {
+	return m.Type == OvnOverlayType &&
+		(m.Role == RolePrimary || m.Topology == TopologyLayer3)
 }

@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	libitr "github.com/kubev2v/forklift/pkg/lib/itinerary"
+	"k8s.io/apimachinery/pkg/types"
 	export "kubevirt.io/api/export/v1alpha1"
 
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
@@ -17,13 +19,13 @@ import (
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
 	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
+	model "github.com/kubev2v/forklift/pkg/controller/provider/web/ocp"
 	ocpclient "github.com/kubev2v/forklift/pkg/lib/client/openshift"
+	"github.com/kubev2v/forklift/pkg/templateutil"
 	core "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes/scheme"
 	cnv "kubevirt.io/api/core/v1"
@@ -58,6 +60,12 @@ func (r *Builder) ConfigMap(vmRef ref.Ref, secret *core.Secret, object *core.Con
 		return liberr.Wrap(err)
 	}
 
+	// For Skipped exports (e.g., ContainerDisk-only VMs), no cert to provide
+	if vmExport.Status != nil && vmExport.Status.Phase == export.Skipped {
+		r.Log.Info("VMExport is skipped, no ConfigMap cert needed", "vmRef", vmRef)
+		return nil
+	}
+
 	links := vmExport.Status.Links
 	if links.External != nil {
 		object.Data = map[string]string{
@@ -84,6 +92,12 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *v1.Secret, configMap *v1.Co
 		return nil, liberr.Wrap(err)
 	}
 
+	// For Skipped exports (e.g., ContainerDisk-only VMs), no volumes to transfer
+	if vmExport.Status != nil && vmExport.Status.Phase == export.Skipped {
+		r.Log.Info("VMExport is skipped, no DataVolumes to create", "vmRef", vmRef)
+		return []cdi.DataVolume{}, nil
+	}
+
 	// Build storage map
 	storageMap := map[string]v1beta1.DestinationStorage{}
 	for _, storage := range r.Map.Storage.Spec.Map {
@@ -91,7 +105,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *v1.Secret, configMap *v1.Co
 	}
 
 	dataVolumes := []cdi.DataVolume{}
-	for _, volume := range vmExport.Status.Links.External.Volumes {
+	for diskIndex, volume := range vmExport.Status.Links.External.Volumes {
 		// Get PVC
 		pvc := &core.PersistentVolumeClaim{}
 		err = r.sourceClient.Get(context.TODO(), client.ObjectKey{Namespace: vmRef.Namespace, Name: volume.Name}, pvc)
@@ -101,7 +115,26 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *v1.Secret, configMap *v1.Co
 
 		size := pvc.Spec.Resources.Requests["storage"]
 		dataVolume := dvTemplate.DeepCopy()
+		dataVolume.GenerateName = ""
+
+		pvcName, templateErr := r.setPVCNameFromTemplate(vmRef, pvc, diskIndex)
+		if templateErr != nil {
+			r.Log.Info("Failed to generate PVC name using template, using source PVC name", "error", templateErr)
+			pvcName = pvc.Name
+		}
+
+		if r.hasCustomPVCNameTemplate(vmRef) && r.Plan.Spec.PVCNameTemplateUseGenerateName {
+			if !strings.HasSuffix(pvcName, "-") {
+				pvcName = pvcName + "-"
+			}
+			dataVolume.GenerateName = pvcName
+			dataVolume.Name = ""
+		} else {
+			dataVolume.Name = pvcName
+		}
+
 		dataVolume.Annotations[planbase.AnnDiskSource] = fmt.Sprintf("%s/%s", pvc.Namespace, pvc.Name)
+		dataVolume.Annotations[planbase.AnnDiskIndex] = fmt.Sprintf("%d", diskIndex)
 
 		url := getExportURL(volume.Formats)
 		if url == "" {
@@ -112,7 +145,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *v1.Secret, configMap *v1.Co
 
 		err = r.Destination.Client.Create(context.TODO(), dataVolume, &client.CreateOptions{})
 		if err != nil {
-			if !k8serr.IsAlreadyExists(err) {
+			if !errors.IsAlreadyExists(err) {
 				r.Log.Error(err, "Failed to create DataVolume")
 				return nil, liberr.Wrap(err)
 			}
@@ -156,6 +189,12 @@ func (r *Builder) Secret(vmRef ref.Ref, in *core.Secret, object *core.Secret) er
 	if err != nil {
 		r.Log.Error(err, "Failed to get VM-export Secret")
 		return liberr.Wrap(err)
+	}
+
+	// For Skipped exports (e.g., ContainerDisk-only VMs), no token secret
+	if vmExport.Status != nil && vmExport.Status.Phase == export.Skipped {
+		r.Log.Info("VMExport is skipped, no Secret token needed", "vmRef", vmRef)
+		return nil
 	}
 
 	// Export pod is ready
@@ -251,222 +290,147 @@ func (r *Builder) TemplateLabels(vmRef ref.Ref) (labels map[string]string, err e
 
 // VirtualMachine implements base.Builder
 func (r *Builder) VirtualMachine(vmRef ref.Ref, object *cnv.VirtualMachineSpec, persistentVolumeClaims []*v1.PersistentVolumeClaim, usesInstanceType bool, sortVolumesByLibvirt bool) error {
-	vmExport := &export.VirtualMachineExport{}
-	err := r.sourceClient.Get(context.Background(), client.ObjectKey{Namespace: vmRef.Namespace, Name: vmRef.Name}, vmExport)
-	if err != nil {
-		return liberr.Wrap(err)
-	}
-
-	sourceVm, err := r.getSourceVmFromDefinition(vmExport)
+	sourceVm, err := r.getSourceVmFromDefinition(vmRef)
 	if err != nil {
 		return liberr.Wrap(err)
 	}
 
 	targetVmSpec := sourceVm.Spec.DeepCopy()
 	object.Template = targetVmSpec.Template
-	r.mapDisks(sourceVm, targetVmSpec, persistentVolumeClaims, vmRef)
 	r.mapNetworks(sourceVm, targetVmSpec)
+	r.mapVolumes(sourceVm, targetVmSpec, persistentVolumeClaims)
 
 	return nil
 }
 
-func (r *Builder) mapDisks(sourceVm *cnv.VirtualMachine, targetVmSpec *cnv.VirtualMachineSpec, persistentVolumeClaims []*core.PersistentVolumeClaim, vmRef ref.Ref) {
-	pvcMap := make(map[string]*core.PersistentVolumeClaim)
-	for i := range persistentVolumeClaims {
-		pvc := persistentVolumeClaims[i]
-		if source, ok := pvc.Annotations[planbase.AnnDiskSource]; ok {
-			pvcMap[source] = pvc
-		}
+// ConfigMaps builds CRs for each of the ConfigMaps that the source VM depends upon.
+// Migration labels are set to track when they were first created, but since these may be
+// used by more than one VM they are not labeled with the VM id.
+func (r *Builder) ConfigMaps(vmRef ref.Ref) (list []core.ConfigMap, err error) {
+	virtualMachine := &model.VM{}
+	err = r.Source.Inventory.Find(virtualMachine, vmRef)
+	if err != nil {
+		err = liberr.Wrap(err, "vm", vmRef.String())
+		return
 	}
-
-	diskMap := createDiskMap(sourceVm, pvcMap, vmRef)
-	configMaps, secrets := r.createEnvMaps(sourceVm, vmRef)
-
-	// Clear original disks and volumes, will be required for other mapped devices later
-	targetVmSpec.Template.Spec.Domain.Devices.Disks = []cnv.Disk{}
-	targetVmSpec.Template.Spec.Volumes = []cnv.Volume{}
-
-	r.mapPVCsToTarget(targetVmSpec, persistentVolumeClaims, diskMap)
-	r.mapConfigMapsToTarget(targetVmSpec, configMaps)
-	r.mapSecretsToTarget(targetVmSpec, secrets)
-	r.mapDeviceDisks(targetVmSpec, sourceVm, diskMap)
-}
-
-// FIXME: The map does not contain all possible disk configuration
-// We should go through the missing and implement them or warn around them
-func (r *Builder) isDiskInDiskMap(disk *cnv.Disk, diskMap map[string]*cnv.Disk) bool {
-	for _, val := range diskMap {
-		if disk.Name == val.Name {
-			return true
-		}
-	}
-	return false
-}
-
-func (r *Builder) mapDeviceDisks(targetVmSpec *cnv.VirtualMachineSpec, sourceVm *cnv.VirtualMachine, diskMap map[string]*cnv.Disk) {
-	for _, disk := range sourceVm.Spec.Template.Spec.Domain.Devices.Disks {
-		if r.isDiskInDiskMap(&disk, diskMap) {
-			targetVmSpec.Template.Spec.Domain.Devices.Disks = append(targetVmSpec.Template.Spec.Domain.Devices.Disks, *disk.DeepCopy())
-		}
-	}
-}
-
-func createDiskMap(sourceVm *cnv.VirtualMachine, pvcMap map[string]*core.PersistentVolumeClaim, vmRef ref.Ref) map[string]*cnv.Disk {
-	diskMap := make(map[string]*cnv.Disk)
-
-	for _, disk := range sourceVm.Spec.Template.Spec.Domain.Devices.Disks {
-		currentDisk := disk
-		for _, vol := range sourceVm.Spec.Template.Spec.Volumes {
-			if vol.Name != disk.Name {
-				continue
-			}
-
-			var key string
-			switch {
-			case vol.PersistentVolumeClaim != nil:
-				key = pvcSourceName(vmRef.Namespace, vol.PersistentVolumeClaim.ClaimName)
-			case vol.DataVolume != nil:
-				key = pvcSourceName(vmRef.Namespace, vol.DataVolume.Name)
-			case vol.ConfigMap != nil:
-				key = vol.ConfigMap.Name
-			case vol.Secret != nil:
-				key = vol.Secret.SecretName
-			}
-
-			diskMap[key] = &currentDisk
-			break
-		}
-	}
-
-	return diskMap
-}
-
-func (r *Builder) mapPVCsToTarget(targetVmSpec *cnv.VirtualMachineSpec, persistentVolumeClaims []*core.PersistentVolumeClaim, diskMap map[string]*cnv.Disk) {
-	for _, volume := range persistentVolumeClaims {
-		if disk, ok := diskMap[volume.Annotations[planbase.AnnDiskSource]]; ok {
-			targetVolume := cnv.Volume{
-				Name: disk.Name,
-				VolumeSource: cnv.VolumeSource{
-					PersistentVolumeClaim: &cnv.PersistentVolumeClaimVolumeSource{
-						PersistentVolumeClaimVolumeSource: core.PersistentVolumeClaimVolumeSource{
-							ClaimName: volume.Name,
-						},
-					},
-				},
-			}
-			targetVmSpec.Template.Spec.Volumes = append(targetVmSpec.Template.Spec.Volumes, targetVolume)
-		}
-	}
-}
-
-type envMap struct {
-	envResource interface{}
-	volName     string
-}
-
-func (r *Builder) createEnvMaps(sourceVm *cnv.VirtualMachine, vmRef ref.Ref) (map[string]*envMap, map[string]*envMap) {
-	configMaps := make(map[string]*envMap)
-	secrets := make(map[string]*envMap)
-
-	for _, envVol := range sourceVm.Spec.Template.Spec.Volumes {
+	sources := []types.NamespacedName{}
+	for _, vol := range virtualMachine.Object.Spec.Template.Spec.Volumes {
 		switch {
-		case envVol.ConfigMap != nil:
-			configMap := &core.ConfigMap{}
-			err := r.sourceClient.Get(context.Background(), client.ObjectKey{Namespace: vmRef.Namespace, Name: envVol.ConfigMap.Name}, configMap)
-			if err != nil {
-				r.Log.Error(err, "Failed to get ConfigMap", "namespace", vmRef.Namespace, "name", envVol.ConfigMap.Name)
-				continue
+		case vol.ConfigMap != nil:
+			key := types.NamespacedName{Namespace: virtualMachine.Namespace, Name: vol.ConfigMap.Name}
+			sources = append(sources, key)
+		case vol.Sysprep != nil:
+			if vol.Sysprep.ConfigMap != nil {
+				key := types.NamespacedName{Namespace: virtualMachine.Namespace, Name: vol.Sysprep.ConfigMap.Name}
+				sources = append(sources, key)
 			}
-			configMaps[envVol.ConfigMap.Name] = &envMap{
-				envResource: configMap,
-				volName:     envVol.Name,
-			}
-
-		case envVol.Secret != nil:
-			secret := &core.Secret{}
-			err := r.sourceClient.Get(context.Background(), client.ObjectKey{Namespace: vmRef.Namespace, Name: envVol.Secret.SecretName}, secret)
-			if err != nil {
-				r.Log.Error(err, "Failed to get Secret", "namespace", vmRef.Namespace, "name", envVol.Secret.SecretName)
-				continue
-			}
-			secrets[envVol.Secret.SecretName] = &envMap{
-				envResource: secret,
-				volName:     envVol.Name,
-			}
+		default:
+			continue
 		}
 	}
-
-	return configMaps, secrets
+	for _, key := range sources {
+		source := &core.ConfigMap{}
+		err = r.sourceClient.Get(context.Background(), key, source)
+		if err != nil {
+			err = liberr.Wrap(err)
+			return
+		}
+		target := core.ConfigMap{}
+		target.Name = source.Name
+		target.Namespace = r.Plan.Spec.TargetNamespace
+		target.Data = source.Data
+		target.BinaryData = source.BinaryData
+		target.Immutable = source.Immutable
+		target.SetLabels(source.GetLabels())
+		r.Labeler.SetLabels(&target, r.Labeler.MigrationLabels())
+		target.SetAnnotations(source.GetAnnotations())
+		r.Labeler.SetAnnotation(&target, planbase.AnnSource, key.String())
+		list = append(list, target)
+	}
+	return
 }
 
-func (r *Builder) mapConfigMapsToTarget(targetVmSpec *cnv.VirtualMachineSpec, configMaps map[string]*envMap) {
-	for _, configMap := range configMaps {
-		// Create configmap on destination cluster
-		sourceConfigMap := configMap.envResource.(*core.ConfigMap)
-		targetConfigMap := &core.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:        sourceConfigMap.Name,
-				Namespace:   r.Plan.Spec.TargetNamespace,
-				Labels:      sourceConfigMap.Labels,
-				Annotations: sourceConfigMap.Annotations,
-			},
-			Data: sourceConfigMap.Data,
-		}
-		err := r.Destination.Client.Create(context.Background(), targetConfigMap)
-		if err != nil {
-			if !errors.IsAlreadyExists(err) {
-				r.Log.Error(err, "Failed to create ConfigMap", "namespace", r.Plan.Spec.TargetNamespace, "name", targetConfigMap.Name)
-				continue
+// Secrets builds CRs for each of the Secrets that the source VM depends upon.
+// Migration labels are set to track when they were first created, but since these may be
+// used by more than one VM they are not labeled with the VM id.
+func (r *Builder) Secrets(vmRef ref.Ref) (list []core.Secret, err error) {
+	virtualMachine := &model.VM{}
+	err = r.Source.Inventory.Find(virtualMachine, vmRef)
+	if err != nil {
+		err = liberr.Wrap(err, "vm", vmRef.String())
+		return
+	}
+	sources := []types.NamespacedName{}
+	for _, cred := range virtualMachine.Object.Spec.Template.Spec.AccessCredentials {
+		switch {
+		case cred.SSHPublicKey != nil:
+			if cred.SSHPublicKey.Source.Secret != nil {
+				key := types.NamespacedName{Namespace: virtualMachine.Namespace, Name: cred.SSHPublicKey.Source.Secret.SecretName}
+				sources = append(sources, key)
+			}
+		case cred.UserPassword != nil:
+			if cred.UserPassword.Source.Secret != nil {
+				key := types.NamespacedName{Namespace: virtualMachine.Namespace, Name: cred.UserPassword.Source.Secret.SecretName}
+				sources = append(sources, key)
 			}
 		}
-
-		configMapVolume := cnv.Volume{
-			Name: configMap.volName,
-			VolumeSource: cnv.VolumeSource{
-				ConfigMap: &cnv.ConfigMapVolumeSource{
-					LocalObjectReference: core.LocalObjectReference{
-						Name: targetConfigMap.Name,
-					},
-				},
-			},
-		}
-
-		targetVmSpec.Template.Spec.Volumes = append(targetVmSpec.Template.Spec.Volumes, configMapVolume)
 	}
-}
-
-func (r *Builder) mapSecretsToTarget(targetVmSpec *cnv.VirtualMachineSpec, secrets map[string]*envMap) {
-	for _, secret := range secrets {
-		// Create secret on destination cluster
-		sourceSecret := secret.envResource.(*core.Secret)
-		targetSecret := &core.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:        sourceSecret.Name,
-				Namespace:   r.Plan.Spec.TargetNamespace,
-				Labels:      sourceSecret.Labels,
-				Annotations: sourceSecret.Annotations,
-			},
-			Data: sourceSecret.Data,
-		}
-		err := r.Destination.Client.Create(context.Background(), targetSecret)
-		if err != nil {
-			if !errors.IsAlreadyExists(err) {
-				r.Log.Error(err, "Failed to create Secret", "namespace", r.Plan.Spec.TargetNamespace, "name", targetSecret.Name)
-				continue
+	for _, vol := range virtualMachine.Object.Spec.Template.Spec.Volumes {
+		switch {
+		case vol.Secret != nil:
+			key := types.NamespacedName{Namespace: virtualMachine.Namespace, Name: vol.Secret.SecretName}
+			sources = append(sources, key)
+		case vol.CloudInitNoCloud != nil:
+			if vol.CloudInitNoCloud.UserDataSecretRef != nil {
+				key := types.NamespacedName{Namespace: virtualMachine.Namespace, Name: vol.CloudInitNoCloud.UserDataSecretRef.Name}
+				sources = append(sources, key)
 			}
+			if vol.CloudInitNoCloud.NetworkDataSecretRef != nil {
+				key := types.NamespacedName{Namespace: virtualMachine.Namespace, Name: vol.CloudInitNoCloud.NetworkDataSecretRef.Name}
+				sources = append(sources, key)
+			}
+		case vol.CloudInitConfigDrive != nil:
+			if vol.CloudInitConfigDrive.UserDataSecretRef != nil {
+				key := types.NamespacedName{Namespace: virtualMachine.Namespace, Name: vol.CloudInitConfigDrive.UserDataSecretRef.Name}
+				sources = append(sources, key)
+			}
+			if vol.CloudInitConfigDrive.NetworkDataSecretRef != nil {
+				key := types.NamespacedName{Namespace: virtualMachine.Namespace, Name: vol.CloudInitConfigDrive.NetworkDataSecretRef.Name}
+				sources = append(sources, key)
+			}
+		case vol.Sysprep != nil:
+			if vol.Sysprep.Secret != nil {
+				key := types.NamespacedName{Namespace: virtualMachine.Namespace, Name: vol.Sysprep.Secret.Name}
+				sources = append(sources, key)
+			}
+		case vol.ContainerDisk != nil:
+			if vol.ContainerDisk.ImagePullSecret != "" {
+				key := types.NamespacedName{Namespace: virtualMachine.Namespace, Name: vol.ContainerDisk.ImagePullSecret}
+				sources = append(sources, key)
+			}
+		default:
+			continue
 		}
-
-		secretVolume := cnv.Volume{
-			Name: secret.volName,
-			VolumeSource: cnv.VolumeSource{
-				Secret: &cnv.SecretVolumeSource{
-					SecretName: targetSecret.Name,
-				},
-			},
-		}
-
-		targetVmSpec.Template.Spec.Volumes = append(targetVmSpec.Template.Spec.Volumes, secretVolume)
 	}
+	for _, key := range sources {
+		source := &core.Secret{}
+		err = r.sourceClient.Get(context.Background(), key, source)
+		if err != nil {
+			err = liberr.Wrap(err)
+			return
+		}
+		target := core.Secret{}
+		target.Name = source.Name
+		target.Namespace = r.Plan.Spec.TargetNamespace
+		target.Data = source.Data
+		target.Immutable = source.Immutable
+		target.SetLabels(source.GetLabels())
+		r.Labeler.SetLabels(&target, r.Labeler.MigrationLabels())
+		target.SetAnnotations(source.GetAnnotations())
+		r.Labeler.SetAnnotation(&target, planbase.AnnSource, key.String())
+		list = append(list, target)
+	}
+	return
 }
 
 func (r *Builder) mapNetworks(sourceVm *cnv.VirtualMachine, targetVmSpec *cnv.VirtualMachineSpec) {
@@ -549,7 +513,56 @@ func (r *Builder) mapNetworks(sourceVm *cnv.VirtualMachine, targetVmSpec *cnv.Vi
 	targetVmSpec.Template.Spec.Domain.Devices.Interfaces = interfaces
 }
 
-func (r *Builder) getSourceVmFromDefinition(vme *export.VirtualMachineExport) (*cnv.VirtualMachine, error) {
+// mapVolumes updates volume references from source PVC names to target (templated) PVC names.
+// It uses the AnnDiskSource annotation on target PVCs to map source PVC identifiers to target PVC names.
+func (r *Builder) mapVolumes(sourceVm *cnv.VirtualMachine, targetVmSpec *cnv.VirtualMachineSpec, persistentVolumeClaims []*v1.PersistentVolumeClaim) {
+	// Build a map from source PVC identifier (namespace/name) to target PVC name
+	// using the AnnDiskSource annotation
+	pvcMap := make(map[string]string) // sourcePVCIdentifier -> targetPVCName
+	for _, pvc := range persistentVolumeClaims {
+		if source, ok := pvc.Annotations[planbase.AnnDiskSource]; ok {
+			pvcMap[source] = pvc.Name
+			r.Log.V(1).Info("Mapped source PVC to target PVC", "source", source, "target", pvc.Name)
+		}
+	}
+
+	// Update volume references in the target VM spec
+	for i, vol := range targetVmSpec.Template.Spec.Volumes {
+		var sourceIdentifier string
+		switch {
+		case vol.PersistentVolumeClaim != nil:
+			sourceIdentifier = fmt.Sprintf("%s/%s", sourceVm.Namespace, vol.PersistentVolumeClaim.ClaimName)
+			if targetPVCName, found := pvcMap[sourceIdentifier]; found {
+				r.Log.Info("Updating PVC volume reference", "source", sourceIdentifier, "target", targetPVCName)
+				targetVmSpec.Template.Spec.Volumes[i].PersistentVolumeClaim.ClaimName = targetPVCName
+			}
+		case vol.DataVolume != nil:
+			sourceIdentifier = fmt.Sprintf("%s/%s", sourceVm.Namespace, vol.DataVolume.Name)
+			if targetPVCName, found := pvcMap[sourceIdentifier]; found {
+				r.Log.Info("Updating DataVolume volume reference", "source", sourceIdentifier, "target", targetPVCName)
+				targetVmSpec.Template.Spec.Volumes[i].DataVolume.Name = targetPVCName
+			}
+		}
+	}
+}
+
+func (r *Builder) getSourceVmFromDefinition(vmRef ref.Ref) (*cnv.VirtualMachine, error) {
+	vme := &export.VirtualMachineExport{}
+	if err := r.sourceClient.Get(context.Background(), client.ObjectKey{Namespace: vmRef.Namespace, Name: vmRef.Name}, vme); err != nil {
+		return nil, liberr.Wrap(err)
+	}
+
+	// For Skipped exports (e.g., ContainerDisk-only VMs), read VM directly from source
+	if vme.Status != nil && vme.Status.Phase == export.Skipped {
+		sourceVm := &cnv.VirtualMachine{}
+		if err := r.sourceClient.Get(context.Background(), client.ObjectKey{Namespace: vmRef.Namespace, Name: vmRef.Name}, sourceVm); err != nil {
+			return nil, liberr.Wrap(err, "failed to get source VM for skipped export")
+		}
+		r.Log.Info("Retrieved VM directly from source for skipped export", "vm", sourceVm.Name)
+		return sourceVm, nil
+	}
+
+	// Fetch VM manifest from export server
 	var vmManifestUrl string
 	for _, manifest := range vme.Status.Links.External.Manifests {
 		if manifest.Type == export.AllManifests {
@@ -659,10 +672,6 @@ func createDataVolumeSpec(size resource.Quantity, storageClassName, url, configM
 	}
 }
 
-func pvcSourceName(namespace, name string) string {
-	return fmt.Sprintf("%s/%s", namespace, name)
-}
-
 func (r *Builder) SupportsVolumePopulators() bool {
 	return false
 }
@@ -696,5 +705,116 @@ func (r *Builder) LunPersistentVolumes(vmRef ref.Ref) (pvs []core.PersistentVolu
 // Build LUN PVCs.
 func (r *Builder) LunPersistentVolumeClaims(vmRef ref.Ref) (pvcs []core.PersistentVolumeClaim, err error) {
 	// do nothing
+	return
+}
+
+// ConversionPodConfig returns provider-specific configuration for the virt-v2v conversion pod.
+// OCP provider does not require any special configuration.
+func (r *Builder) ConversionPodConfig(_ ref.Ref) (*planbase.ConversionPodConfigResult, error) {
+	return &planbase.ConversionPodConfigResult{}, nil
+}
+
+func (r *Builder) NetAppShiftPVCs(vmRef ref.Ref, labels map[string]string) ([]v1.PersistentVolumeClaim, error) {
+	return nil, nil
+}
+
+// getPlanVM returns the plan VM for the given vmRef
+func (r *Builder) getPlanVM(vmRef ref.Ref) *planapi.VM {
+	var fallback *planapi.VM
+	for i := range r.Plan.Spec.VMs {
+		planVM := &r.Plan.Spec.VMs[i]
+		if planVM.ID != "" && planVM.ID == vmRef.ID {
+			return planVM
+		}
+		if fallback == nil && planVM.Name != "" && planVM.Name == vmRef.Name {
+			fallback = planVM
+		}
+	}
+	return fallback
+}
+
+// getPlanVMStatus returns the plan VM status for the given vmRef
+func (r *Builder) getPlanVMStatus(vmRef ref.Ref) *planapi.VMStatus {
+	if r.Plan == nil || r.Plan.Status.Migration.VMs == nil {
+		return nil
+	}
+	var fallback *planapi.VMStatus
+	for _, planVMStatus := range r.Plan.Status.Migration.VMs {
+		if planVMStatus.ID != "" && planVMStatus.ID == vmRef.ID {
+			return planVMStatus
+		}
+		if fallback == nil && planVMStatus.Name != "" && planVMStatus.Name == vmRef.Name {
+			fallback = planVMStatus
+		}
+	}
+	return fallback
+}
+
+// hasCustomPVCNameTemplate returns true when a pvcNameTemplate has been
+// explicitly set at the VM or Plan level (i.e. it is not the built-in default).
+func (r *Builder) hasCustomPVCNameTemplate(vmRef ref.Ref) bool {
+	planVM := r.getPlanVM(vmRef)
+	if planVM != nil && planVM.PVCNameTemplate != "" {
+		return true
+	}
+	return r.Plan.Spec.PVCNameTemplate != ""
+}
+
+// getPVCNameTemplate returns the PVC name template for the given vmRef
+// Returns the VM-level template if set, otherwise the Plan-level template.
+// If neither is set, returns the default template "{{.SourcePVCName}}" which preserves
+// the original PVC name (backward compatible behavior).
+func (r *Builder) getPVCNameTemplate(vmRef ref.Ref) string {
+	// Check VM-level template first
+	planVM := r.getPlanVM(vmRef)
+	if planVM != nil && planVM.PVCNameTemplate != "" {
+		return planVM.PVCNameTemplate
+	}
+
+	// Check Plan-level template
+	if r.Plan.Spec.PVCNameTemplate != "" {
+		return r.Plan.Spec.PVCNameTemplate
+	}
+
+	// Default template that preserves original PVC name
+	return "{{.SourcePVCName}}"
+}
+
+// executeTemplate executes a Go template with the given data
+func (r *Builder) executeTemplate(templateText string, templateData any) (string, error) {
+	return templateutil.ExecuteTemplate(templateText, templateData)
+}
+
+// setPVCNameFromTemplate generates a PVC name using the configured template
+func (r *Builder) setPVCNameFromTemplate(vmRef ref.Ref, sourcePVC *core.PersistentVolumeClaim, diskIndex int) (string, error) {
+	pvcNameTemplate := r.getPVCNameTemplate(vmRef)
+
+	// Get target VM name
+	targetVmName := vmRef.Name
+	planVMStatus := r.getPlanVMStatus(vmRef)
+	if planVMStatus != nil && planVMStatus.NewName != "" {
+		targetVmName = planVMStatus.NewName
+	}
+
+	// Create template data
+	templateData := v1beta1.OCPPVCNameTemplateData{
+		VmName:             vmRef.Name,
+		TargetVmName:       targetVmName,
+		PlanName:           r.Plan.Name,
+		DiskIndex:          diskIndex,
+		SourcePVCName:      sourcePVC.Name,
+		SourcePVCNamespace: sourcePVC.Namespace,
+	}
+
+	generatedName, err := r.executeTemplate(pvcNameTemplate, &templateData)
+	if err != nil {
+		return "", liberr.Wrap(err, "failed to execute PVC name template")
+	}
+
+	return generatedName, nil
+}
+
+// NO-OP
+func (r *Builder) SourceVMLabelsAndAnnotations(vmRef ref.Ref, tagMapping *v1beta1.TagMapping) (labels map[string]string, annotations map[string]string, sanitizationReport map[string]string, err error) {
 	return
 }

@@ -3,6 +3,7 @@ package vsphere
 import (
 	"errors"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -65,6 +66,7 @@ func (h VMHandler) List(ctx *gin.Context) {
 	if err != nil {
 		return
 	}
+	markSharedDisks(list, buildDiskFileCount(list))
 	content := []interface{}{}
 	err = h.filter(ctx, &list)
 	if err != nil {
@@ -77,6 +79,10 @@ func (h VMHandler) List(ctx *gin.Context) {
 				"Skipping template VM",
 				"vmID", m.ID,
 				"isTemplate", m.IsTemplate)
+			continue
+		}
+		if m.UUID == "" && m.InstanceUUID == "" && m.Host == "" {
+			log.Info("Skipping ghost VM", "vmID", m.ID)
 			continue
 		}
 		r := &VM{}
@@ -116,6 +122,20 @@ func (h VMHandler) Get(ctx *gin.Context) {
 		ctx.Status(http.StatusInternalServerError)
 		return
 	}
+	var allVMs []model.VM
+	err = db.List(&allVMs, model.ListOptions{Detail: model.MaxDetail})
+	if err != nil {
+		log.Trace(
+			err,
+			"url",
+			ctx.Request.URL)
+		ctx.Status(http.StatusInternalServerError)
+		return
+	}
+	fileCount := buildDiskFileCount(allVMs)
+	vms := []model.VM{*m}
+	markSharedDisks(vms, fileCount)
+	*m = vms[0]
 	pb := PathBuilder{DB: db}
 	r := &VM{}
 	r.With(m)
@@ -217,40 +237,103 @@ func (r *VM1) Content(detail int) interface{} {
 	return r
 }
 
+func (r *VM1) filterDisksWithBus(disks []model.Disk, bus string) []model.Disk {
+	var resp []model.Disk
+	for _, disk := range disks {
+		if disk.Bus == bus {
+			resp = append(resp, disk)
+		}
+	}
+	return resp
+}
+
+// The disks are first sorted by the buses going in order SCSI, SATA and IDE and within each bus they are
+// sorted by controller (ControllerKey), then unit (UnitNumber), then device key. VMware can assign device keys
+// that are not monotonic with (controller, unit), so sorting by Key alone can interleave disks from different
+// controllers and misalign with libvirt / virt-v2v ordering.
+// https://github.com/libvirt/libvirt/blob/d7b3be8ca35ffcbbece2c65120ab3ac9ec3dff0c/src/vmx/vmx.c#L1730
+func (r *VM1) sortedDisksByBusses(disks []model.Disk, buses []string) []model.Disk {
+	var resp []model.Disk
+	for _, bus := range buses {
+		disksWithBus := r.filterDisksWithBus(disks, bus)
+		sort.Slice(disksWithBus, func(i, j int) bool {
+			a, b := disksWithBus[i], disksWithBus[j]
+			if a.ControllerKey != b.ControllerKey {
+				return a.ControllerKey < b.ControllerKey
+			}
+			if a.UnitNumber != b.UnitNumber {
+				return a.UnitNumber < b.UnitNumber
+			}
+			return a.Key < b.Key
+		})
+		resp = append(resp, disksWithBus...)
+	}
+	return resp
+}
+func (r *VM1) SortedDisksAsLibvirt() []model.Disk {
+	var buses = []string{model.SCSI, model.SATA, model.IDE, model.NVME}
+	return r.sortedDisksByBusses(r.Disks, buses)
+}
+
+func (r *VM1) SortedDisksAsVmware() []model.Disk {
+	var buses = []string{model.SATA, model.IDE, model.SCSI, model.NVME}
+	return r.sortedDisksByBusses(r.Disks, buses)
+}
+
 // VM full detail.
 type VM struct {
 	VM1
-	PolicyVersion            int                  `json:"policyVersion"`
-	UUID                     string               `json:"uuid"`
-	Firmware                 string               `json:"firmware"`
-	ConnectionState          string               `json:"connectionState"`
-	Snapshot                 model.Ref            `json:"snapshot"`
-	ChangeTrackingEnabled    bool                 `json:"changeTrackingEnabled"`
-	CpuAffinity              []int32              `json:"cpuAffinity"`
-	CpuHotAddEnabled         bool                 `json:"cpuHotAddEnabled"`
-	CpuHotRemoveEnabled      bool                 `json:"cpuHotRemoveEnabled"`
-	MemoryHotAddEnabled      bool                 `json:"memoryHotAddEnabled"`
-	FaultToleranceEnabled    bool                 `json:"faultToleranceEnabled"`
-	CpuCount                 int32                `json:"cpuCount"`
-	CoresPerSocket           int32                `json:"coresPerSocket"`
-	MemoryMB                 int32                `json:"memoryMB"`
-	GuestName                string               `json:"guestName"`
-	GuestNameFromVmwareTools string               `json:"guestNameFromVmwareTools"`
-	HostName                 string               `json:"hostName"`
-	GuestID                  string               `json:"guestId"`
-	BalloonedMemory          int32                `json:"balloonedMemory"`
-	IpAddress                string               `json:"ipAddress"`
-	StorageUsed              int64                `json:"storageUsed"`
-	TpmEnabled               bool                 `json:"tpmEnabled"`
-	NumaNodeAffinity         []string             `json:"numaNodeAffinity"`
-	Devices                  []model.Device       `json:"devices"`
-	NICs                     []model.NIC          `json:"nics"`
-	GuestNetworks            []model.GuestNetwork `json:"guestNetworks"`
-	GuestDisks               []model.GuestDisk    `json:"guestDisks"`
-	GuestIpStacks            []model.GuestIpStack `json:"guestIpStacks"`
-	SecureBoot               bool                 `json:"secureBoot"`
-	DiskEnableUuid           bool                 `json:"diskEnableUuid"`
-	NestedHVEnabled          bool                 `json:"nestedHVEnabled"`
+	PolicyVersion            int                    `json:"policyVersion"`
+	UUID                     string                 `json:"uuid"`
+	InstanceUUID             string                 `json:"instanceUuid"`
+	Firmware                 string                 `json:"firmware"`
+	ConnectionState          string                 `json:"connectionState"`
+	Snapshot                 model.Ref              `json:"snapshot"`
+	ChangeTrackingEnabled    bool                   `json:"changeTrackingEnabled"`
+	ConsolidationNeeded      bool                   `json:"consolidationNeeded"`
+	CpuAffinity              []int32                `json:"cpuAffinity"`
+	CpuHotAddEnabled         bool                   `json:"cpuHotAddEnabled"`
+	CpuHotRemoveEnabled      bool                   `json:"cpuHotRemoveEnabled"`
+	MemoryHotAddEnabled      bool                   `json:"memoryHotAddEnabled"`
+	FaultToleranceEnabled    bool                   `json:"faultToleranceEnabled"`
+	CpuCount                 int32                  `json:"cpuCount"`
+	CoresPerSocket           int32                  `json:"coresPerSocket"`
+	MemoryMB                 int32                  `json:"memoryMB"`
+	GuestName                string                 `json:"guestName"`
+	GuestNameFromVmwareTools string                 `json:"guestNameFromVmwareTools"`
+	HostName                 string                 `json:"hostName"`
+	GuestID                  string                 `json:"guestId"`
+	BalloonedMemory          int32                  `json:"balloonedMemory"`
+	IpAddress                string                 `json:"ipAddress"`
+	StorageUsed              int64                  `json:"storageUsed"`
+	TpmEnabled               bool                   `json:"tpmEnabled"`
+	NumaNodeAffinity         []string               `json:"numaNodeAffinity"`
+	Devices                  []model.Device         `json:"devices"`
+	NICs                     []model.NIC            `json:"nics"`
+	GuestNetworks            []model.GuestNetwork   `json:"guestNetworks"`
+	GuestDisks               []model.DiskMountPoint `json:"guestDisks"`
+	GuestIpStacks            []model.GuestIpStack   `json:"guestIpStacks"`
+	SecureBoot               bool                   `json:"secureBoot"`
+	ToolsStatus              string                 `json:"toolsStatus"`
+	ToolsRunningStatus       string                 `json:"toolsRunningStatus"`
+	// Note: vSphere reports version as "toolsVersionStatus2"; we keep the Go field
+	// name ToolsVersionStatus for continuity while serializing as toolsVersionStatus2.
+	ToolsVersionStatus string                   `json:"toolsVersionStatus2"`
+	DiskEnableUuid     bool                     `json:"diskEnableUuid"`
+	NestedHVEnabled    bool                     `json:"nestedHVEnabled"`
+	CustomDef          []model.CustomFieldDef   `json:"customDef"`
+	CustomValues       []model.CustomFieldValue `json:"customValues"`
+	Tags               []model.Tag              `json:"tags"`
+}
+
+func (r *VM) GetConcerns() []model.Concern {
+	return r.Concerns
+}
+
+func (r *VM) IsWindows() bool {
+	gid := strings.ToLower(r.GuestID)
+	gname := strings.ToLower(r.GuestName)
+	return strings.Contains(gid, "win") || strings.Contains(gname, "win")
 }
 
 // Build the resource using the model.
@@ -258,6 +341,7 @@ func (r *VM) With(m *model.VM) {
 	r.VM1.With(m)
 	r.PolicyVersion = m.PolicyVersion
 	r.UUID = m.UUID
+	r.InstanceUUID = m.InstanceUUID
 	r.Firmware = m.Firmware
 	r.ConnectionState = m.ConnectionState
 	r.Snapshot = m.Snapshot
@@ -285,8 +369,15 @@ func (r *VM) With(m *model.VM) {
 	r.GuestDisks = m.GuestDisks
 	r.GuestIpStacks = m.GuestIpStacks
 	r.SecureBoot = m.SecureBoot
+	r.ToolsStatus = m.ToolsStatus
+	r.ToolsRunningStatus = m.ToolsRunningStatus
+	r.ToolsVersionStatus = m.ToolsVersionStatus
 	r.DiskEnableUuid = m.DiskEnableUuid
 	r.NestedHVEnabled = m.NestedHVEnabled
+	r.CustomDef = m.CustomDef
+	r.CustomValues = m.CustomValues
+	r.Tags = m.Tags
+	r.ConsolidationNeeded = m.ConsolidationNeeded
 }
 
 // Build self link (URI).
@@ -344,4 +435,29 @@ func (r *VM) RemoveDisk(removeDisk model.Disk) {
 		}
 	}
 	r.Disks = disks
+}
+
+// buildDiskFileCount builds a map from disk file path to the number of
+// VMs that reference that file. Used to detect disks shared by multiple
+// VMs even when vSphere does not report multi-writer sharing.
+func buildDiskFileCount(vms []model.VM) map[string]int {
+	m := map[string]int{}
+	for i := range vms {
+		for _, disk := range vms[i].Disks {
+			m[disk.File]++
+		}
+	}
+	return m
+}
+
+// markSharedDisks sets Shared=true on disks whose backing file is used
+// by more than one VM according to the provided file count map.
+func markSharedDisks(vms []model.VM, fileCount map[string]int) {
+	for i := range vms {
+		for j := range vms[i].Disks {
+			if fileCount[vms[i].Disks[j].File] > 1 {
+				vms[i].Disks[j].Shared = true
+			}
+		}
+	}
 }

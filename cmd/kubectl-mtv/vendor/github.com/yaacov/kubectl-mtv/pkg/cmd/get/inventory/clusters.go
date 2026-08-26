@@ -1,0 +1,108 @@
+package inventory
+
+import (
+	"context"
+	"fmt"
+
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+
+	"github.com/yaacov/kubectl-mtv/pkg/util/output"
+	querypkg "github.com/yaacov/kubectl-mtv/pkg/util/query"
+	"github.com/yaacov/kubectl-mtv/pkg/util/watch"
+)
+
+// ListClustersWithInsecure queries the provider's cluster inventory with optional insecure TLS skip verification
+func ListClustersWithInsecure(ctx context.Context, kubeConfigFlags *genericclioptions.ConfigFlags, providerName, namespace string, inventoryURL string, outputFormat string, query string, watchMode bool, insecureSkipTLS bool) error {
+	sq := watch.NewSafeQuery(query)
+
+	return watch.WrapWithWatchAndQuery(watchMode, outputFormat, func() error {
+		return listClustersOnce(ctx, kubeConfigFlags, providerName, namespace, inventoryURL, outputFormat, sq.Get(), insecureSkipTLS)
+	}, watch.DefaultInterval, sq.Set, query)
+}
+
+func listClustersOnce(ctx context.Context, kubeConfigFlags *genericclioptions.ConfigFlags, providerName, namespace string, inventoryURL string, outputFormat string, query string, insecureSkipTLS bool) error {
+	// Get the provider object
+	provider, err := GetProviderByName(ctx, kubeConfigFlags, providerName, namespace)
+	if err != nil {
+		return err
+	}
+
+	// Create a new provider client
+	providerClient := NewProviderClientWithInsecure(kubeConfigFlags, provider, inventoryURL, insecureSkipTLS)
+
+	// Get provider type to verify cluster support
+	providerType, err := providerClient.GetProviderType()
+	if err != nil {
+		return fmt.Errorf("failed to get provider type: %v", err)
+	}
+
+	// Define default headers based on provider type
+	var defaultHeaders []output.Column
+	switch providerType {
+	case "ovirt":
+		defaultHeaders = []output.Column{
+			{Title: "NAME", Key: "name"},
+			{Title: "ID", Key: "id"},
+			{Title: "DATACENTER", Key: "dataCenter.name"},
+			{Title: "HA-RESERVATION", Key: "haReservation"},
+			{Title: "KSM-ENABLED", Key: "ksmEnabled"},
+		}
+	case "vsphere":
+		defaultHeaders = []output.Column{
+			{Title: "NAME", Key: "name"},
+			{Title: "ID", Key: "id"},
+			{Title: "DATACENTER", Key: "dataCenter.name"},
+			{Title: "DRS", Key: "drsEnabled"},
+			{Title: "HA", Key: "haEnabled"},
+		}
+	default:
+		defaultHeaders = []output.Column{
+			{Title: "NAME", Key: "name"},
+			{Title: "ID", Key: "id"},
+			{Title: "DATACENTER", Key: "dataCenter.name"},
+		}
+	}
+
+	// Fetch clusters inventory from the provider based on provider type
+	var data interface{}
+	switch providerType {
+	case "ovirt", "vsphere":
+		data, err = providerClient.GetClusters(ctx, 4)
+	default:
+		return fmt.Errorf("provider type '%s' does not support cluster inventory", providerType)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to get clusters from provider: %v", err)
+	}
+
+	// Parse query options for advanced query features
+	var queryOpts *querypkg.QueryOptions
+	if query != "" {
+		queryOpts, err = querypkg.ParseQueryString(query)
+		if err != nil {
+			return fmt.Errorf("failed to parse query: %v", err)
+		}
+
+		// Apply query filter
+		data, err = querypkg.ApplyQueryInterface(data, query)
+		if err != nil {
+			return fmt.Errorf("failed to apply query: %v", err)
+		}
+	}
+
+	// Format and display the results
+	emptyMessage := fmt.Sprintf("No clusters found for provider %s", providerName)
+	switch outputFormat {
+	case "json":
+		return output.PrintJSONWithEmpty(data, emptyMessage)
+	case "yaml":
+		return output.PrintYAMLWithEmpty(data, emptyMessage)
+	case "markdown":
+		return output.PrintMarkdownWithQuery(data, defaultHeaders, queryOpts, emptyMessage)
+	case "table":
+		return output.PrintTableWithQuery(data, defaultHeaders, queryOpts, emptyMessage)
+	default:
+		return fmt.Errorf("unsupported output format: %s", outputFormat)
+	}
+}

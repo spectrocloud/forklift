@@ -29,9 +29,11 @@ import (
 	"github.com/kubev2v/forklift/pkg/lib/logging"
 	"github.com/kubev2v/forklift/pkg/settings"
 	"github.com/kubev2v/forklift/pkg/webhook"
+	route "github.com/openshift/api/route/v1"
 	template "github.com/openshift/api/template/v1"
 	"github.com/pkg/profile"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	storagev1 "k8s.io/api/storage/v1"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	cnv "kubevirt.io/api/core/v1"
 	export "kubevirt.io/api/export/v1alpha1"
@@ -42,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	multicluster "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
 )
 
 // Application settings.
@@ -111,6 +114,10 @@ func main() {
 		log.Error(err, "unable to add K8s APIs to scheme")
 		os.Exit(1)
 	}
+	if err := storagev1.AddToScheme(mgr.GetScheme()); err != nil {
+		log.Error(err, "unable to add storage APIs to scheme")
+		os.Exit(1)
+	}
 	if err := net.AddToScheme(mgr.GetScheme()); err != nil {
 		log.Error(err, "unable to add CNI APIs to scheme")
 		os.Exit(1)
@@ -132,6 +139,15 @@ func main() {
 	}
 	if err := instancetype.AddToScheme(mgr.GetScheme()); err != nil {
 		log.Error(err, "proceeding without optional kubevirt instance type APIs")
+	}
+	if err := multicluster.AddToScheme(mgr.GetScheme()); err != nil {
+		log.Error(err, "proceeding without optional multicluster APIs.")
+	}
+	if Settings.OpenShift {
+		if err := route.Install(mgr.GetScheme()); err != nil {
+			log.Error(err, "unable to add route APIs to scheme")
+			os.Exit(1)
+		}
 	}
 	// Setup all Controllers
 	log.Info("Setting up controller")
