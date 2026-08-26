@@ -230,7 +230,49 @@ func (b *Builder) BuildVirtV2vConversionPod(pod *core.Pod, environment []core.En
 	pod.Labels[convctx.LabelApp] = "virt-v2v"
 	pod.Spec.Containers[0].Name = "virt-v2v"
 	pod.Spec.Containers[0].Env = environment
+	applySpectroConversionPodRelaxations(pod)
 	return nil
+}
+
+// applySpectroConversionPodRelaxations loosens the conversion pod's confinement
+// so libguestfs can run outside OpenShift, where there is no SCC granting the
+// equivalent access. On OpenShift the upstream settings are left untouched.
+//
+// libguestfs needs to create user namespaces and remount the guest root; with
+// RuntimeDefault seccomp and an AppArmor profile applied it fails to start the
+// appliance. LIBGUESTFS_BACKEND=direct avoids libvirt, but some operations
+// still require CAP_SYS_ADMIN.
+func applySpectroConversionPodRelaxations(pod *core.Pod) {
+	container := &pod.Spec.Containers[0]
+
+	container.Env = append(container.Env, core.EnvVar{
+		Name:  "LIBGUESTFS_BACKEND",
+		Value: "direct",
+	})
+
+	if settings.Settings.OpenShift {
+		return
+	}
+
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations["container.apparmor.security.beta.kubernetes.io/"+container.Name] = "unconfined"
+
+	if pod.Spec.SecurityContext != nil {
+		pod.Spec.SecurityContext.SeccompProfile = &core.SeccompProfile{
+			Type: core.SeccompProfileTypeUnconfined,
+		}
+	}
+
+	if container.SecurityContext == nil {
+		container.SecurityContext = &core.SecurityContext{}
+	}
+	if container.SecurityContext.Capabilities == nil {
+		container.SecurityContext.Capabilities = &core.Capabilities{}
+	}
+	container.SecurityContext.Capabilities.Add = append(
+		container.SecurityContext.Capabilities.Add, core.Capability("SYS_ADMIN"))
 }
 
 // BuildVirtV2vInspectionPod applies inspection-specific settings to a pod.
