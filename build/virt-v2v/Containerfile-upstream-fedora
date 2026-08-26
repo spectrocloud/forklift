@@ -13,7 +13,7 @@ RUN go build -buildvcs=false -ldflags="-w -s" -o virt-v2v-wrapper ./cmd/virt-v2v
 RUN go build -buildvcs=false -ldflags="-w -s" -o forklift-wait-for-reboot github.com/kubev2v/forklift/cmd/forklift-wait-for-reboot
 
 # Main container
-FROM quay.io/fedora/fedora:41
+FROM quay.io/fedora/fedora:43
 RUN rm /etc/pki/tls/fips_local.cnf && \
     echo -e '[fips_sect]\ntls1-prf-ems-check = 0\nactivate = 1' > /etc/pki/tls/fips_local.cnf && \
     sed -i '/^\\[ crypto_policy \\]/a Options=RHNoEnforceEMSinFIPS' /etc/pki/tls/openssl.cnf
@@ -26,7 +26,7 @@ RUN mkdir /disks && \
         virt-v2v && \
     dnf clean all
 
-RUN dnf install -y https://kojihub.stream.centos.org/kojifiles/packages/virtio-win/1.9.40/1.el9/noarch/virtio-win-1.9.40-1.el9.noarch.rpm
+RUN dnf install -y https://kojihub.stream.centos.org/kojifiles/packages/virtio-win/1.9.45/1.el10/noarch/virtio-win-1.9.45-1.el10.noarch.rpm
 
 
 # Missing `libguestfs-winsupport` in the Fedora packages, this is not needed for Fedora as the v2v uses ntfs-3g
