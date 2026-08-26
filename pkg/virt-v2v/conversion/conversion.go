@@ -144,6 +144,11 @@ func (c *Conversion) RunVirtV2VInspection() error {
 }
 
 func (c *Conversion) RunVirtV2vInPlace() error {
+	// Spectro: clear any leftover/partial disk data before converting in place.
+	if err := c.prepareDiskFilesForInPlace(); err != nil {
+		return fmt.Errorf("failed to prepare disk files for in-place conversion: %w", err)
+	}
+
 	v2vCmdBuilder := c.CommandBuilder.New("virt-v2v-in-place").
 		AddFlag("-v").
 		AddFlag("-x").
