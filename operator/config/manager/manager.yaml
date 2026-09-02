@@ -8,7 +8,7 @@ metadata:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: forklift-operator-ansible
+  name: forklift-operator
   namespace: system
   labels:
     control-plane: controller-manager
@@ -40,16 +40,24 @@ spec:
           value: explicit
         - name: CONTROLLER_IMAGE
           value: ${CONTROLLER_IMAGE}
+        - name: DEEP_INSPECTION_IMAGE
+          value: ${DEEP_INSPECTION_IMAGE}
+        - name: DEEP_INSPECTION_IMAGE_XFS
+          value: ${DEEP_INSPECTION_IMAGE_RHEL9}
         - name: API_IMAGE
           value: ${API_IMAGE}
         - name: MUST_GATHER_IMAGE
           value: ${MUST_GATHER_IMAGE}
         - name: UI_PLUGIN_IMAGE
           value: ${UI_PLUGIN_IMAGE}
+        - name: CLI_DOWNLOAD_IMAGE
+          value: ${CLI_DOWNLOAD_IMAGE}
         - name: VALIDATION_IMAGE
           value: ${VALIDATION_IMAGE}
         - name: VIRT_V2V_IMAGE
           value: ${VIRT_V2V_IMAGE}
+        - name: VIRT_V2V_IMAGE_XFS
+          value: ${VIRT_V2V_IMAGE_RHEL9}
         - name: VIRT_V2V_DONT_REQUEST_KVM
           value: ${VIRT_V2V_DONT_REQUEST_KVM}
         - name: SNAPSHOT_REMOVAL_TIMEOUT
@@ -72,14 +80,18 @@ spec:
           value: ${OPENSTACK_POPULATOR_IMAGE}
         - name: OVA_PROVIDER_SERVER_IMAGE
           value: ${OVA_PROVIDER_SERVER_IMAGE}
+        - name: HYPERV_PROVIDER_SERVER_IMAGE
+          value: ${HYPERV_PROVIDER_SERVER_IMAGE}
+        - name: OVA_PROXY_IMAGE
+          value: ${OVA_PROXY_IMAGE}
         - name: OVIRT_OS_MAP
           value: ${OVIRT_OS_MAP}
         - name: VSPHERE_OS_MAP
           value: ${VSPHERE_OS_MAP}
         - name: VIRT_CUSTOMIZE_MAP
           value: ${VIRT_CUSTOMIZE_MAP}
-        - name: VSPHERE_XCOPY_VOLUME_POPULATOR_IMAGE
-          value: ${VSPHERE_XCOPY_VOLUME_POPULATOR_IMAGE}
+        - name: VSPHERE_COPY_OFFLOAD_POPULATOR_IMAGE
+          value: ${VSPHERE_COPY_OFFLOAD_POPULATOR_IMAGE}
         livenessProbe:
           httpGet:
             path: /healthz

@@ -3,15 +3,21 @@ package plan
 import (
 	"strconv"
 
+	k8snet "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
+	apisplan "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/provider"
+	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
 	"github.com/kubev2v/forklift/pkg/controller/base"
-	"github.com/kubev2v/forklift/pkg/lib/condition"
+	vspheremodel "github.com/kubev2v/forklift/pkg/controller/provider/model/vsphere"
+	"github.com/kubev2v/forklift/pkg/controller/provider/web/vsphere"
+	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
 	ginkgo "github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	core "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/version"
@@ -47,6 +53,7 @@ var _ = ginkgo.Describe("Plan Validations", func() {
 	ginkgo.BeforeEach(func() {
 		reconciler = &Reconciler{
 			base.Reconciler{},
+			nil,
 		}
 		fakeClientSet = fake.NewSimpleClientset()
 	})
@@ -81,8 +88,8 @@ var _ = ginkgo.Describe("Plan Validations", func() {
 			source := createProvider(sourceName, sourceNamespace, "https://source", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
 			destination := createProvider(destName, destNamespace, "", api.OpenShift, &core.ObjectReference{})
 			plan := createPlan(testPlanName, testNamespace, source, destination)
-			source.Status.Conditions.SetCondition(condition.Condition{Type: condition.Ready, Status: condition.True})
-			destination.Status.Conditions.SetCondition(condition.Condition{Type: condition.Ready, Status: condition.True})
+			source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+			destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
 
 			reconciler = createFakeReconciler(secret, plan, source, destination)
 			err := reconciler.ensureSecretForProvider(plan)
@@ -97,8 +104,8 @@ var _ = ginkgo.Describe("Plan Validations", func() {
 			source := createProvider(sourceName, sourceNamespace, "", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
 			destination := createProvider(destName, destNamespace, "https://destination", api.OpenShift, &core.ObjectReference{})
 			plan := createPlan(testPlanName, testNamespace, source, destination)
-			source.Status.Conditions.SetCondition(condition.Condition{Type: condition.Ready, Status: condition.True})
-			destination.Status.Conditions.SetCondition(condition.Condition{Type: condition.Ready, Status: condition.True})
+			source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+			destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
 
 			reconciler = createFakeReconciler(secret, plan, source, destination)
 			err := reconciler.ensureSecretForProvider(plan)
@@ -109,95 +116,780 @@ var _ = ginkgo.Describe("Plan Validations", func() {
 		})
 	})
 
-	ginkgo.Describe("validatePVCNameTemplate", func() {
-		var reconciler *Reconciler
+	ginkgo.Describe("GuestToolsIssue aggregation", func() {
+		var (
+			mockValidator   *mockGuestToolsValidator
+			guestToolsIssue libcnd.Condition
+		)
 
 		ginkgo.BeforeEach(func() {
-			reconciler = &Reconciler{
-				Reconciler: base.Reconciler{
-					Log: planValidationLog,
-				},
+			mockValidator = &mockGuestToolsValidator{
+				responses: make(map[string]guestToolsResponse),
+			}
+			guestToolsIssue = libcnd.Condition{
+				Type:     GuestToolsIssue,
+				Status:   libcnd.True,
+				Reason:   NotValid,
+				Category: api.CategoryCritical,
+				Message:  "",
+				Items:    []string{},
 			}
 		})
 
-		source := createProvider(sourceName, sourceNamespace, "", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
-		destination := createProvider(destName, destNamespace, "https://destination", api.OpenShift, &core.ObjectReference{})
+		ginkgo.It("should append multiple failing VMs to Items", func() {
+			// Setup multiple VMs with guest tools issues
+			mockValidator.responses["vm1"] = guestToolsResponse{ok: false, msg: "VM1 tools not installed"}
+			mockValidator.responses["vm2"] = guestToolsResponse{ok: false, msg: "VM2 tools not running"}
+			mockValidator.responses["vm3"] = guestToolsResponse{ok: true, msg: ""}
 
-		ginkgo.DescribeTable("should validate a plan correctly",
-			func(template string, shouldBeValid bool) {
-				plan := createPlan(testPlanName, testNamespace, source, destination)
-				plan.Spec.PVCNameTemplate = template
+			refs := []ref.Ref{
+				{Name: "vm1", Namespace: "test"},
+				{Name: "vm2", Namespace: "test"},
+				{Name: "vm3", Namespace: "test"},
+			}
 
-				err := reconciler.validatePVCNameTemplate(plan)
-				if err != nil {
-					gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			// Simulate the validation loop
+			for _, vmRef := range refs {
+				ok, err := mockValidator.GuestToolsInstalled(vmRef)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				if !ok {
+					guestToolsIssue.Items = append(guestToolsIssue.Items, vmRef.String())
 				}
+			}
 
-				hasInvalidCondition := false
-				for _, cond := range plan.Status.Conditions.List {
-					if cond.Type == NotValid {
-						hasInvalidCondition = true
-						break
-					}
-				}
+			// Verify that both failing VMs are in Items
+			gomega.Expect(guestToolsIssue.Items).To(gomega.HaveLen(2))
+			gomega.Expect(guestToolsIssue.Items).To(gomega.ContainElement(" id: name:'vm1' "))
+			gomega.Expect(guestToolsIssue.Items).To(gomega.ContainElement(" id: name:'vm2' "))
+			gomega.Expect(guestToolsIssue.Items).NotTo(gomega.ContainElement(" id: name:'vm3' "))
 
-				if shouldBeValid {
-					gomega.Expect(hasInvalidCondition).To(gomega.BeFalse())
-				} else {
-					gomega.Expect(hasInvalidCondition).To(gomega.BeTrue())
+			// Generic message is now used from condition level
+			gomega.Expect(guestToolsIssue.Message).To(gomega.Equal(""))
+		})
+
+		ginkgo.It("should add failing VM to Items with generic guidance", func() {
+			// Setup VM with specific tools issue
+			mockValidator.responses["encrypted-vm"] = guestToolsResponse{
+				ok:  false,
+				msg: "Unable to determine VMware Tools status for this powered-on VM. This commonly occurs when an encrypted VM is locked and VMware Tools cannot start. Power off the VM manually (or unlock the disks) before migration.",
+			}
+
+			vmRef := ref.Ref{Name: "encrypted-vm", Namespace: "test"}
+			ok, err := mockValidator.GuestToolsInstalled(vmRef)
+
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(ok).To(gomega.BeFalse())
+
+			guestToolsIssue.Items = append(guestToolsIssue.Items, vmRef.String())
+
+			// Verify VM is added to Items (message is now generic at condition level)
+			gomega.Expect(guestToolsIssue.Items).To(gomega.ContainElement(" id: name:'encrypted-vm' "))
+		})
+
+		ginkgo.It("should add failing VMs to Items regardless of provider type", func() {
+			// Setup VM that returns empty message (e.g., from non-VSphere providers)
+			mockValidator.responses["vm-empty-msg"] = guestToolsResponse{ok: false, msg: ""}
+
+			vmRef := ref.Ref{Name: "vm-empty-msg", Namespace: "test"}
+			ok, err := mockValidator.GuestToolsInstalled(vmRef)
+
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(ok).To(gomega.BeFalse())
+
+			guestToolsIssue.Items = append(guestToolsIssue.Items, vmRef.String())
+
+			// Verify VM is added to Items (providers no longer return messages)
+			gomega.Expect(guestToolsIssue.Items).To(gomega.ContainElement(" id: name:'vm-empty-msg' "))
+		})
+
+		ginkgo.It("should add all failing VMs to Items with generic message", func() {
+			// Setup multiple VMs where first one has detailed message
+			mockValidator.responses["first-vm"] = guestToolsResponse{
+				ok:  false,
+				msg: "First VM detailed error message",
+			}
+			mockValidator.responses["second-vm"] = guestToolsResponse{
+				ok:  false,
+				msg: "Second VM error message",
+			}
+
+			refs := []ref.Ref{
+				{Name: "first-vm", Namespace: "test"},
+				{Name: "second-vm", Namespace: "test"},
+			}
+
+			// Simulate the validation loop
+			for _, vmRef := range refs {
+				ok, err := mockValidator.GuestToolsInstalled(vmRef)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				if !ok {
+					guestToolsIssue.Items = append(guestToolsIssue.Items, vmRef.String())
 				}
-			},
-			ginkgo.Entry("empty template is valid", "", true),
-			ginkgo.Entry("simple valid template", "{{.VmName}}-disk-{{.DiskIndex}}", true),
-			ginkgo.Entry("complex valid template", "{{.PlanName}}-{{.VmName}}-disk-{{.DiskIndex}}", true),
-			ginkgo.Entry("valid template with root disk index", "{{if eq .DiskIndex .RootDiskIndex}}root{{else}}data{{end}}-{{.DiskIndex}}", true),
-			ginkgo.Entry("template with invalid k8s label chars", "disk@{{.DiskIndex}}", false),
-			ginkgo.Entry("template with undefined variable", "{{.UndefinedVar}}", false),
-			ginkgo.Entry("template resulting in empty string", "{{if false}}disk{{end}}", false),
-			ginkgo.Entry("template with special characters", "disk!{{.DiskIndex}}", false),
-			ginkgo.Entry("template with spaces", "disk {{.DiskIndex}}", false),
-			ginkgo.Entry("template with invalid start character", "_{{.VmName}}", false),
-			ginkgo.Entry("template exceeding length limit", "very-very-very-very-very-very-very-very-very-very-long-prefix-{{.VmName}}", false),
-			ginkgo.Entry("template with slash character", "{{.VmName}}/{{.DiskIndex}}", false),
-		)
+			}
+
+			// Verify both VMs are added to Items (messages are now generic at condition level)
+			gomega.Expect(guestToolsIssue.Items).To(gomega.HaveLen(2))
+		})
 	})
 
-	ginkgo.Describe("IsValidPVCNameTemplate", func() {
-		var reconciler *Reconciler
-
-		ginkgo.BeforeEach(func() {
-			reconciler = &Reconciler{
-				Reconciler: base.Reconciler{
-					Log: planValidationLog,
+	ginkgo.Describe("validateTransferNetwork", func() {
+		ginkgo.It("should pass validation when route annotation has valid IP", func() {
+			nad := &k8snet.NetworkAttachmentDefinition{
+				ObjectMeta: meta.ObjectMeta{
+					Name:      "test-nad",
+					Namespace: "test-ns",
+					Annotations: map[string]string{
+						AnnForkliftNetworkRoute: "192.168.1.1",
+					},
 				},
+			}
+
+			reconciler := createFakeReconciler(nad)
+			plan := &api.Plan{
+				Spec: api.PlanSpec{
+					TargetNamespace: "test-ns",
+					TransferNetwork: &core.ObjectReference{
+						Namespace: "test-ns",
+						Name:      "test-nad",
+					},
+				},
+			}
+
+			err := reconciler.validateTransferNetwork(plan)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(TransferNetNotValid)).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("should pass validation when route annotation is 'none'", func() {
+			nad := &k8snet.NetworkAttachmentDefinition{
+				ObjectMeta: meta.ObjectMeta{
+					Name:      "test-nad",
+					Namespace: "test-ns",
+					Annotations: map[string]string{
+						AnnForkliftNetworkRoute: AnnForkliftRouteValueNone,
+					},
+				},
+			}
+
+			reconciler := createFakeReconciler(nad)
+			plan := &api.Plan{
+				Spec: api.PlanSpec{
+					TargetNamespace: "test-ns",
+					TransferNetwork: &core.ObjectReference{
+						Namespace: "test-ns",
+						Name:      "test-nad",
+					},
+				},
+			}
+
+			err := reconciler.validateTransferNetwork(plan)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(TransferNetNotValid)).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("should set warning when route annotation is missing", func() {
+			nad := &k8snet.NetworkAttachmentDefinition{
+				ObjectMeta: meta.ObjectMeta{
+					Name:      "test-nad",
+					Namespace: "test-ns",
+				},
+			}
+
+			reconciler := createFakeReconciler(nad)
+			plan := &api.Plan{
+				Spec: api.PlanSpec{
+					TargetNamespace: "test-ns",
+					TransferNetwork: &core.ObjectReference{
+						Namespace: "test-ns",
+						Name:      "test-nad",
+					},
+				},
+			}
+
+			err := reconciler.validateTransferNetwork(plan)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(TransferNetMissingDefaultRoute)).To(gomega.BeTrue())
+		})
+
+		ginkgo.It("should set error when route annotation has invalid IP", func() {
+			nad := &k8snet.NetworkAttachmentDefinition{
+				ObjectMeta: meta.ObjectMeta{
+					Name:      "test-nad",
+					Namespace: "test-ns",
+					Annotations: map[string]string{
+						AnnForkliftNetworkRoute: "invalid-ip-address",
+					},
+				},
+			}
+
+			reconciler := createFakeReconciler(nad)
+			plan := &api.Plan{
+				Spec: api.PlanSpec{
+					TargetNamespace: "test-ns",
+					TransferNetwork: &core.ObjectReference{
+						Namespace: "test-ns",
+						Name:      "test-nad",
+					},
+				},
+			}
+
+			err := reconciler.validateTransferNetwork(plan)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(TransferNetNotValid)).To(gomega.BeTrue())
+			gomega.Expect(plan.Status.FindCondition(TransferNetNotValid).Reason).To(gomega.Equal(NotValid))
+		})
+
+		ginkgo.It("should set error when transfer network is in different namespace than target", func() {
+			nad := &k8snet.NetworkAttachmentDefinition{
+				ObjectMeta: meta.ObjectMeta{
+					Name:      "test-nad",
+					Namespace: "openshift-mtv",
+					Annotations: map[string]string{
+						AnnForkliftNetworkRoute: "192.168.1.1",
+					},
+				},
+			}
+
+			reconciler := createFakeReconciler(nad)
+			plan := &api.Plan{
+				Spec: api.PlanSpec{
+					TargetNamespace: "mtv-test",
+					TransferNetwork: &core.ObjectReference{
+						Namespace: "openshift-mtv",
+						Name:      "test-nad",
+					},
+				},
+			}
+
+			err := reconciler.validateTransferNetwork(plan)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(TransferNetNotValid)).To(gomega.BeTrue())
+			gomega.Expect(plan.Status.FindCondition(TransferNetNotValid).Reason).To(gomega.Equal(NotValid))
+			gomega.Expect(plan.Status.FindCondition(TransferNetNotValid).Message).To(
+				gomega.ContainSubstring("different namespace"))
+		})
+
+		ginkgo.It("should set error when NAD does not exist", func() {
+			reconciler := createFakeReconciler()
+			plan := &api.Plan{
+				Spec: api.PlanSpec{
+					TransferNetwork: &core.ObjectReference{
+						Namespace: "test-ns",
+						Name:      "non-existent-nad",
+					},
+				},
+			}
+
+			err := reconciler.validateTransferNetwork(plan)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(TransferNetNotValid)).To(gomega.BeTrue())
+			gomega.Expect(plan.Status.FindCondition(TransferNetNotValid).Reason).To(gomega.Equal(NotFound))
+		})
+	})
+
+	ginkgo.Describe("validateNetworkMap destination NAD", func() {
+		nadName := "test-nad"
+		targetNS := "target-ns"
+		wrongNS := "wrong-ns"
+
+		newNetMap := func(pairs ...api.NetworkPair) *api.NetworkMap {
+			nm := &api.NetworkMap{
+				ObjectMeta: meta.ObjectMeta{Name: "test-netmap", Namespace: testNamespace},
+				Spec:       api.NetworkMapSpec{Map: pairs},
+			}
+			nm.Status.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+			return nm
+		}
+		newPlan := func(ns string) *api.Plan {
+			p := &api.Plan{
+				ObjectMeta: meta.ObjectMeta{Name: "test-plan", Namespace: testNamespace},
+				Spec: api.PlanSpec{
+					TargetNamespace: ns,
+				},
+				Referenced: api.Referenced{
+					Provider: struct {
+						Source      *api.Provider
+						Destination *api.Provider
+					}{Source: &api.Provider{}},
+				},
+			}
+			p.Spec.Map.Network = core.ObjectReference{Name: "test-netmap", Namespace: testNamespace}
+			return p
+		}
+
+		ginkgo.It("should block when destination NAD is in wrong namespace", func() {
+			nm := newNetMap(api.NetworkPair{
+				Destination: api.DestinationNetwork{Type: "multus", Namespace: wrongNS, Name: nadName},
+			})
+			plan := newPlan(targetNS)
+			r := createFakeReconciler(nm)
+			err := r.validateNetworkMap(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NetMapDestinationNADNotValid)).To(gomega.BeTrue())
+			gomega.Expect(plan.Status.FindCondition(NetMapDestinationNADNotValid).Message).To(
+				gomega.ContainSubstring("must be in either the target namespace"))
+		})
+
+		ginkgo.It("should pass when destination NAD is in target namespace", func() {
+			nm := newNetMap(api.NetworkPair{
+				Destination: api.DestinationNetwork{Type: "multus", Namespace: targetNS, Name: nadName},
+			})
+			plan := newPlan(targetNS)
+			r := createFakeReconciler(nm)
+			err := r.validateNetworkMap(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NetMapDestinationNADNotValid)).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("should pass when destination NAD is in default namespace", func() {
+			nm := newNetMap(api.NetworkPair{
+				Destination: api.DestinationNetwork{Type: "multus", Namespace: "default", Name: nadName},
+			})
+			plan := newPlan(targetNS)
+			r := createFakeReconciler(nm)
+			err := r.validateNetworkMap(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NetMapDestinationNADNotValid)).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("should skip non-Multus destinations", func() {
+			nm := newNetMap(api.NetworkPair{
+				Destination: api.DestinationNetwork{Type: "pod"},
+			})
+			plan := newPlan(targetNS)
+			r := createFakeReconciler(nm)
+			err := r.validateNetworkMap(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NetMapDestinationNADNotValid)).To(gomega.BeFalse())
+		})
+	})
+
+	ginkgo.Describe("validateHooks hook ServiceAccount", func() {
+		const planNS = "openshift-mtv"
+		const hookName = "test-hook"
+
+		newHook := func(sa string, aapCfg *api.AAPConfig) *api.Hook {
+			spec := api.HookSpec{ServiceAccount: sa}
+			if aapCfg != nil {
+				spec.AAP = aapCfg
+			} else {
+				spec.Image = "quay.io/kubev2v/hook-runner:latest"
+			}
+			h := &api.Hook{
+				ObjectMeta: meta.ObjectMeta{Name: hookName, Namespace: planNS},
+				Spec:       spec,
+			}
+			h.Status.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+			return h
+		}
+
+		newPlanWithHook := func() *api.Plan {
+			return &api.Plan{
+				ObjectMeta: meta.ObjectMeta{Name: "test-plan", Namespace: planNS},
+				Spec: api.PlanSpec{
+					VMs: []apisplan.VM{{
+						Ref: ref.Ref{ID: "vm-1", Name: "test-vm"},
+						Hooks: []apisplan.HookRef{{
+							Step: api.PhasePreHook,
+							Hook: core.ObjectReference{Name: hookName, Namespace: planNS},
+						}},
+					}},
+				},
+			}
+		}
+
+		ginkgo.It("should not set condition when hook SA exists in plan namespace", func() {
+			sa := &core.ServiceAccount{ObjectMeta: meta.ObjectMeta{Name: "my-sa", Namespace: planNS}}
+			hook := newHook("my-sa", nil)
+			plan := newPlanWithHook()
+			r := createFakeReconciler(hook, sa)
+
+			err := r.validateHooks(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(HookServiceAccountNotValid)).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("should set condition when hook SA does not exist", func() {
+			hook := newHook("nonexistent-sa", nil)
+			plan := newPlanWithHook()
+			r := createFakeReconciler(hook)
+
+			err := r.validateHooks(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(HookServiceAccountNotValid)).To(gomega.BeTrue())
+			cnd := plan.Status.FindCondition(HookServiceAccountNotValid)
+			gomega.Expect(cnd.Items).To(gomega.HaveLen(1))
+			gomega.Expect(cnd.Items[0]).To(gomega.ContainSubstring("nonexistent-sa"))
+		})
+
+		ginkgo.It("should skip SA validation for AAP hooks", func() {
+			savedURL := Settings.Migration.AAPURL
+			savedTok := Settings.Migration.AAPTokenSecretName
+			defer func() {
+				Settings.Migration.AAPURL = savedURL
+				Settings.Migration.AAPTokenSecretName = savedTok
+			}()
+			Settings.Migration.AAPURL = "https://aap.example.com"
+			Settings.Migration.AAPTokenSecretName = "aap-token"
+
+			aapCfg := &api.AAPConfig{
+				JobTemplateID: 42,
+			}
+			hook := newHook("nonexistent-sa", aapCfg)
+			plan := newPlanWithHook()
+			r := createFakeReconciler(hook)
+
+			err := r.validateHooks(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(HookServiceAccountNotValid)).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("should not set condition when hook has no SA", func() {
+			hook := newHook("", nil)
+			plan := newPlanWithHook()
+			r := createFakeReconciler(hook)
+
+			err := r.validateHooks(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(HookServiceAccountNotValid)).To(gomega.BeFalse())
+		})
+	})
+
+	ginkgo.Describe("validateConversionTempStorage", func() {
+		ginkgo.It("should pass when both fields are set and StorageClass exists", func() {
+			secret := createSecret(sourceSecretName, sourceNamespace, false)
+			source := createProvider(sourceName, sourceNamespace, "https://source", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
+			destination := createProvider(destName, destNamespace, "", api.OpenShift, &core.ObjectReference{})
+			plan := createPlan(testPlanName, testNamespace, source, destination)
+			plan.Spec.ConversionTempStorageClass = "fast-ssd"
+			plan.Spec.ConversionTempStorageSize = "50Gi"
+			source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+			destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+
+			sc := &storagev1.StorageClass{ObjectMeta: meta.ObjectMeta{Name: "fast-ssd"}, Provisioner: "kubernetes.io/fake"}
+			csiCap := &storagev1.CSIStorageCapacity{
+				ObjectMeta:       meta.ObjectMeta{Name: "fast-ssd-cap", Namespace: "kube-system"},
+				StorageClassName: "fast-ssd",
+				Capacity:         ptr.To(resource.MustParse("100Gi")),
+			}
+			reconciler = createFakeReconciler(secret, plan, source, destination, sc, csiCap)
+			err := reconciler.validateConversionTempStorage(plan)
+
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NotValid)).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("should pass when neither field is set", func() {
+			secret := createSecret(sourceSecretName, sourceNamespace, false)
+			source := createProvider(sourceName, sourceNamespace, "https://source", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
+			destination := createProvider(destName, destNamespace, "", api.OpenShift, &core.ObjectReference{})
+			plan := createPlan(testPlanName, testNamespace, source, destination)
+			source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+			destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+
+			reconciler = createFakeReconciler(secret, plan, source, destination)
+			err := reconciler.validateConversionTempStorage(plan)
+
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NotValid)).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("should fail when only storage class is set", func() {
+			secret := createSecret(sourceSecretName, sourceNamespace, false)
+			source := createProvider(sourceName, sourceNamespace, "https://source", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
+			destination := createProvider(destName, destNamespace, "", api.OpenShift, &core.ObjectReference{})
+			plan := createPlan(testPlanName, testNamespace, source, destination)
+			plan.Spec.ConversionTempStorageClass = "fast-ssd"
+			plan.Spec.ConversionTempStorageSize = ""
+			source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+			destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+
+			reconciler = createFakeReconciler(secret, plan, source, destination)
+			err := reconciler.validateConversionTempStorage(plan)
+
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NotValid)).To(gomega.BeTrue())
+			condition := plan.Status.FindCondition(NotValid)
+			gomega.Expect(condition).NotTo(gomega.BeNil())
+			gomega.Expect(condition.Message).To(gomega.ContainSubstring("Both ConversionTempStorageClass and ConversionTempStorageSize must be specified together"))
+		})
+
+		ginkgo.It("should fail when only storage size is set", func() {
+			secret := createSecret(sourceSecretName, sourceNamespace, false)
+			source := createProvider(sourceName, sourceNamespace, "https://source", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
+			destination := createProvider(destName, destNamespace, "", api.OpenShift, &core.ObjectReference{})
+			plan := createPlan(testPlanName, testNamespace, source, destination)
+			plan.Spec.ConversionTempStorageClass = ""
+			plan.Spec.ConversionTempStorageSize = "50Gi"
+			source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+			destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+
+			reconciler = createFakeReconciler(secret, plan, source, destination)
+			err := reconciler.validateConversionTempStorage(plan)
+
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NotValid)).To(gomega.BeTrue())
+			condition := plan.Status.FindCondition(NotValid)
+			gomega.Expect(condition).NotTo(gomega.BeNil())
+			gomega.Expect(condition.Message).To(gomega.ContainSubstring("Both ConversionTempStorageClass and ConversionTempStorageSize must be specified together"))
+		})
+
+		ginkgo.It("should fail when storage size is invalid", func() {
+			secret := createSecret(sourceSecretName, sourceNamespace, false)
+			source := createProvider(sourceName, sourceNamespace, "https://source", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
+			destination := createProvider(destName, destNamespace, "", api.OpenShift, &core.ObjectReference{})
+			plan := createPlan(testPlanName, testNamespace, source, destination)
+			plan.Spec.ConversionTempStorageClass = "fast-ssd"
+			plan.Spec.ConversionTempStorageSize = "invalid-size"
+			source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+			destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+
+			reconciler = createFakeReconciler(secret, plan, source, destination)
+			err := reconciler.validateConversionTempStorage(plan)
+
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NotValid)).To(gomega.BeTrue())
+			condition := plan.Status.FindCondition(NotValid)
+			gomega.Expect(condition).NotTo(gomega.BeNil())
+			gomega.Expect(condition.Message).To(gomega.ContainSubstring("is not a valid Kubernetes resource quantity"))
+		})
+
+		ginkgo.It("should pass with valid size formats when StorageClass exists and CSIStorageCapacity has sufficient capacity", func() {
+			secret := createSecret(sourceSecretName, sourceNamespace, false)
+			source := createProvider(sourceName, sourceNamespace, "https://source", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
+			destination := createProvider(destName, destNamespace, "", api.OpenShift, &core.ObjectReference{})
+			source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+			destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+
+			sc := &storagev1.StorageClass{ObjectMeta: meta.ObjectMeta{Name: "fast-ssd"}, Provisioner: "kubernetes.io/fake"}
+			csiCap := &storagev1.CSIStorageCapacity{
+				ObjectMeta:       meta.ObjectMeta{Name: "fast-ssd-cap", Namespace: "kube-system"},
+				StorageClassName: "fast-ssd",
+				Capacity:         ptr.To(resource.MustParse("2Ti")),
+			}
+			validSizes := []string{"50Gi", "1Ti", "100Mi", "500G", "2T"}
+			for _, size := range validSizes {
+				plan := createPlan(testPlanName, testNamespace, source, destination)
+				plan.Spec.ConversionTempStorageClass = "fast-ssd"
+				plan.Spec.ConversionTempStorageSize = size
+
+				reconciler = createFakeReconciler(secret, plan, source, destination, sc, csiCap)
+				err := reconciler.validateConversionTempStorage(plan)
+
+				gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Size %s should be valid", size)
+				gomega.Expect(plan.Status.HasBlockerCondition()).To(gomega.BeFalse(), "Size %s should not cause blocking validation error", size)
 			}
 		})
 
-		ginkgo.DescribeTable("should validate PVC name template correctly",
-			func(template string, shouldBeValid bool) {
-				err := reconciler.IsValidPVCNameTemplate(template)
-				if shouldBeValid {
-					gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				} else {
-					gomega.Expect(err).To(gomega.HaveOccurred())
-				}
-			},
-			ginkgo.Entry("empty template is valid", "", true),
-			ginkgo.Entry("simple valid template", "{{.VmName}}-disk-{{.DiskIndex}}", true),
-			ginkgo.Entry("complex valid template", "{{.PlanName}}-{{.VmName}}-disk-{{.DiskIndex}}", true),
-			ginkgo.Entry("valid template with root disk index", "{{if eq .DiskIndex .RootDiskIndex}}root{{else}}data{{end}}-{{.DiskIndex}}", true),
-			ginkgo.Entry("invalid template syntax", "{{.VmName}-disk-{{.DiskIndex}", false),
-			ginkgo.Entry("template with invalid k8s label chars", "disk@{{.DiskIndex}}", false),
-			ginkgo.Entry("template with undefined variable", "{{.UndefinedVar}}", false),
-			ginkgo.Entry("template resulting in empty string", "{{if false}}disk{{end}}", false),
-			ginkgo.Entry("template starting with non-alphanumeric", "-{{.VmName}}", false),
-			ginkgo.Entry("template ending with non-alphanumeric", "{{.VmName}}-", false),
-			ginkgo.Entry("template with too long result", "very-long-prefix-that-will-definitely-exceed-kubernetes-label-length-limit-for-sure-{{.VmName}}", false),
-			ginkgo.Entry("template with invalid character in the middle", "disk-{{.VmName}}/{{.DiskIndex}}", false),
-			ginkgo.Entry("template with uppercase characters (invalid K8s name)", "DISK-{{.VmName}}", false),
-		)
+		ginkgo.It("should block when ConversionTempStorageClass does not exist", func() {
+			secret := createSecret(sourceSecretName, sourceNamespace, false)
+			source := createProvider(sourceName, sourceNamespace, "https://source", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
+			destination := createProvider(destName, destNamespace, "", api.OpenShift, &core.ObjectReference{})
+			plan := createPlan(testPlanName, testNamespace, source, destination)
+			plan.Spec.ConversionTempStorageClass = "error-sc"
+			plan.Spec.ConversionTempStorageSize = "150Gi"
+			source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+			destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+
+			// No StorageClass "error-sc" in fake client -> should block
+			reconciler = createFakeReconciler(secret, plan, source, destination)
+			err := reconciler.validateConversionTempStorage(plan)
+
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasBlockerCondition()).To(gomega.BeTrue())
+			cnd := plan.Status.FindCondition(NotValid)
+			gomega.Expect(cnd).NotTo(gomega.BeNil())
+			gomega.Expect(cnd.Category).To(gomega.Equal(api.CategoryCritical))
+			gomega.Expect(cnd.Message).To(gomega.ContainSubstring("not found"))
+			gomega.Expect(cnd.Message).To(gomega.ContainSubstring("error-sc"))
+		})
+
+		ginkgo.It("should block when CSIStorageCapacity reports insufficient capacity", func() {
+			secret := createSecret(sourceSecretName, sourceNamespace, false)
+			source := createProvider(sourceName, sourceNamespace, "https://source", api.OpenShift, &core.ObjectReference{Name: sourceSecretName, Namespace: sourceNamespace})
+			destination := createProvider(destName, destNamespace, "", api.OpenShift, &core.ObjectReference{})
+			plan := createPlan(testPlanName, testNamespace, source, destination)
+			plan.Spec.ConversionTempStorageClass = "ocs-storagecluster-ceph-rbd"
+			plan.Spec.ConversionTempStorageSize = "1Ti"
+			source.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+			destination.Status.Conditions.SetCondition(libcnd.Condition{Type: libcnd.Ready, Status: libcnd.True})
+
+			sc := &storagev1.StorageClass{ObjectMeta: meta.ObjectMeta{Name: "ocs-storagecluster-ceph-rbd"}, Provisioner: "kubernetes.io/fake"}
+			// Only 70Gi available - not enough for 1Ti
+			csiCap := &storagev1.CSIStorageCapacity{
+				ObjectMeta:       meta.ObjectMeta{Name: "ceph-cap", Namespace: "openshift-storage"},
+				StorageClassName: "ocs-storagecluster-ceph-rbd",
+				Capacity:         ptr.To(resource.MustParse("70Gi")),
+			}
+			reconciler = createFakeReconciler(secret, plan, source, destination, sc, csiCap)
+			err := reconciler.validateConversionTempStorage(plan)
+
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasBlockerCondition()).To(gomega.BeTrue())
+			cnd := plan.Status.FindCondition(NotValid)
+			gomega.Expect(cnd).NotTo(gomega.BeNil())
+			gomega.Expect(cnd.Category).To(gomega.Equal(api.CategoryCritical))
+			gomega.Expect(cnd.Message).To(gomega.ContainSubstring("Insufficient space"))
+			gomega.Expect(cnd.Message).To(gomega.ContainSubstring("1Ti"))
+		})
 	})
 })
+
+var _ = ginkgo.Describe("vmUsesVddk", func() {
+	var (
+		reconciler *Reconciler
+	)
+
+	ginkgo.BeforeEach(func() {
+		reconciler = createFakeReconciler()
+	})
+
+	// Helper to create a vsphere.VM with disks
+	createVSphereVM := func(name string, diskDatastores []string) *vsphere.VM {
+		disks := []vspheremodel.Disk{}
+		for i, dsID := range diskDatastores {
+			disks = append(disks, vspheremodel.Disk{
+				Key: int32(i + 2000),
+				Datastore: vspheremodel.Ref{
+					ID: dsID,
+				},
+			})
+		}
+		return &vsphere.VM{
+			VM1: vsphere.VM1{
+				VM0: vsphere.VM0{
+					ID:   name + "-id",
+					Path: name,
+				},
+				Disks: disks,
+			},
+		}
+	}
+
+	// Helper to create a StorageMap
+	createStorageMap := func(datastorePairs []struct {
+		datastoreID string
+		hasOffload  bool
+	}) *api.StorageMap {
+		pairs := []api.StoragePair{}
+		for _, pair := range datastorePairs {
+			sp := api.StoragePair{
+				Source: ref.Ref{
+					ID: pair.datastoreID,
+				},
+				Destination: api.DestinationStorage{
+					StorageClass: "test-storage-class",
+				},
+			}
+			if pair.hasOffload {
+				sp.OffloadPlugin = &api.OffloadPlugin{
+					VSphereXcopyPluginConfig: &api.VSphereXcopyPluginConfig{
+						StorageVendorProduct: api.StorageVendorProduct("test-vendor"),
+					},
+				}
+			}
+			pairs = append(pairs, sp)
+		}
+		return &api.StorageMap{
+			Spec: api.StorageMapSpec{
+				Map: pairs,
+			},
+		}
+	}
+
+	// Tests for VDDK usage detection
+	ginkgo.DescribeTable("should correctly identify if VM uses VDDK",
+		func(vmName string, diskDatastores []string, storageMapPairs []struct {
+			datastoreID string
+			hasOffload  bool
+		}, expectedUsesVddk bool) {
+			storageMap := createStorageMap(storageMapPairs)
+			vsphereVM := createVSphereVM(vmName, diskDatastores)
+
+			usesVddk, err := reconciler.vmUsesVddk(storageMap, vsphereVM, vmName)
+
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(usesVddk).To(gomega.Equal(expectedUsesVddk))
+		},
+		ginkgo.Entry("one pure VDDK disk",
+			"vm1",
+			[]string{"ds1"},
+			[]struct {
+				datastoreID string
+				hasOffload  bool
+			}{
+				{datastoreID: "ds1", hasOffload: false},
+			},
+			true, // uses VDDK
+		),
+		ginkgo.Entry("one pure offload disk",
+			"vm1",
+			[]string{"ds1"},
+			[]struct {
+				datastoreID string
+				hasOffload  bool
+			}{
+				{datastoreID: "ds1", hasOffload: true},
+			},
+			false, // doesn't use VDDK (uses offload)
+		),
+		ginkgo.Entry("multiple pure VDDK disks",
+			"vm1",
+			[]string{"ds1", "ds2"},
+			[]struct {
+				datastoreID string
+				hasOffload  bool
+			}{
+				{datastoreID: "ds1", hasOffload: false},
+				{datastoreID: "ds2", hasOffload: false},
+			},
+			true, // uses VDDK
+		),
+		ginkgo.Entry("multiple pure offload disks",
+			"vm1",
+			[]string{"ds1", "ds2"},
+			[]struct {
+				datastoreID string
+				hasOffload  bool
+			}{
+				{datastoreID: "ds1", hasOffload: true},
+				{datastoreID: "ds2", hasOffload: true},
+			},
+			false, // doesn't use VDDK (uses offload)
+		),
+		ginkgo.Entry("mixed VM with both VDDK and offload disks",
+			"vm1",
+			[]string{"ds1", "ds2"},
+			[]struct {
+				datastoreID string
+				hasOffload  bool
+			}{
+				{datastoreID: "ds1", hasOffload: false}, // VDDK
+				{datastoreID: "ds2", hasOffload: true},  // Offload
+			},
+			true, // uses VDDK (because at least one disk uses VDDK)
+		),
+	)
+})
+
+// Mock validator for testing GuestToolsIssue aggregation
+type guestToolsResponse struct {
+	ok  bool
+	msg string
+	err error
+}
+
+type mockGuestToolsValidator struct {
+	responses map[string]guestToolsResponse
+}
+
+func (m *mockGuestToolsValidator) GuestToolsInstalled(vmRef ref.Ref) (ok bool, err error) {
+	if response, exists := m.responses[vmRef.Name]; exists {
+		return response.ok, response.err
+	}
+	// Default: tools are OK
+	return true, nil
+}
 
 //nolint:errcheck
 func createFakeReconciler(objects ...runtime.Object) *Reconciler {
@@ -205,7 +897,9 @@ func createFakeReconciler(objects ...runtime.Object) *Reconciler {
 	objs = append(objs, objects...)
 
 	scheme := runtime.NewScheme()
-	_ = v1.AddToScheme(scheme)
+	_ = core.AddToScheme(scheme)
+	_ = k8snet.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
 	api.SchemeBuilder.AddToScheme(scheme)
 
 	client := fakeClient.NewClientBuilder().
@@ -218,6 +912,7 @@ func createFakeReconciler(objects ...runtime.Object) *Reconciler {
 			Client: client,
 			Log:    planValidationLog,
 		},
+		client,
 	}
 }
 
@@ -277,3 +972,552 @@ func createPlan(name, namespace string, source, destination *api.Provider) *api.
 		},
 	}
 }
+
+var _ = ginkgo.Describe("Template Validation", func() {
+	var reconciler *Reconciler
+
+	ginkgo.BeforeEach(func() {
+		reconciler = createFakeReconciler()
+	})
+
+	ginkgo.Describe("IsValidVolumeNameTemplate", func() {
+		ginkgo.It("should pass with empty template", func() {
+			err := reconciler.IsValidVolumeNameTemplate("")
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should pass with valid simple template", func() {
+			err := reconciler.IsValidVolumeNameTemplate("disk-{{.VolumeIndex}}")
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should pass with template using PVCName", func() {
+			err := reconciler.IsValidVolumeNameTemplate("vol-{{.PVCName}}")
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should fail with invalid template syntax", func() {
+			err := reconciler.IsValidVolumeNameTemplate("disk-{{.InvalidField}}")
+			gomega.Expect(err).To(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should fail with unclosed template braces", func() {
+			err := reconciler.IsValidVolumeNameTemplate("disk-{{.VolumeIndex")
+			gomega.Expect(err).To(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should fail when output is not valid DNS label", func() {
+			// Template that produces output starting with hyphen
+			err := reconciler.IsValidVolumeNameTemplate("-{{.PVCName}}")
+			gomega.Expect(err).To(gomega.HaveOccurred())
+		})
+	})
+
+	ginkgo.Describe("IsValidNetworkNameTemplate", func() {
+		ginkgo.It("should pass with empty template", func() {
+			err := reconciler.IsValidNetworkNameTemplate("")
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should pass with valid simple template", func() {
+			err := reconciler.IsValidNetworkNameTemplate("net-{{.NetworkIndex}}")
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should pass with template using NetworkName", func() {
+			err := reconciler.IsValidNetworkNameTemplate("{{.NetworkName}}")
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should fail with invalid template syntax", func() {
+			err := reconciler.IsValidNetworkNameTemplate("net-{{.InvalidField}}")
+			gomega.Expect(err).To(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should fail with unclosed template braces", func() {
+			err := reconciler.IsValidNetworkNameTemplate("net-{{.NetworkIndex")
+			gomega.Expect(err).To(gomega.HaveOccurred())
+		})
+	})
+
+	ginkgo.Describe("IsValidTargetName", func() {
+		ginkgo.It("should pass with empty target name", func() {
+			err := reconciler.IsValidTargetName("")
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should pass with valid DNS subdomain name", func() {
+			err := reconciler.IsValidTargetName("my-vm-name")
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should pass with name containing dots", func() {
+			err := reconciler.IsValidTargetName("my.vm.name")
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should fail with name starting with hyphen", func() {
+			err := reconciler.IsValidTargetName("-invalid-name")
+			gomega.Expect(err).To(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should fail with name containing uppercase", func() {
+			err := reconciler.IsValidTargetName("Invalid-Name")
+			gomega.Expect(err).To(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should fail with name containing spaces", func() {
+			err := reconciler.IsValidTargetName("invalid name")
+			gomega.Expect(err).To(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("should fail with name containing underscores", func() {
+			err := reconciler.IsValidTargetName("invalid_name")
+			gomega.Expect(err).To(gomega.HaveOccurred())
+		})
+	})
+
+	ginkgo.Describe("validateVolumeNameTemplate", func() {
+		ginkgo.It("should not set condition for empty template", func() {
+			plan := &api.Plan{
+				Spec: api.PlanSpec{
+					VolumeNameTemplate: "",
+				},
+			}
+			err := reconciler.validateVolumeNameTemplate(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NotValid)).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("should not set condition for valid template", func() {
+			plan := &api.Plan{
+				Spec: api.PlanSpec{
+					VolumeNameTemplate: "disk-{{.VolumeIndex}}",
+				},
+			}
+			err := reconciler.validateVolumeNameTemplate(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NotValid)).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("should set condition for invalid template", func() {
+			plan := &api.Plan{
+				ObjectMeta: meta.ObjectMeta{
+					Name:      "test-plan",
+					Namespace: "test-ns",
+				},
+				Spec: api.PlanSpec{
+					VolumeNameTemplate: "{{.InvalidField}}",
+				},
+			}
+			err := reconciler.validateVolumeNameTemplate(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NotValid)).To(gomega.BeTrue())
+		})
+	})
+
+	ginkgo.Describe("validateNetworkNameTemplate", func() {
+		ginkgo.It("should not set condition for empty template", func() {
+			plan := &api.Plan{
+				Spec: api.PlanSpec{
+					NetworkNameTemplate: "",
+				},
+			}
+			err := reconciler.validateNetworkNameTemplate(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NotValid)).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("should not set condition for valid template", func() {
+			plan := &api.Plan{
+				Spec: api.PlanSpec{
+					NetworkNameTemplate: "net-{{.NetworkIndex}}",
+				},
+			}
+			err := reconciler.validateNetworkNameTemplate(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NotValid)).To(gomega.BeFalse())
+		})
+
+		ginkgo.It("should set condition for invalid template", func() {
+			plan := &api.Plan{
+				ObjectMeta: meta.ObjectMeta{
+					Name:      "test-plan",
+					Namespace: "test-ns",
+				},
+				Spec: api.PlanSpec{
+					NetworkNameTemplate: "{{.InvalidField}}",
+				},
+			}
+			err := reconciler.validateNetworkNameTemplate(plan)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(plan.Status.HasCondition(NotValid)).To(gomega.BeTrue())
+		})
+	})
+
+	ginkgo.Describe("createVddkCheckJob ServiceAccount", func() {
+		const globalImage = "quay.io/kubev2v/forklift-virt-v2v:latest"
+		const vddkImage = "quay.io/kubev2v/vddk:latest"
+		var savedGlobalSA string
+
+		newPlanWithVddkProvider := func() *api.Plan {
+			return &api.Plan{
+				ObjectMeta: meta.ObjectMeta{
+					Name:      "test-plan",
+					Namespace: testNamespace,
+					UID:       "test-uid",
+				},
+				Spec: api.PlanSpec{
+					TargetNamespace: testNamespace,
+				},
+				Referenced: api.Referenced{
+					Provider: struct {
+						Source      *api.Provider
+						Destination *api.Provider
+					}{
+						Source: &api.Provider{
+							ObjectMeta: meta.ObjectMeta{Name: "vsphere-src"},
+							Spec: api.ProviderSpec{
+								Settings: map[string]string{
+									api.VDDK: vddkImage,
+								},
+							},
+						},
+					},
+				},
+			}
+		}
+
+		ginkgo.BeforeEach(func() {
+			Settings.Migration.VirtV2vImage = globalImage
+			savedGlobalSA = Settings.Migration.ServiceAccount
+		})
+
+		ginkgo.AfterEach(func() {
+			Settings.Migration.ServiceAccount = savedGlobalSA
+		})
+
+		ginkgo.It("should set plan SA on the VDDK validation job", func() {
+			p := newPlanWithVddkProvider()
+			p.Spec.ServiceAccount = "plan-sa"
+			Settings.Migration.ServiceAccount = ""
+			job := createVddkCheckJob(p)
+			gomega.Expect(job.Spec.Template.Spec.ServiceAccountName).To(gomega.Equal("plan-sa"))
+		})
+
+		ginkgo.It("should fall back to global SA when plan SA is empty", func() {
+			p := newPlanWithVddkProvider()
+			p.Spec.ServiceAccount = ""
+			Settings.Migration.ServiceAccount = "global-sa"
+			job := createVddkCheckJob(p)
+			gomega.Expect(job.Spec.Template.Spec.ServiceAccountName).To(gomega.Equal("global-sa"))
+		})
+
+		ginkgo.It("should leave SA empty when both plan and global are empty", func() {
+			p := newPlanWithVddkProvider()
+			p.Spec.ServiceAccount = ""
+			Settings.Migration.ServiceAccount = ""
+			job := createVddkCheckJob(p)
+			gomega.Expect(job.Spec.Template.Spec.ServiceAccountName).To(gomega.BeEmpty())
+		})
+
+		ginkgo.It("should prefer plan SA over global SA", func() {
+			p := newPlanWithVddkProvider()
+			p.Spec.ServiceAccount = "plan-sa"
+			Settings.Migration.ServiceAccount = "global-sa"
+			job := createVddkCheckJob(p)
+			gomega.Expect(job.Spec.Template.Spec.ServiceAccountName).To(gomega.Equal("plan-sa"))
+		})
+	})
+
+	ginkgo.Describe("createVddkCheckJob image selection", func() {
+		const globalImage = "quay.io/kubev2v/forklift-virt-v2v:latest"
+		const vddkImage = "quay.io/kubev2v/vddk:latest"
+
+		newPlanWithVddkProvider := func() *api.Plan {
+			return &api.Plan{
+				ObjectMeta: meta.ObjectMeta{
+					Name:      "test-plan",
+					Namespace: testNamespace,
+					UID:       "test-uid",
+				},
+				Spec: api.PlanSpec{
+					TargetNamespace: testNamespace,
+				},
+				Referenced: api.Referenced{
+					Provider: struct {
+						Source      *api.Provider
+						Destination *api.Provider
+					}{
+						Source: &api.Provider{
+							ObjectMeta: meta.ObjectMeta{Name: "vsphere-src"},
+							Spec: api.ProviderSpec{
+								Settings: map[string]string{
+									api.VDDK: vddkImage,
+								},
+							},
+						},
+					},
+				},
+			}
+		}
+
+		ginkgo.BeforeEach(func() {
+			Settings.Migration.VirtV2vImage = globalImage
+		})
+
+		ginkgo.It("should use global virt-v2v image when plan has no override", func() {
+			p := newPlanWithVddkProvider()
+			job := createVddkCheckJob(p)
+
+			validatorContainer := job.Spec.Template.Spec.Containers[0]
+			gomega.Expect(validatorContainer.Image).To(gomega.Equal(globalImage))
+		})
+
+		ginkgo.It("should use per-plan virt-v2v image when set", func() {
+			perPlanImage := "quay.io/kubev2v/forklift-virt-v2v:custom-build"
+			p := newPlanWithVddkProvider()
+			p.Spec.VirtV2vImage = perPlanImage
+			job := createVddkCheckJob(p)
+
+			validatorContainer := job.Spec.Template.Spec.Containers[0]
+			gomega.Expect(validatorContainer.Image).To(gomega.Equal(perPlanImage))
+		})
+
+		ginkgo.It("should fall back to global image when plan override is empty string", func() {
+			p := newPlanWithVddkProvider()
+			p.Spec.VirtV2vImage = ""
+			job := createVddkCheckJob(p)
+
+			validatorContainer := job.Spec.Template.Spec.Containers[0]
+			gomega.Expect(validatorContainer.Image).To(gomega.Equal(globalImage))
+		})
+	})
+})
+
+var _ = ginkgo.Describe("aggregateCriticalConcerns", func() {
+	var vmCriticalConcerns libcnd.Condition
+
+	ginkgo.BeforeEach(func() {
+		vmCriticalConcerns = libcnd.Condition{
+			Type:     VMCriticalConcerns,
+			Status:   libcnd.True,
+			Reason:   NotValid,
+			Category: api.CategoryCritical,
+			Message:  "One or more VMs in the plan have critical concerns that block migration.",
+			Items:    []string{},
+		}
+	})
+
+	ginkgo.It("should flag VMs with Critical concerns", func() {
+		vm := &vsphere.VM{
+			VM1: vsphere.VM1{
+				Concerns: []vspheremodel.Concern{
+					{Id: "vmware.passthrough_device.detected", Label: "Passthrough device detected", Category: "Critical"},
+				},
+			},
+		}
+		vmRef := ref.Ref{Name: "vm-with-passthrough", Namespace: "test"}
+
+		aggregateCriticalConcerns(vm, vmRef.String(), &vmCriticalConcerns)
+
+		gomega.Expect(vmCriticalConcerns.Items).To(gomega.HaveLen(1))
+		gomega.Expect(vmCriticalConcerns.Items[0]).To(gomega.ContainSubstring("Passthrough device detected"))
+	})
+
+	ginkgo.It("should not flag VMs with only Warning concerns", func() {
+		vm := &vsphere.VM{
+			VM1: vsphere.VM1{
+				Concerns: []vspheremodel.Concern{
+					{Id: "vmware.disk.rdm.detected", Label: "Raw Device Mapped disk detected", Category: "Warning"},
+				},
+			},
+		}
+		vmRef := ref.Ref{Name: "vm-with-rdm", Namespace: "test"}
+
+		aggregateCriticalConcerns(vm, vmRef.String(), &vmCriticalConcerns)
+
+		gomega.Expect(vmCriticalConcerns.Items).To(gomega.BeEmpty())
+	})
+
+	ginkgo.It("should list all Critical concerns per VM", func() {
+		vm := &vsphere.VM{
+			VM1: vsphere.VM1{
+				Concerns: []vspheremodel.Concern{
+					{Id: "vmware.disk_mode.independent", Label: "Independent disk detected", Category: "Critical"},
+					{Id: "vmware.disk.rdm.detected", Label: "RDM disk detected", Category: "Warning"},
+					{Id: "vmware.passthrough_device.detected", Label: "Passthrough device detected", Category: "Critical"},
+				},
+			},
+		}
+		vmRef := ref.Ref{Name: "vm-multi", Namespace: "test"}
+
+		aggregateCriticalConcerns(vm, vmRef.String(), &vmCriticalConcerns)
+
+		gomega.Expect(vmCriticalConcerns.Items).To(gomega.HaveLen(2))
+		gomega.Expect(vmCriticalConcerns.Items[0]).To(gomega.ContainSubstring("Independent disk detected"))
+		gomega.Expect(vmCriticalConcerns.Items[1]).To(gomega.ContainSubstring("Passthrough device detected"))
+	})
+
+	ginkgo.It("should flag multiple VMs with Critical concerns", func() {
+		vms := []struct {
+			vm  *vsphere.VM
+			ref ref.Ref
+		}{
+			{
+				vm: &vsphere.VM{VM1: vsphere.VM1{Concerns: []vspheremodel.Concern{
+					{Id: "vmware.disk_mode.independent", Label: "Independent disk detected", Category: "Critical"},
+				}}},
+				ref: ref.Ref{Name: "vm1", Namespace: "test"},
+			},
+			{
+				vm: &vsphere.VM{VM1: vsphere.VM1{Concerns: []vspheremodel.Concern{
+					{Id: "vmware.disk.rdm.detected", Label: "RDM disk detected", Category: "Warning"},
+				}}},
+				ref: ref.Ref{Name: "vm2", Namespace: "test"},
+			},
+			{
+				vm: &vsphere.VM{VM1: vsphere.VM1{Concerns: []vspheremodel.Concern{
+					{Id: "vmware.passthrough_device.detected", Label: "Passthrough device detected", Category: "Critical"},
+				}}},
+				ref: ref.Ref{Name: "vm3", Namespace: "test"},
+			},
+		}
+
+		for _, entry := range vms {
+			aggregateCriticalConcerns(entry.vm, entry.ref.String(), &vmCriticalConcerns)
+		}
+
+		gomega.Expect(vmCriticalConcerns.Items).To(gomega.HaveLen(2))
+		gomega.Expect(vmCriticalConcerns.Items[0]).To(gomega.ContainSubstring("vm1"))
+		gomega.Expect(vmCriticalConcerns.Items[1]).To(gomega.ContainSubstring("vm3"))
+	})
+})
+
+var _ = ginkgo.Describe("aggregateWarningConcerns", func() {
+	var unsupportedOVFExport libcnd.Condition
+
+	ginkgo.BeforeEach(func() {
+		unsupportedOVFExport = libcnd.Condition{
+			Type:     UnsupportedOVFExportSource,
+			Status:   libcnd.True,
+			Category: api.CategoryWarn,
+			Message:  "VM appears to have been exported from an unsupported OVF source.",
+			Items:    []string{},
+		}
+	})
+
+	ginkgo.It("should detect OVA unsupported export source", func() {
+		vm := &vsphere.VM{
+			VM1: vsphere.VM1{
+				Concerns: []vspheremodel.Concern{
+					{Id: "ova.source.unsupported", Label: "Unsupported OVF source", Category: "Warning"},
+				},
+			},
+		}
+		vmRef := ref.Ref{Name: "ova-vm", Namespace: "test"}
+
+		aggregateWarningConcerns(vm, vmRef.String(), &unsupportedOVFExport)
+
+		gomega.Expect(unsupportedOVFExport.Items).To(gomega.HaveLen(1))
+		gomega.Expect(unsupportedOVFExport.Items[0]).To(gomega.ContainSubstring("ova-vm"))
+	})
+
+	ginkgo.It("should not flag VMs without the unsupported OVA concern", func() {
+		vm := &vsphere.VM{
+			VM1: vsphere.VM1{
+				Concerns: []vspheremodel.Concern{
+					{Id: "vmware.disk.rdm.detected", Label: "Raw Device Mapped disk detected", Category: "Warning"},
+				},
+			},
+		}
+		vmRef := ref.Ref{Name: "normal-vm", Namespace: "test"}
+
+		aggregateWarningConcerns(vm, vmRef.String(), &unsupportedOVFExport)
+
+		gomega.Expect(unsupportedOVFExport.Items).To(gomega.BeEmpty())
+	})
+})
+
+var _ = ginkgo.Describe("validateVirtV2vImage", func() {
+	var reconciler *Reconciler
+
+	ginkgo.BeforeEach(func() {
+		reconciler = &Reconciler{
+			base.Reconciler{},
+			nil,
+		}
+	})
+
+	ginkgo.It("should not set condition when VirtV2vImage is empty", func() {
+		plan := &api.Plan{}
+		plan.Spec.VirtV2vImage = ""
+		err := reconciler.validateVirtV2vImage(plan)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(plan.Status.HasCondition(VirtV2vImageNotValid)).To(gomega.BeFalse())
+	})
+
+	ginkgo.It("should not set condition for a valid fully-qualified image", func() {
+		plan := &api.Plan{}
+		plan.Spec.VirtV2vImage = "quay.io/kubev2v/forklift-virt-v2v:latest"
+		err := reconciler.validateVirtV2vImage(plan)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(plan.Status.HasCondition(VirtV2vImageNotValid)).To(gomega.BeFalse())
+	})
+
+	ginkgo.It("should not set condition for image with tag and registry port", func() {
+		plan := &api.Plan{}
+		plan.Spec.VirtV2vImage = "registry.example.com:5000/myorg/myimage:v1.2.3"
+		err := reconciler.validateVirtV2vImage(plan)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(plan.Status.HasCondition(VirtV2vImageNotValid)).To(gomega.BeFalse())
+	})
+
+	ginkgo.It("should set condition for a bare name like 'test'", func() {
+		plan := &api.Plan{}
+		plan.Spec.VirtV2vImage = "test"
+		err := reconciler.validateVirtV2vImage(plan)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(plan.Status.HasCondition(VirtV2vImageNotValid)).To(gomega.BeTrue())
+	})
+
+	ginkgo.It("should set condition for an invalid reference with spaces", func() {
+		plan := &api.Plan{}
+		plan.Spec.VirtV2vImage = "invalid image name"
+		err := reconciler.validateVirtV2vImage(plan)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(plan.Status.HasCondition(VirtV2vImageNotValid)).To(gomega.BeTrue())
+	})
+
+	ginkgo.It("should set condition for a bare name with tag", func() {
+		plan := &api.Plan{}
+		plan.Spec.VirtV2vImage = "myimage:latest"
+		err := reconciler.validateVirtV2vImage(plan)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(plan.Status.HasCondition(VirtV2vImageNotValid)).To(gomega.BeTrue())
+	})
+
+	ginkgo.It("should not set condition for org/image format", func() {
+		plan := &api.Plan{}
+		plan.Spec.VirtV2vImage = "kubev2v/forklift-virt-v2v:custom"
+		err := reconciler.validateVirtV2vImage(plan)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(plan.Status.HasCondition(VirtV2vImageNotValid)).To(gomega.BeFalse())
+	})
+
+	ginkgo.It("should not set condition for image with double underscore separator", func() {
+		plan := &api.Plan{}
+		plan.Spec.VirtV2vImage = "quay.io/my__org/image:tag"
+		err := reconciler.validateVirtV2vImage(plan)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(plan.Status.HasCondition(VirtV2vImageNotValid)).To(gomega.BeFalse())
+	})
+
+	ginkgo.It("should not set condition for image with multiple dashes in path", func() {
+		plan := &api.Plan{}
+		plan.Spec.VirtV2vImage = "quay.io/my---image/repo:tag"
+		err := reconciler.validateVirtV2vImage(plan)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(plan.Status.HasCondition(VirtV2vImageNotValid)).To(gomega.BeFalse())
+	})
+})

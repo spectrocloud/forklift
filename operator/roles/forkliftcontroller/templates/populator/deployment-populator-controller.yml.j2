@@ -16,7 +16,7 @@ spec:
       serviceAccountName: forklift-populator-controller
       containers:
         - name: {{ populator_controller_container_name }}
-          image: {{ populator_controller_image_fqin }}
+          image: "{{ populator_controller_image_fqin or lookup('env', 'POPULATOR_CONTROLLER_IMAGE') or lookup('env', 'RELATED_IMAGE_POPULATOR_CONTROLLER') }}"
           imagePullPolicy: {{ image_pull_policy }}
           env:
           - name: POD_NAMESPACE
@@ -25,13 +25,33 @@ spec:
                   apiVersion: v1
                   fieldPath: metadata.namespace
           - name: OVIRT_POPULATOR_IMAGE
-            value: {{ populator_ovirt_image_fqin }}
+            value: "{{ populator_ovirt_image_fqin or lookup('env', 'OVIRT_POPULATOR_IMAGE') or lookup('env', 'RELATED_IMAGE_RHV_POPULATOR') }}"
           - name: OPENSTACK_POPULATOR_IMAGE
-            value: {{ populator_openstack_image_fqin }}
+            value: "{{ populator_openstack_image_fqin or lookup('env', 'OPENSTACK_POPULATOR_IMAGE') or lookup('env', 'RELATED_IMAGE_OPENSTACK_POPULATOR') }}"
 {% if feature_copy_offload|bool %}
-          - name: VSPHERE_XCOPY_VOLUME_POPULATOR_IMAGE
-            value: {{ populator_vsphere_xcopy_volume_image_fqin }}
+          - name: VSPHERE_COPY_OFFLOAD_POPULATOR_IMAGE
+            value: "{{ populator_vsphere_copy_offload_image_fqin or lookup('env', 'VSPHERE_COPY_OFFLOAD_POPULATOR_IMAGE') or lookup('env', 'RELATED_IMAGE_VSPHERE_COPY_OFFLOAD_POPULATOR') }}"
+{% if controller_host_lease_namespace is defined %}
+          - name: HOST_LEASE_NAMESPACE
+            value: "{{ controller_host_lease_namespace }}"
 {% endif %}
+{% if controller_host_lease_duration_seconds is number %}
+          - name: HOST_LEASE_DURATION_SECONDS
+            value: "{{ controller_host_lease_duration_seconds }}"
+{% endif %}
+{% endif %}
+{% if controller_max_populator_inflight is number %}
+          - name: MAX_POPULATOR_INFLIGHT
+            value: "{{ controller_max_populator_inflight }}"
+{% endif %}
+          - name: POPULATOR_CONTAINER_LIMITS_CPU
+            value: "{{ populator_container_limits_cpu }}"
+          - name: POPULATOR_CONTAINER_LIMITS_MEMORY
+            value: "{{ populator_container_limits_memory }}"
+          - name: POPULATOR_CONTAINER_REQUESTS_CPU
+            value: "{{ populator_container_requests_cpu }}"
+          - name: POPULATOR_CONTAINER_REQUESTS_MEMORY
+            value: "{{ populator_container_requests_memory }}"
           ports:
             - containerPort: 8080
               name: http-endpoint

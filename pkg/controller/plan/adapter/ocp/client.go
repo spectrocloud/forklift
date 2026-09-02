@@ -194,7 +194,7 @@ func (r *Client) PreTransferActions(vmRef ref.Ref) (ready bool, err error) {
 				TTLDuration: tokenTTLDuration,
 				Source: core.TypedLocalObjectReference{
 					APIGroup: &apiGroup,
-					Kind:     "VirtualMachine",
+					Kind:     util.VirtualMachineKind,
 					Name:     vmRef.Name,
 				},
 			},
@@ -207,6 +207,10 @@ func (r *Client) PreTransferActions(vmRef ref.Ref) (ready bool, err error) {
 	}
 	if vmExport.Status != nil && vmExport.Status.Phase == export.Ready {
 		r.Log.Info("VM-export is ready.", "vm", vmRef.Name)
+		return true, nil
+	}
+	if vmExport.Status != nil && vmExport.Status.Phase == export.Skipped {
+		r.Log.Info("VM-export is skipped (no exportable volumes), will migrate VM definition only.", "vm", vmRef.Name)
 		return true, nil
 	}
 

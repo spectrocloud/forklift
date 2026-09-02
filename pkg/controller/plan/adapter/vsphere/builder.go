@@ -2,20 +2,23 @@ package vsphere
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	liburl "net/url"
 	"path"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 
 	"k8s.io/klog/v2"
 
-	"github.com/google/uuid"
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
@@ -23,16 +26,14 @@ import (
 	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
 	utils "github.com/kubev2v/forklift/pkg/controller/plan/util"
-	container "github.com/kubev2v/forklift/pkg/controller/provider/container/vsphere"
 	"github.com/kubev2v/forklift/pkg/controller/provider/model/vsphere"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web"
-	"github.com/kubev2v/forklift/pkg/controller/provider/web/base"
-	"github.com/kubev2v/forklift/pkg/controller/provider/web/ocp"
 	model "github.com/kubev2v/forklift/pkg/controller/provider/web/vsphere"
 	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	libitr "github.com/kubev2v/forklift/pkg/lib/itinerary"
 	libref "github.com/kubev2v/forklift/pkg/lib/ref"
+	"github.com/kubev2v/forklift/pkg/lib/util"
 	"github.com/kubev2v/forklift/pkg/settings"
 	"github.com/kubev2v/forklift/pkg/templateutil"
 	"github.com/vmware/govmomi/vim25"
@@ -80,6 +81,7 @@ const (
 	TemplateOSLabel       = "os.template.kubevirt.io/%s"
 	TemplateWorkloadLabel = "workload.template.kubevirt.io/server"
 	TemplateFlavorLabel   = "flavor.template.kubevirt.io/medium"
+	TemplateNAALabel      = "volume.csi.k8s.io/affinity-source-naa"
 )
 
 // Operating Systems
@@ -90,18 +92,8 @@ const (
 	WindowsPrefix  = "win"
 )
 
-// Annotations
-const (
-	// CDI import backing file annotation on PVC
-	AnnImportBackingFile = "cdi.kubevirt.io/storage.import.backingFile"
-)
-
 const (
 	Shareable = "shareable"
-)
-
-const (
-	ManagementNetwork = "Management Network"
 )
 
 // Map of vmware guest ids to osinfo ids.
@@ -142,6 +134,7 @@ var osMap = map[string]string{
 	"win2000ProGuest":            "win2k",
 	"win2000ServGuest":           "win2k",
 	"windows7Guest":              "win7",
+	"windows7_64Guest":           "win7",
 	"windows7Server64Guest":      "win2k8r2",
 	"windows8_64Guest":           "win8",
 	"windows8Guest":              "win8",
@@ -176,49 +169,13 @@ var legacyIdentifiers = []string{
 // vSphere disk backing file.
 var backingFilePattern = regexp.MustCompile(`-\d\d\d\d\d\d.vmdk`)
 
+var sanitizeNameRx = regexp.MustCompile(`[^a-zA-Z0-9_.-]+`)
+
 // vSphere builder.
 type Builder struct {
 	*plancontext.Context
 	// Host CRs.
 	hosts map[string]*api.Host
-	// MAC addresses already in use on the destination cluster. k=mac, v=vmName
-	macConflictsMap map[string]string
-}
-
-// Get list of destination VMs with mac addresses that would
-// conflict with this VM, if any exist.
-func (r *Builder) macConflicts(vm *model.VM) (conflictingVMs []string, err error) {
-	if r.macConflictsMap == nil {
-		list := []ocp.VM{}
-		err = r.Destination.Inventory.List(&list, base.Param{
-			Key:   base.DetailParam,
-			Value: "all",
-		})
-		if err != nil {
-			return
-		}
-
-		r.macConflictsMap = make(map[string]string)
-		for _, kVM := range list {
-			for _, iface := range kVM.Object.Spec.Template.Spec.Domain.Devices.Interfaces {
-				r.macConflictsMap[iface.MacAddress] = path.Join(kVM.Namespace, kVM.Name)
-			}
-		}
-	}
-
-	for _, nic := range vm.NICs {
-		if conflictingVm, found := r.macConflictsMap[nic.MAC]; found {
-			for i := range conflictingVMs {
-				// ignore duplicates
-				if conflictingVMs[i] == conflictingVm {
-					continue
-				}
-			}
-			conflictingVMs = append(conflictingVMs, conflictingVm)
-		}
-	}
-
-	return
 }
 
 // Create DataVolume certificate configmap.
@@ -247,7 +204,7 @@ func (r *Builder) PodEnvironment(vmRef ref.Ref, sourceSecret *core.Secret) (env 
 		err = liberr.Wrap(err, "vm", vmRef.String())
 		return
 	}
-	if !r.Context.Plan.Spec.MigrateSharedDisks {
+	if !r.shouldMigrateSharedDisks(vm) {
 		vm.RemoveSharedDisks()
 	}
 	macsToIps := ""
@@ -273,14 +230,14 @@ func (r *Builder) PodEnvironment(vmRef ref.Ref, sourceSecret *core.Secret) (env 
 	if useLegacyDrivers {
 		env = append(env, core.EnvVar{
 			Name:  "VIRTIO_WIN",
-			Value: "/usr/local/virtio-win.iso",
+			Value: "/usr/local/virtio-win-legacy.iso",
 		})
 	} else if isWindows(vm) { // We check for multiple IPs per NIC only on Windows VMs
 		macIPCount := make(map[string]int)
 
 		for _, gn := range vm.GuestNetworks {
 			//IS ipv4
-			if net.IP.To4(net.ParseIP(gn.IP)) != nil {
+			if gn.Origin == string(types.NetIpConfigInfoIpAddressOriginManual) && net.IP.To4(net.ParseIP(gn.IP)) != nil {
 				macIPCount[gn.MAC]++
 			}
 		}
@@ -300,6 +257,13 @@ func (r *Builder) PodEnvironment(vmRef ref.Ref, sourceSecret *core.Secret) (env 
 		env = append(env, core.EnvVar{
 			Name:  "V2V_HOSTNAME",
 			Value: vm.HostName,
+		})
+	}
+	planVM := r.getPlanVM(vm)
+	if planVM != nil && planVM.NbdeClevis {
+		env = append(env, core.EnvVar{
+			Name:  "V2V_NBDE_CLEVIS",
+			Value: "true",
 		})
 	}
 
@@ -331,6 +295,10 @@ func (r *Builder) PodEnvironment(vmRef ref.Ref, sourceSecret *core.Secret) (env 
 		core.EnvVar{
 			Name:  "V2V_extra_args",
 			Value: settings.Settings.Migration.VirtV2vExtraArgs,
+		},
+		core.EnvVar{
+			Name:  "V2V_inspector_extra_args",
+			Value: settings.Settings.Migration.VirtV2vInspectorExtraArgs,
 		},
 	)
 	if macsToIps != "" {
@@ -380,17 +348,15 @@ func isWindows(vm *model.VM) bool {
 	return strings.Contains(vm.GuestID, WindowsPrefix) || strings.Contains(vm.GuestName, WindowsPrefix)
 }
 
-// Retrieve the IP address of an ESXI host from its Management Network VNIC or fall back to the hostname.
-func getHostAddress(host *model.Host) string {
-	for _, vnic := range host.Network.VNICs {
-		if vnic.PortGroup == ManagementNetwork {
-			if vnic.IpAddress != "" && net.ParseIP(vnic.IpAddress) != nil {
-				return vnic.IpAddress // Return the IP address if found
-			}
-		}
+// formatHostAddress wraps IPv6 addresses in brackets for URL compatibility.
+func formatHostAddress(address string) string {
+	ip := net.ParseIP(address)
+	if ip != nil && ip.To4() == nil {
+		// IPv6 address - wrap in brackets
+		return "[" + address + "]"
 	}
-	// otherwise fall back to the host name
-	return host.Name
+	// IPv4 address or hostname - return as-is
+	return address
 }
 
 func (r *Builder) getSourceDetails(vm *model.VM, sourceSecret *core.Secret) (libvirtURL liburl.URL, fingerprint string, err error) {
@@ -399,9 +365,12 @@ func (r *Builder) getSourceDetails(vm *model.VM, sourceSecret *core.Secret) (lib
 		return
 	}
 
-	sslVerify := ""
+	var sslVerify string
 	if basecontroller.GetInsecureSkipVerifyFlag(sourceSecret) {
 		sslVerify = "no_verify=1"
+	} else {
+		// This path is created by linkCertificates in the v2v container containes either the provider cert or pod certs.
+		sslVerify = "cacert=/opt/ca-bundle.crt"
 	}
 
 	if hostDef, found := r.hosts[host.ID]; found {
@@ -412,7 +381,7 @@ func (r *Builder) getSourceDetails(vm *model.VM, sourceSecret *core.Secret) (lib
 		}
 		libvirtURL = liburl.URL{
 			Scheme:   "esx",
-			Host:     hostDef.Spec.IpAddress,
+			Host:     formatHostAddress(hostDef.Spec.IpAddress),
 			User:     liburl.User(string(hostSecret.Data["user"])),
 			Path:     "",
 			RawQuery: sslVerify,
@@ -425,9 +394,16 @@ func (r *Builder) getSourceDetails(vm *model.VM, sourceSecret *core.Secret) (lib
 			fingerprint = host.Thumbprint
 		}
 	} else if r.Source.Provider.Spec.Settings[api.SDK] == api.ESXI {
+		// For ESXi SDK endpoint, use the provider URL directly instead of
+		// extracting management IP from inventory
+		var url *liburl.URL
+		if url, err = liburl.Parse(r.Source.Provider.Spec.URL); err != nil {
+			err = liberr.Wrap(err)
+			return
+		}
 		libvirtURL = liburl.URL{
 			Scheme:   "esx",
-			Host:     getHostAddress(host),
+			Host:     formatHostAddress(url.Hostname()),
 			User:     liburl.User(string(sourceSecret.Data["user"])),
 			Path:     "",
 			RawQuery: sslVerify,
@@ -488,7 +464,7 @@ func (r *Builder) Secret(vmRef ref.Ref, in, object *core.Secret) (err error) {
 			"secretKey":   in.Data["password"],
 		}
 	}
-	if cacert, ok := in.Data["cacert"]; ok {
+	if cacert, ok := util.GetCACert(in); ok {
 		object.Data["cacert"] = cacert
 	}
 	return
@@ -521,28 +497,15 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 		err = liberr.Wrap(err, "vm", vmRef.String())
 		return
 	}
-	if !r.Context.Plan.Spec.MigrateSharedDisks {
+	if !r.shouldMigrateSharedDisks(vm) {
 		vm.RemoveSharedDisks()
 	}
+
 	url := r.Source.Provider.Spec.URL
 	thumbprint := r.Source.Provider.Status.Fingerprint
-	hostID, err := r.hostID(vmRef)
+	url, thumbprint, err = r.applyHostsConfig(vmRef, url, thumbprint)
 	if err != nil {
 		return
-	}
-	if hostDef, found := r.hosts[hostID]; found {
-		hostURL := liburl.URL{
-			Scheme: "https",
-			Host:   hostDef.Spec.IpAddress,
-			Path:   vim25.Path,
-		}
-		url = hostURL.String()
-		h, nErr := r.host(hostID)
-		if nErr != nil {
-			err = nErr
-			return
-		}
-		thumbprint = h.Thumbprint
 	}
 
 	// Build datastore map for more efficient lookups
@@ -551,9 +514,40 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 		return
 	}
 
+	// For storage offload warm migrations, match this DataVolume to the
+	// existing PVC via the backing file name.
+	var pvcMap map[string]core.PersistentVolumeClaim
+	if r.Plan.IsWarm() && r.SupportsVolumePopulators() {
+		pvcMap = make(map[string]core.PersistentVolumeClaim)
+		pvcs := &core.PersistentVolumeClaimList{}
+		pvcLabels := map[string]string{
+			"vmID":      vmRef.ID,
+			"migration": string(r.Migration.UID),
+		}
+
+		err = r.Context.Destination.Client.List(
+			context.TODO(),
+			pvcs,
+			&client.ListOptions{
+				Namespace:     r.Plan.Spec.TargetNamespace,
+				LabelSelector: labels.SelectorFromSet(pvcLabels),
+			},
+		)
+		if err != nil {
+			err = liberr.Wrap(err)
+			return
+		}
+
+		for _, pvc := range pvcs.Items {
+			if copyOffload, present := pvc.Annotations["copy-offload"]; present && copyOffload != "" {
+				pvcMap[baseVolume(copyOffload, r.Plan.IsWarm())] = pvc
+			}
+		}
+	}
+
 	// Sort disks by bus, so we can match the disk index to the boot order.
 	// Important: need to match order in mapDisks method
-	disks := r.sortedDisksAsVmware(vm.Disks)
+	disks := vm.SortedDisksAsVmware()
 
 	for diskIndex, disk := range disks {
 		mapped, found := dsMap[disk.Datastore.ID]
@@ -561,13 +555,22 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 			continue
 		}
 
-		storageClass := mapped.Destination.StorageClass
-		vddkImage := settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
+		// Shift disks are handled by NetAppShiftPVCs (PVCs, not DVs).
+		if isShift, sErr := mapped.Destination.IsNetAppShiftStorageClass(r.Destination.Client); sErr != nil {
+			err = sErr
+			return
+		} else if isShift {
+			continue
+		}
 
-		// Let CDI do the copying
+		storageClass := mapped.Destination.StorageClass
+		// Spectro: the virt-v2v transfer path is removed. CDI+VDDK always copies
+		// the disks and virt-v2v is reduced to in-place conversion, so VDDK is a
+		// hard requirement for vSphere migrations.
+		vddkImage := settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
 		dvSource := cdi.DataVolumeSource{
 			VDDK: &cdi.DataVolumeSourceVDDK{
-				BackingFile:  baseVolume(disk.File, r.Plan.Spec.Warm),
+				BackingFile:  baseVolume(disk.File, r.Plan.IsWarm()),
 				UUID:         vm.UUID,
 				URL:          url,
 				SecretRef:    secret.Name,
@@ -591,10 +594,6 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 		// otherwise, let the storage profile decide the default values.
 		if mapped.Destination.AccessMode != "" {
 			dvSpec.Storage.AccessModes = []core.PersistentVolumeAccessMode{mapped.Destination.AccessMode}
-		} else {
-			// we expect the storage class for migration to support RWX for live migration to work.
-			// In case the override is needed, set it in the StorageMap mapping
-			dvSpec.Storage.AccessModes = []core.PersistentVolumeAccessMode{core.ReadWriteMany}
 		}
 		if mapped.Destination.VolumeMode != "" {
 			dvSpec.Storage.VolumeMode = &mapped.Destination.VolumeMode
@@ -605,70 +604,26 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 		if dv.ObjectMeta.Annotations == nil {
 			dv.ObjectMeta.Annotations = make(map[string]string)
 		}
-		dv.ObjectMeta.Annotations[planbase.AnnDiskSource] = baseVolume(disk.File, r.Plan.Spec.Warm)
+		dv.ObjectMeta.Annotations[planbase.AnnDiskSource] = baseVolume(disk.File, r.Plan.IsWarm())
 		if disk.Shared {
 			dv.ObjectMeta.Labels[Shareable] = "true"
 		}
 
-		// Preserve the disk index as an annotation on the created DataVolume
+		// Preserve the disk index as an annotation on the created DataVolume.
 		// Note: this annotation will be used to match the PVC to the VM disks by
 		//       matching the disk and PVC index.
 		dv.ObjectMeta.Annotations[planbase.AnnDiskIndex] = fmt.Sprintf("%d", diskIndex)
 
-		// if exists, get the PVC generate name from the PlanSpec, generate the name
-		// and update the GenerateName field in the DataVolume object.
-		pvcNameTemplate := r.getPVCNameTemplate(vm)
-		if pvcNameTemplate != "" {
-			// Get the VM root disk index
-			planVM := r.getPlanVM(vm)
-			rootDiskIndex := 0
-			if planVM != nil {
-				rootDiskIndex = utils.GetBootDiskNumber(planVM.RootDisk)
+		if pvcMap != nil && dvSource.VDDK != nil {
+			// In a warm migration with storage offload, the PVC has already been created with
+			// the name template. Copy the result to the DataVolume so it can adopt the PVC.
+			if pvc, present := pvcMap[dvSource.VDDK.BackingFile]; present {
+				dv.ObjectMeta.Name = pvc.Name
 			}
-
-			// Create template data
-			templateData := api.PVCNameTemplateData{
-				VmName:         r.getPlenVMSafeName(vm),
-				PlanName:       r.Plan.Name,
-				DiskIndex:      diskIndex,
-				RootDiskIndex:  rootDiskIndex,
-				Shared:         disk.Shared,
-				FileName:       disk.File,
-				WinDriveLetter: disk.WinDriveLetter,
-			}
-
-			generatedName, err := r.executeTemplate(pvcNameTemplate, &templateData)
-			useGenerateName := r.Plan.Spec.PVCNameTemplateUseGenerateName
-
-			// Validate that template output is a valid k8s label
-			errs := k8svalidation.IsDNS1123Label(generatedName)
-			if len(errs) > 0 {
-				// Raise an error if the generated name is not valid
-				err = errors.New("generated PVC name is not valid")
-
-				// Failed to generate PVC name using template
-				r.Log.Info("Failed to generate PVC name using template", "template", pvcNameTemplate, "error", err)
-			}
-
-			if err == nil && generatedName != "" {
-				if useGenerateName {
-					// Ensure generatedName ends with "-"
-					if !strings.HasSuffix(generatedName, "-") {
-						generatedName = generatedName + "-"
-					}
-					dv.ObjectMeta.GenerateName = generatedName
-				} else {
-					// Ensure generatedName does not end with "-"
-					if strings.HasSuffix(generatedName, "-") {
-						generatedName = strings.Trim(generatedName, "-")
-					}
-
-					// Use the generated name as the PVC name
-					dv.ObjectMeta.Name = generatedName
-				}
-			} else {
-				// Failed to generate PVC name using template
-				r.Log.Info("Failed to generate PVC name using template", "template", pvcNameTemplate, "error", err)
+		} else {
+			// Set PVC name/generateName using template if configured
+			if err := r.setPVCNameFromTemplate(&dv.ObjectMeta, vm, diskIndex, disk); err != nil {
+				r.Log.Info("Failed to set PVC name from template", "error", err)
 			}
 		}
 
@@ -679,6 +634,29 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 	}
 
 	return
+}
+
+func (r *Builder) applyHostsConfig(vmRef ref.Ref, url, thumbprint string) (string, string, error) {
+	hostID, err := r.hostID(vmRef)
+	if err != nil {
+		return "", "", liberr.Wrap(err)
+	}
+	if hostDef, found := r.hosts[hostID]; found {
+		hostURL := liburl.URL{
+			Scheme: "https",
+			Host:   formatHostAddress(hostDef.Spec.IpAddress),
+			Path:   vim25.Path,
+		}
+		url = hostURL.String()
+		h, nErr := r.host(hostID)
+		if nErr != nil {
+			err = nErr
+			return "", "", liberr.Wrap(err)
+		}
+		thumbprint = h.Thumbprint
+	}
+
+	return url, thumbprint, nil
 }
 
 // Create the destination Kubevirt VM.
@@ -704,14 +682,14 @@ func (r *Builder) VirtualMachine(vmRef ref.Ref, object *cnv.VirtualMachineSpec, 
 				vmRef.String()))
 		return
 	}
-	if r.Plan.Spec.Warm && !vm.ChangeTrackingEnabled {
+	if r.Plan.IsWarm() && !vm.ChangeTrackingEnabled {
 		err = liberr.New(
 			fmt.Sprintf(
 				"Changed Block Tracking (CBT) is disabled for VM %s",
 				vmRef.String()))
 		return
 	}
-	if !r.Context.Plan.Spec.MigrateSharedDisks {
+	if !r.shouldMigrateSharedDisks(vm) {
 		sharedPVCs, missingDiskPVCs, err := findSharedPVCs(r.Destination.Client, vm, r.Plan.Spec.TargetNamespace)
 		if err != nil {
 			return liberr.Wrap(err)
@@ -726,22 +704,10 @@ func (r *Builder) VirtualMachine(vmRef ref.Ref, object *cnv.VirtualMachineSpec, 
 		}
 	}
 
-	var conflicts []string
-	conflicts, err = r.macConflicts(vm)
-	if err != nil {
-		return
-	}
-	if len(conflicts) > 0 {
-		err = liberr.New(
-			fmt.Sprintf("Source VM has a mac address conflict with one or more destination VMs: %s", conflicts))
-		return
-	}
-
 	host, err := r.host(vm.Host)
 	if err != nil {
 		return
 	}
-
 	if object.Template == nil {
 		object.Template = &cnv.VirtualMachineInstanceTemplateSpec{}
 	}
@@ -751,7 +717,7 @@ func (r *Builder) VirtualMachine(vmRef ref.Ref, object *cnv.VirtualMachineSpec, 
 	}
 	r.mapFirmware(vm, object)
 	if !usesInstanceType {
-		r.mapCPU(vm, object)
+		r.mapCPU(vmRef, vm, object)
 		r.mapMemory(vm, object)
 	}
 	r.mapClock(host, object)
@@ -765,15 +731,42 @@ func (r *Builder) VirtualMachine(vmRef ref.Ref, object *cnv.VirtualMachineSpec, 
 	return
 }
 
+func isIPv4(address string) bool {
+	ip := net.ParseIP(address)
+	return ip != nil && ip.To4() != nil
+}
+
+func (r *Builder) findInterfaceIps(vm *model.VM, nic vsphere.NIC) []string {
+	var interfaceIps []string
+	for _, net := range vm.GuestNetworks {
+		if net.DeviceConfigId == nic.DeviceKey {
+			if isIPv4(net.IP) {
+				interfaceIps = append(interfaceIps, net.IP)
+			}
+		}
+	}
+	return interfaceIps
+}
+
 func (r *Builder) mapNetworks(vm *model.VM, object *cnv.VirtualMachineSpec) (err error) {
 	var kNetworks []cnv.Network
 	var kInterfaces []cnv.Interface
+	var staticIpInterfaces = make(map[string][]string)
 
 	numNetworks := 0
-	netMapIn := r.Context.Map.Network.Spec.Map
+	hasUDN := r.Plan.DestinationHasUdnNetwork(r.Destination)
+	pool := planbase.NewNADPool()
+	nicKeys, pairsBySource, err := r.buildNICResolver(vm.NICs)
+	if err != nil {
+		return
+	}
 
-	for _, nic := range vm.NICs {
-		mapped := r.findNetworkMapping(nic, netMapIn)
+	for i, nic := range vm.NICs {
+		pair, allocated := planbase.AllocateNetwork(pool, pairsBySource[nicKeys[i]])
+		var mapped *api.NetworkPair
+		if allocated {
+			mapped = &pair
+		}
 
 		// Skip if no valid mapping found or the destination type is Ignored
 		if mapped == nil || mapped.Destination.Type == Ignored {
@@ -782,20 +775,11 @@ func (r *Builder) mapNetworks(vm *model.VM, object *cnv.VirtualMachineSpec) (err
 
 		networkName := fmt.Sprintf("net-%v", numNetworks)
 
-		// If a name template is defined, try to use it
-		networkNameTemplate := r.getNetworkNameTemplate(vm)
-		if networkNameTemplate != "" {
-			templateData := api.NetworkNameTemplateData{
-				NetworkName:      mapped.Destination.Name,
-				NetworkNamespace: mapped.Destination.Namespace,
-				NetworkType:      mapped.Destination.Type,
-				NetworkIndex:     numNetworks,
-			}
-			if generated, err := r.executeTemplate(networkNameTemplate, &templateData); err == nil && generated != "" {
-				networkName = generated
-			} else {
-				r.Log.Info("Failed to generate network name using template, using default", "template", networkNameTemplate, "error", err)
-			}
+		// Generate network name using template if configured
+		if templatedName, templateErr := r.setNetworkNameFromTemplate(vm, mapped, numNetworks); templateErr != nil {
+			r.Log.Info("Failed to generate network name using template, using default", "error", templateErr)
+		} else if templatedName != "" {
+			networkName = templatedName
 		}
 		numNetworks++
 		kNetwork := cnv.Network{Name: networkName}
@@ -804,15 +788,29 @@ func (r *Builder) mapNetworks(vm *model.VM, object *cnv.VirtualMachineSpec) (err
 			interfaceModel = E1000e
 		}
 		kInterface := cnv.Interface{
-			Name:       networkName,
-			Model:      interfaceModel,
-			MacAddress: nic.MAC,
+			Name:  networkName,
+			Model: interfaceModel,
 		}
 
+		if !hasUDN || settings.Settings.UdnSupportsMac {
+			kInterface.MacAddress = nic.MAC
+		}
 		switch mapped.Destination.Type {
 		case Pod:
 			kNetwork.Pod = &cnv.PodNetwork{}
-			kInterface.Masquerade = &cnv.InterfaceMasquerade{}
+			if hasUDN {
+				kInterface.Binding = &cnv.PluginBinding{
+					Name: planbase.UdnL2bridge,
+				}
+				if r.Plan.Spec.PreserveStaticIPs {
+					ips := r.findInterfaceIps(vm, nic)
+					if len(ips) > 0 {
+						staticIpInterfaces[networkName] = ips
+					}
+				}
+			} else {
+				kInterface.Masquerade = &cnv.InterfaceMasquerade{}
+			}
 		case Multus:
 			kNetwork.Multus = &cnv.MultusNetwork{
 				NetworkName: path.Join(mapped.Destination.Namespace, mapped.Destination.Name),
@@ -826,23 +824,38 @@ func (r *Builder) mapNetworks(vm *model.VM, object *cnv.VirtualMachineSpec) (err
 
 	object.Template.Spec.Networks = kNetworks
 	object.Template.Spec.Domain.Devices.Interfaces = kInterfaces
+
+	if settings.Settings.StaticUdnIpAddresses && hasUDN && r.Plan.Spec.PreserveStaticIPs && len(staticIpInterfaces) > 0 {
+		var staticIpInterfacesAnnotation []byte
+		staticIpInterfacesAnnotation, err = json.Marshal(staticIpInterfaces)
+		if err != nil {
+			return err
+		}
+		if object.Template.ObjectMeta.Annotations == nil {
+			object.Template.ObjectMeta.Annotations = make(map[string]string)
+		}
+		object.Template.ObjectMeta.Annotations[planbase.AnnStaticUdnIp] = string(staticIpInterfacesAnnotation)
+	}
 	return
 }
 
-func (r *Builder) findNetworkMapping(nic vsphere.NIC, netMap []api.NetworkPair) *api.NetworkPair {
-	for i := range netMap {
-		candidate := &netMap[i]
+func (r *Builder) buildNICResolver(nics []vsphere.NIC) ([]string, map[string][]api.NetworkPair, error) {
+	pairsBySource := map[string][]api.NetworkPair{}
+	for _, pair := range r.Map.Network.Spec.Map {
 		network := &model.Network{}
-		if err := r.Source.Inventory.Find(network, candidate.Source); err != nil {
-			continue
+		if err := r.Source.Inventory.Find(network, pair.Source.Ref); err != nil {
+			return nil, nil, liberr.Wrap(err, "buildNICResolver, source", pair.Source.String())
 		}
-
-		if (network.Variant == vsphere.NetDvPortGroup || network.Variant == vsphere.OpaqueNetwork) &&
-			nic.Network.ID == network.Key || nic.Network.ID == network.ID {
-			return candidate
+		if network.Variant == vsphere.NetDvPortGroup || network.Variant == vsphere.OpaqueNetwork {
+			pairsBySource[network.Key] = append(pairsBySource[network.Key], pair)
 		}
+		pairsBySource[network.ID] = append(pairsBySource[network.ID], pair)
 	}
-	return nil
+	nicKeys := make([]string, len(nics))
+	for i, nic := range nics {
+		nicKeys[i] = nic.Network.ID
+	}
+	return nicKeys, pairsBySource, nil
 }
 
 func (r *Builder) mapInput(object *cnv.VirtualMachineSpec) {
@@ -874,29 +887,37 @@ func (r *Builder) mapMemory(vm *model.VM, object *cnv.VirtualMachineSpec) {
 	object.Template.Spec.Domain.Memory = &cnv.Memory{Guest: reservation}
 }
 
-func (r *Builder) mapCPU(vm *model.VM, object *cnv.VirtualMachineSpec) {
+func (r *Builder) mapCPU(vmRef ref.Ref, vm *model.VM, object *cnv.VirtualMachineSpec) {
 	object.Template.Spec.Domain.CPU = &cnv.CPU{
 		Sockets: uint32(vm.CpuCount / vm.CoresPerSocket),
 		Cores:   uint32(vm.CoresPerSocket),
 	}
-	if vm.NestedHVEnabled {
-		//FIXME: Replace in future with single feature flag for nested virt https://issues.redhat.com/browse/CNV-60150
-		var features []cnv.CPUFeature
-		features = append(features, cnv.CPUFeature{
-			Name:   "vmx",
-			Policy: "optional",
-		})
-		features = append(features, cnv.CPUFeature{
-			Name:   "svm",
-			Policy: "optional",
-		})
-		object.Template.Spec.Domain.CPU.Features = features
+	if enableNestedVirt := r.NestedVirtualizationSetting(vmRef, vm.NestedHVEnabled); enableNestedVirt != nil {
+		policy := "optional"
+		if !*enableNestedVirt {
+			policy = "disable"
+		}
+		object.Template.Spec.Domain.CPU.Features = append(object.Template.Spec.Domain.CPU.Features,
+			cnv.CPUFeature{Name: "vmx", Policy: policy},
+			cnv.CPUFeature{Name: "svm", Policy: policy},
+		)
 	}
+}
+
+func (r *Builder) getSystemSerial(vm *model.VM) string {
+	// On deployments where VMware serial number formtting is enabled,
+	if settings.Settings.VmwareSystemSerialNumber {
+		// we use the UUID to generate a VMware serial number.
+		return UUIDToVMwareSerial(vm.UUID)
+	}
+
+	// Default to using .config.uuid as the system serial number
+	return vm.UUID
 }
 
 func (r *Builder) mapFirmware(vm *model.VM, object *cnv.VirtualMachineSpec) {
 	firmware := &cnv.Firmware{
-		Serial: vm.UUID,
+		Serial: r.getSystemSerial(vm),
 	}
 	switch vm.Firmware {
 	case Efi:
@@ -904,7 +925,9 @@ func (r *Builder) mapFirmware(vm *model.VM, object *cnv.VirtualMachineSpec) {
 			EFI: &cnv.EFI{
 				SecureBoot: &vm.SecureBoot,
 			}}
-		// SecureBoot requires SMM to be enabled or KubeVirt webhook rejects the VM.
+		// SecureBoot requires SMM or the KubeVirt webhook rejects the VM.
+		// Upstream replaces Features wholesale here, discarding anything set
+		// earlier; only set the SMM field.
 		if vm.SecureBoot {
 			if object.Template.Spec.Domain.Features == nil {
 				object.Template.Spec.Domain.Features = &cnv.Features{}
@@ -919,54 +942,15 @@ func (r *Builder) mapFirmware(vm *model.VM, object *cnv.VirtualMachineSpec) {
 	object.Template.Spec.Domain.Firmware = firmware
 }
 
-func (r *Builder) filterDisksWithBus(disks []vsphere.Disk, bus string) []vsphere.Disk {
-	var resp []vsphere.Disk
-	for _, disk := range disks {
-		if disk.Bus == bus {
-			resp = append(resp, disk)
-		}
-	}
-	return resp
-}
-
-// The disks are first sorted by the buses going in order SCSI, SATA and IDE and within the controller the
-// disks are sorted by the key. This needs to be done because the virt-v2v outputs the files in an order,
-// which it gets from libvirt. The libvirt orders the devices starting with SCSI, SATA and IDE.
-// When we were sorting by the keys the order was IDE, SATA and SCSI. This cause that some PVs were populated by
-// incorrect disks.
-// https://github.com/libvirt/libvirt/blob/master/src/vmx/vmx.c#L1713
-func (r *Builder) sortedDisksByBusses(disks []vsphere.Disk, buses []string) []vsphere.Disk {
-	var resp []vsphere.Disk
-	for _, bus := range buses {
-		disksWithBus := r.filterDisksWithBus(disks, bus)
-		sort.Slice(disksWithBus, func(i, j int) bool {
-			return disksWithBus[i].Key < disksWithBus[j].Key
-		})
-		resp = append(resp, disksWithBus...)
-	}
-	return resp
-}
-
-func (r *Builder) sortedDisksAsLibvirt(disks []vsphere.Disk) []vsphere.Disk {
-	var buses = []string{container.SCSI, container.NVME, container.SATA, container.IDE}
-	return r.sortedDisksByBusses(disks, buses)
-}
-
-func (r *Builder) sortedDisksAsVmware(disks []vsphere.Disk) []vsphere.Disk {
-	var buses = []string{container.SATA, container.NVME, container.IDE, container.SCSI}
-	return r.sortedDisksByBusses(disks, buses)
-}
-
 func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims []*core.PersistentVolumeClaim, object *cnv.VirtualMachineSpec, sortByLibvirt bool) error {
 	var kVolumes []cnv.Volume
 	var kDisks []cnv.Disk
-	var templateErr error
 	var disks []vsphere.Disk
 
 	if sortByLibvirt {
-		disks = r.sortedDisksAsLibvirt(vm.Disks)
+		disks = vm.SortedDisksAsLibvirt()
 	} else {
-		disks = r.sortedDisksAsVmware(vm.Disks)
+		disks = vm.SortedDisksAsVmware()
 	}
 	pvcMap := make(map[string]*core.PersistentVolumeClaim)
 	for i := range persistentVolumeClaims {
@@ -975,14 +959,19 @@ func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims [
 		if source, ok := pvc.Annotations[planbase.AnnDiskSource]; ok {
 			pvcMap[trimBackingFileName(source)] = pvc
 		} else {
-			pvcMap[trimBackingFileName(pvc.Annotations[AnnImportBackingFile])] = pvc
+			pvcMap[trimBackingFileName(pvc.Annotations[planbase.AnnImportBackingFile])] = pvc
 		}
 	}
 
 	var bootDisk int
 	for _, vmConf := range r.Plan.Spec.VMs {
 		if vmConf.ID == vmRef.ID {
-			bootDisk = utils.GetBootDiskNumber(vmConf.RootDisk)
+			if vmConf.RootDisk != "" {
+				bootDisk = utils.GetBootDiskNumber(vmConf.RootDisk)
+			} else if vmStatus := r.getPlanVMStatus(vm); vmStatus != nil &&
+				vmStatus.DetectedBootDisk != nil && *vmStatus.DetectedBootDisk >= 0 {
+				bootDisk = *vmStatus.DetectedBootDisk
+			}
 			break
 		}
 	}
@@ -998,32 +987,21 @@ func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims [
 		}
 		volumeName := fmt.Sprintf("vol-%v", i)
 
-		// If the volume name template is set, use it to generate the volume name.
-		volumeNameTemplate := r.getVolumeNameTemplate(vm)
-		if volumeNameTemplate != "" {
-			// Create template data
-			templateData := api.VolumeNameTemplateData{
-				PVCName:     pvc.Name,
-				VolumeIndex: i,
-			}
+		// Generate volume name using template if configured
+		if templatedName, templateErr := r.setVolumeNameFromTemplate(vm, pvc.Name, i); templateErr != nil {
+			// Failed to generate volume name using template
+			r.Log.Info("Failed to generate volume name using template, using default name", "error", templateErr)
+		} else if templatedName != "" {
+			volumeName = templatedName
+		}
 
-			volumeName, templateErr = r.executeTemplate(volumeNameTemplate, &templateData)
-			if templateErr != nil {
-				// Failed to generate volume name using template
-				r.Log.Info("Failed to generate volume name using template, using default name", "template", volumeNameTemplate, "error", templateErr)
+		// Check if the generated name is longer than 63 characters
+		if len(volumeName) > 63 {
+			// If the generated name is longer than 63 characters, trancate it
+			newVolumeName := volumeName[:63]
+			r.Log.Info("Generated volume name is longer than 63 characters, truncating", "volumeName", volumeName, "newVolumeName", newVolumeName)
 
-				// fallback to default name and reset error
-				volumeName = fmt.Sprintf("vol-%v", i)
-			}
-
-			// check if the generated name is longer then 63 characters
-			if len(volumeName) > 63 {
-				// if the generated name is longer then 63 characters, trancate it
-				newVolumeName := volumeName[:63]
-				r.Log.Info("Generated volume name is longer than 63 characters, sanitizing it", "volumeName", volumeName, "newVolumeName", newVolumeName)
-
-				volumeName = newVolumeName
-			}
+			volumeName = newVolumeName
 		}
 
 		volume := cnv.Volume{
@@ -1040,13 +1018,17 @@ func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims [
 		if useCompatibilityModeBus(r.Plan) {
 			bus = cnv.DiskBusSATA
 		}
+		diskDevice := cnv.DiskDevice{
+			Disk: &cnv.DiskTarget{Bus: bus},
+		}
+		if disk.RDM && r.shouldRDMAsLun(vm) {
+			diskDevice = cnv.DiskDevice{
+				LUN: &cnv.LunTarget{Bus: cnv.DiskBusSCSI},
+			}
+		}
 		kubevirtDisk := cnv.Disk{
-			Name: volumeName,
-			DiskDevice: cnv.DiskDevice{
-				Disk: &cnv.DiskTarget{
-					Bus: bus,
-				},
-			},
+			Name:       volumeName,
+			DiskDevice: diskDevice,
 		}
 		if disk.Shared {
 			kubevirtDisk.Shareable = ptr.To(true)
@@ -1063,49 +1045,6 @@ func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims [
 		kVolumes = append(kVolumes, volume)
 		kDisks = append(kDisks, kubevirtDisk)
 	}
-	// 	if !*r.Plan.Provider.Source.Spec.ConvertDisk {
-	// 		tempBootVolume := cnv.Volume{
-	// 			Name: "containerdisk",
-	// 			VolumeSource: cnv.VolumeSource{
-	// 				ContainerDisk: &cnv.ContainerDiskSource{
-	// 					Image: "quay.io/arturshadnik/vmidisk-fedora41:latest",
-	// 				},
-	// 			},
-	// 		}
-	// 		cloudInitVolume := cnv.Volume{
-	// 			Name: "cloudinitdisk",
-	// 			VolumeSource: cnv.VolumeSource{
-	// 				CloudInitNoCloud: &cnv.CloudInitNoCloudSource{
-	// 					UserData: `#cloud-config
-	// password: fedora
-	// chpasswd:
-	//   expire: False
-	// ssh_pwauth: True`,
-	// 				},
-	// 			},
-	// 		}
-
-	// 		tempBootDisk := cnv.Disk{
-	// 			Name: "containerdisk",
-	// 			DiskDevice: cnv.DiskDevice{
-	// 				Disk: &cnv.DiskTarget{
-	// 					Bus: Virtio,
-	// 				},
-	// 			},
-	// 			BootOrder: ptr.To(uint(1)),
-	// 		}
-
-	// 		cloudInitDisk := cnv.Disk{
-	// 			Name: "cloudinitdisk",
-	// 			DiskDevice: cnv.DiskDevice{
-	// 				Disk: &cnv.DiskTarget{
-	// 					Bus: Virtio,
-	// 				},
-	// 			},
-	// 		}
-	// kVolumes = append(kVolumes, tempBootVolume, cloudInitVolume)
-	// kDisks = append(kDisks, tempBootDisk, cloudInitDisk)
-	// }
 	if len(kDisks) == 0 {
 		r.Log.Info("No disks were successfully mapped", "vm", vm.Name, "vmID", vmRef.ID)
 		for _, d := range disks {
@@ -1147,7 +1086,7 @@ func (r *Builder) Tasks(vmRef ref.Ref) (list []*plan.Task, err error) {
 		err = liberr.Wrap(err, "vm", vmRef.String())
 		return
 	}
-	if !r.Context.Plan.Spec.MigrateSharedDisks {
+	if !r.shouldMigrateSharedDisks(vm) {
 		vm.RemoveSharedDisks()
 	}
 	for _, disk := range vm.Disks {
@@ -1155,7 +1094,7 @@ func (r *Builder) Tasks(vmRef ref.Ref) (list []*plan.Task, err error) {
 		list = append(
 			list,
 			&plan.Task{
-				Name: baseVolume(disk.File, r.Plan.Spec.Warm),
+				Name: baseVolume(disk.File, r.Plan.IsWarm()),
 				Progress: libitr.Progress{
 					Total: mB,
 				},
@@ -1166,6 +1105,14 @@ func (r *Builder) Tasks(vmRef ref.Ref) (list []*plan.Task, err error) {
 	}
 
 	return
+}
+
+func (r *Builder) ConfigMaps(vmRef ref.Ref) (list []core.ConfigMap, err error) {
+	return nil, nil
+}
+
+func (r *Builder) Secrets(vmRef ref.Ref) (list []core.Secret, err error) {
+	return nil, nil
 }
 
 func (r *Builder) PreferenceName(vmRef ref.Ref, configMap *core.ConfigMap) (name string, err error) {
@@ -1212,12 +1159,15 @@ func (r *Builder) TemplateLabels(vmRef ref.Ref) (labels map[string]string, err e
 
 // Return a stable identifier for a VDDK DataVolume.
 func (r *Builder) ResolveDataVolumeIdentifier(dv *cdi.DataVolume) string {
-	return baseVolume(dv.ObjectMeta.Annotations[planbase.AnnDiskSource], r.Plan.Spec.Warm)
+	return baseVolume(dv.ObjectMeta.Annotations[planbase.AnnDiskSource], r.Plan.IsWarm())
 }
 
 // Return a stable identifier for a PersistentDataVolume.
 func (r *Builder) ResolvePersistentVolumeClaimIdentifier(pvc *core.PersistentVolumeClaim) string {
-	return baseVolume(pvc.Annotations[AnnImportBackingFile], r.Plan.Spec.Warm)
+	if source, ok := pvc.Annotations[planbase.AnnDiskSource]; ok {
+		return baseVolume(source, r.Plan.IsWarm())
+	}
+	return baseVolume(pvc.Annotations[planbase.AnnImportBackingFile], r.Plan.IsWarm())
 }
 
 // Load
@@ -1332,7 +1282,10 @@ func (r *Builder) LunPersistentVolumeClaims(vmRef ref.Ref) (pvcs []core.Persiste
 // For now this method returns true, if there's a mapping (backend by copy-offload-mapping ConfigMap, that
 // maps StoragetClasses to Vsphere data stores
 func (r *Builder) SupportsVolumePopulators() bool {
-	if !settings.Settings.Features.CopyOffload || r.Plan.Spec.Warm {
+	if !settings.Settings.Features.CopyOffload {
+		return false
+	}
+	if r.Context.Map.Storage == nil {
 		return false
 	}
 	dsMapIn := r.Context.Map.Storage.Spec.Map
@@ -1364,48 +1317,134 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 		return
 	}
 
+	// Get a list of existing PVCs to avoid creating duplicates
+	pvcLabels := map[string]string{
+		"migration": string(r.Migration.UID),
+		"vmID":      vmRef.ID,
+	}
+	pvcList := &core.PersistentVolumeClaimList{}
+	err = r.Destination.Client.List(
+		context.TODO(),
+		pvcList,
+		&client.ListOptions{
+			LabelSelector: labels.SelectorFromSet(pvcLabels),
+			Namespace:     r.Plan.Spec.TargetNamespace,
+		})
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+
+	if !r.shouldMigrateSharedDisks(vm) {
+		vm.RemoveSharedDisks()
+	}
+	// Get sorted disks to maintain consistent indexing with other parts of the system
+	sortedDisks := vm.SortedDisksAsVmware()
+
 	dsMapIn := r.Context.Map.Storage.Spec.Map
+	naaPrefixes := loadNAAPrefixes(r.Client)
+	dsNaaMap := make(map[string]string)
 	for i := range dsMapIn {
 		mapped := &dsMapIn[i]
-		ref := mapped.Source
+		sourceRef := mapped.Source
 		ds := &model.Datastore{}
-		fErr := r.Source.Inventory.Find(ds, ref)
+		fErr := r.Source.Inventory.Find(ds, sourceRef)
 		if fErr != nil {
 			err = fErr
 			return
 		}
 
 		pvblock := core.PersistentVolumeBlock
-		for _, disk := range vm.Disks {
-			if disk.Datastore.ID == ds.ID {
-				storageClass := mapped.Destination.StorageClass
+		for diskIndex, disk := range sortedDisks {
+			// Resolve the effective storage map entry for this disk.
+			// RDM disks are matched by NAA vendor prefix (not datastore)
+			// because the RDM's backing LUN may reside on a different
+			// storage array than the VM's datastore.
+			var effectiveMapped *api.StoragePair
+			if disk.RDM && disk.DeviceName != "" {
+				if i > 0 {
+					continue // RDM disks are processed once, in the first outer iteration
+				}
+				rdmVendor, matched := vendorFromNAA(disk.DeviceName, naaPrefixes)
+				if !matched {
+					return nil, fmt.Errorf(
+						"RDM disk (key=%d) has device name %q that does not match any known storage vendor NAA prefix",
+						disk.Key, disk.DeviceName)
+				}
+				candidates := findStorageMapEntriesForVendor(dsMapIn, rdmVendor)
+				switch len(candidates) {
+				case 0:
+					return nil, fmt.Errorf(
+						"no storage map entry with offload plugin found for vendor %q; "+
+							"add a storage map entry with an offload plugin for this vendor", rdmVendor)
+				case 1:
+					effectiveMapped = candidates[0]
+				default:
+					effectiveMapped, err = disambiguateRDMByNAA(r.Source.Inventory, candidates, disk.DeviceName, naaPrefixes)
+					if err != nil {
+						return nil, err
+					}
+				}
+				r.Log.Info("RDM disk resolved to storage vendor by NAA",
+					"diskKey", disk.Key, "deviceName", disk.DeviceName,
+					"vendor", rdmVendor, "storageClass", effectiveMapped.Destination.StorageClass)
+			} else if disk.Datastore.ID == ds.ID {
+				effectiveMapped = mapped
+			} else {
+				continue
+			}
 
+			if effectiveMapped.OffloadPlugin == nil || effectiveMapped.OffloadPlugin.VSphereXcopyPluginConfig == nil {
+				continue
+			}
+
+			{
+				// For RDM disks, look up the NAA from the resolved storage map entry's
+				// source datastore (not the outer-loop ds) since the RDM may be on a
+				// different array. Use the storage map ref directly as a synthetic
+				// Datastore to ensure the correct cache key and vSphere query.
+				naaDS := ds
+				if disk.RDM && disk.DeviceName != "" {
+					naaDS = &model.Datastore{}
+					naaDS.ID = effectiveMapped.Source.ID
+					naaDS.Name = effectiveMapped.Source.Name
+				}
+				naa := r.lookupDatastoreNAA(naaDS, dsNaaMap)
+				storageClass := effectiveMapped.Destination.StorageClass
 				r.Log.Info(fmt.Sprintf("getting storage mapping by storage class %q and datastore %v datastore name %s datastore", storageClass, disk.Datastore, disk.Datastore))
 				vsphereInstance := r.Context.Plan.Provider.Source.GetName()
-				storageVendorProduct := mapped.OffloadPlugin.VSphereXcopyPluginConfig.StorageVendorProduct
-				storageVendorSecretRef := mapped.OffloadPlugin.VSphereXcopyPluginConfig.SecretRef
+				storageVendorProduct := effectiveMapped.OffloadPlugin.VSphereXcopyPluginConfig.StorageVendorProduct
+				storageVendorSecretRef := effectiveMapped.OffloadPlugin.VSphereXcopyPluginConfig.SecretRef
 
 				r.Log.Info(fmt.Sprintf("vsphere provider %v storage vendor product %v storage secret name %v ", vsphereInstance, storageVendorProduct, storageVendorSecretRef))
 
 				if vsphereInstance == "" || storageVendorProduct == "" || storageVendorSecretRef == "" {
 					return nil, fmt.Errorf(
-						"The offload pluging configuration has missing details. Can't continue with PVC and populator resources creation.")
+						"the offload plugin configuration has missing details, cannot continue with PVC and populator resource creation")
 				}
 
 				namespace := r.Plan.Spec.TargetNamespace
-				// pvs names needs to be less than 63, this leaves 53 chars
-				// for the plan and vm name (2 dashes and 8 chars uuid)
-				commonName := fmt.Sprintf("%s-%s-%s", r.Plan.Name, vm.Name, uuid.New().String()[:8])
 				labels := map[string]string{
 					"migration": string(r.Migration.UID),
+					"plan":      string(r.Plan.GetUID()),
 					// we need uniqness and a value which is less than 64 chars, hence using vmRef.id + disk.key
 					"vmdkKey": fmt.Sprint(disk.Key),
 					"vmID":    vmRef.ID,
 				}
+				// Only add the NAA label if it's a valid Kubernetes label value
+				if errs := k8svalidation.IsValidLabelValue(naa); len(errs) == 0 {
+					labels[TemplateNAALabel] = naa
+				}
+				if errs := k8svalidation.IsValidLabelValue(vm.Host); vm.Host != "" && len(errs) == 0 {
+					labels["sourceHost"] = vm.Host
+				}
+
+				if disk.Shared {
+					labels[Shareable] = "true"
+				}
 				r.Log.Info("target namespace for migration", "namespace", namespace)
 				pvc := core.PersistentVolumeClaim{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:        commonName,
 						Namespace:   namespace,
 						Labels:      labels,
 						Annotations: annotations,
@@ -1421,14 +1460,13 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 						DataSourceRef: &core.TypedObjectReference{
 							APIGroup: &api.SchemeGroupVersion.Group,
 							Kind:     api.VSphereXcopyVolumePopulatorKind,
-							Name:     commonName,
 						},
 					},
 				}
-				// set the access mode and volume mode if they were specified in the storage map.
-				// otherwise, let the storage profile decide the default values.
-				if mapped.Destination.AccessMode != "" {
-					pvc.Spec.AccessModes = []core.PersistentVolumeAccessMode{mapped.Destination.AccessMode}
+				if effectiveMapped.Destination.AccessMode != "" {
+					pvc.Spec.AccessModes = []core.PersistentVolumeAccessMode{effectiveMapped.Destination.AccessMode}
+				} else {
+					pvc.Spec.AccessModes = []core.PersistentVolumeAccessMode{core.ReadWriteMany}
 				}
 
 				if annotations == nil {
@@ -1436,55 +1474,162 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 				} else {
 					pvc.Annotations = annotations
 				}
-				pvc.Annotations[planbase.AnnDiskSource] = baseVolume(disk.File, false)
-				pvc.Annotations["copy-offload"] = baseVolume(disk.File, false)
-				pvcs = append(pvcs, &pvc)
+				pvc.Annotations[planbase.AnnDiskSource] = baseVolume(disk.File, r.Plan.IsWarm())
+				pvc.Annotations["copy-offload"] = baseVolume(disk.File, r.Plan.IsWarm())
 
+				// Apply PVC template naming if configured, replacing the commonName
+				if err := r.setColdMigrationDefaultPVCName(&pvc.ObjectMeta, vm, diskIndex, disk); err != nil {
+					r.Log.Info("Failed to set PVC name from template for populator volume, using default name", "error", err)
+				}
+				if pvc.ObjectMeta.GenerateName != "" {
+					suffix := r.generatePopulatorSuffix(string(r.Migration.UID), vmRef.ID, disk.Key, disk.File, diskIndex)
+					pvc.ObjectMeta.Name = strings.TrimSuffix(pvc.ObjectMeta.GenerateName, "-") + "-" + suffix
+					pvc.ObjectMeta.GenerateName = ""
+				}
+
+				// populator name is the name of the populator, and we can't use generateName for the populator
+				populatorName := pvc.ObjectMeta.Name
+				r.Log.V(2).Info("Initial populator name from new PVC", "populatorName", populatorName, "pvcName", pvc.ObjectMeta.Name)
+
+				// For warm migration, add annotations to jump-start the DataVolume
+				v := r.getPlanVMStatus(vm)
+				if v != nil && v.Warm != nil {
+					url := r.Source.Provider.Spec.URL
+					thumbprint := r.Source.Provider.Status.Fingerprint
+					url, thumbprint, err = r.applyHostsConfig(vmRef, url, thumbprint)
+					if err != nil {
+						return nil, err
+					}
+
+					pvc.Annotations[planbase.AnnEndpoint] = url
+					pvc.Annotations[planbase.AnnImportBackingFile] = baseVolume(disk.File, r.Plan.IsWarm())
+					pvc.Annotations[planbase.AnnUUID] = vm.UUID
+					pvc.Annotations[planbase.AnnThumbprint] = thumbprint
+					pvc.Annotations[planbase.AnnVddkInitImageURL] = settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
+					pvc.Annotations[planbase.AnnPodPhase] = "Succeeded"
+					pvc.Annotations[planbase.AnnSource] = "vddk"
+
+					n := len(v.Warm.Precopies)
+					if n > 0 { // Should be 1 at this point
+						snapshot := v.Warm.Precopies[n-1].Snapshot
+						pvc.Annotations[planbase.AnnFinalCheckpoint] = "false"
+						pvc.Annotations[planbase.AnnCurrentCheckpoint] = snapshot
+						pvc.Annotations[planbase.AnnPreviousCheckpoint] = ""
+
+						copied := fmt.Sprintf("%s.%s", planbase.AnnCheckpointsCopied, snapshot)
+						pvc.Annotations[copied] = "xcopy-initial-offload"                // Any value should work here
+						pvc.Annotations[planbase.AnnImportPod] = "xcopy-initial-offload" // Should match above
+					}
+				}
+
+				// Update DataSourceRef to point to the volume populator
+				pvc.Spec.DataSourceRef.Name = populatorName
+				diskSecretName := fmt.Sprintf("%s-%d", secretName, diskIndex)
+				pvc.Annotations[planbase.AnnSecret] = diskSecretName
+				pvcs = append(pvcs, &pvc)
 				vp := api.VSphereXcopyVolumePopulator{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      commonName,
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: "v1",
+								Kind:       "PersistentVolumeClaim",
+								Name:       pvc.Name,
+								UID:        pvc.UID,
+							},
+						},
+						Name:      populatorName,
 						Namespace: namespace,
 						Labels:    labels,
 					},
 					Spec: api.VSphereXcopyVolumePopulatorSpec{
 						VmId:                 vmRef.ID,
-						VmdkPath:             disk.File,
-						SecretName:           secretName,
+						VmdkPath:             baseVolume(disk.File, r.Plan.IsWarm()),
+						SecretName:           diskSecretName,
 						StorageVendorProduct: string(storageVendorProduct),
 					},
 				}
-
-				// Ensure a Secret combining Vsphere and Storage secrets
-				err = r.mergeSecrets(secretName, namespace, storageVendorSecretRef, r.Source.Provider.Namespace)
-				if err != nil {
-					return nil, fmt.Errorf("failed to merge secrets for popoulators %w", err)
+				createdPVC := &core.PersistentVolumeClaim{}
+				// Check if a PVC was created for the current disk
+				if !r.isPVCExistsInList(&pvc, pvcList) {
+					r.Log.Info("Creating pvc", "pvc", pvc)
+					err = r.Destination.Client.Create(context.TODO(), &pvc, &client.CreateOptions{})
+					if err != nil {
+						if k8serr.IsAlreadyExists(err) {
+							r.Log.Info("PVC already exists in Kubernetes, skipping", "pvcName", pvc.ObjectMeta.Name)
+							continue
+						}
+						return nil, err
+					}
 				}
-				// TODO should we handle if already exists due to re-entry? if the former
-				// reconcile was successful in creating the pvc but failed after that, e.g when
-				// creating the volumepopulator resouce failed
-				r.Log.Info("Creating pvc", "pvc", pvc)
-				err = r.Destination.Client.Create(context.TODO(), &pvc, &client.CreateOptions{})
+				// Fetch the PVC back to get the UID assigned by Kubernetes
+				err = r.Destination.Client.Get(context.TODO(), client.ObjectKey{
+					Namespace: pvc.Namespace,
+					Name:      pvc.Name,
+				}, createdPVC)
 				if err != nil {
-					// ignore if already exists?
 					return nil, err
+				}
+
+				vp.OwnerReferences[0].UID = createdPVC.UID
+				err = r.mergeSecrets(secretName, namespace, storageVendorSecretRef, r.Source.Provider.Namespace, diskSecretName, createdPVC)
+				if err != nil {
+					return nil, fmt.Errorf("failed to merge secrets for populators %w", err)
 				}
 
 				r.Log.Info("Ensuring a populator service account")
-				err := r.ensurePopulatorServiceAccount(namespace)
+				err = r.ensurePopulatorServiceAccount(namespace)
 				if err != nil {
 					return nil, err
 				}
-				r.Log.Info("Creating the populator resource", "VSphereXcopyVolumePopulator", vp)
-				err = r.Destination.Client.Create(context.TODO(), &vp, &client.CreateOptions{})
+				err = r.ensureXCopyVolumePopulator(&vp)
 				if err != nil {
 					return nil, err
 				}
-
+			}
+		}
+		if len(pvcs) > 0 {
+			secret := &core.Secret{}
+			err = r.Destination.Client.Get(context.TODO(), client.ObjectKey{
+				Namespace: r.Plan.Spec.TargetNamespace,
+				Name:      secretName,
+			}, secret)
+			if err != nil {
+				return nil, err
+			}
+			err := controllerutil.SetOwnerReference(pvcs[0], secret, r.Scheme())
+			if err != nil {
+				r.Log.Error(err, "Failed to set pvc as owner reference for migration secret '%s'", secret.Name)
+			} else {
+				err = r.Destination.Client.Update(context.TODO(), secret)
+				if err != nil {
+					r.Log.Error(err, "Failed to update migration secret '%s' with owner reference", secret.Name)
+				}
 			}
 		}
 	}
 
 	return pvcs, nil
+}
+
+// lookupDatastoreNAA returns the NAA identifier for a datastore, using the
+// cache or querying vSphere if not cached yet.
+func (r *Builder) lookupDatastoreNAA(ds *model.Datastore, cache map[string]string) string {
+	if naa, ok := cache[ds.ID]; ok {
+		return naa
+	}
+	vsphereClient := &Client{Context: r.Context}
+	if err := vsphereClient.connect(); err != nil {
+		r.Log.Error(err, "failed to connect to vSphere client, continue without storage affinity label")
+		cache[ds.ID] = ""
+		return ""
+	}
+	defer vsphereClient.Close()
+	naa, err := vsphereClient.getNAAFromDatastore(context.TODO(), ref.Ref{ID: ds.ID, Name: ds.Name})
+	if err != nil {
+		r.Log.Error(err, "failed to get NAA from datastore, continue without storage affinity label", "datastore", ds.Name)
+	}
+	cache[ds.ID] = naa
+	return naa
 }
 
 func (r *Builder) PrePopulateActions(c planbase.Client, vmRef ref.Ref) (ready bool, err error) {
@@ -1497,6 +1642,11 @@ func (r *Builder) PopulatorTransferredBytes(pvc *core.PersistentVolumeClaim) (tr
 	vmId := pvc.Labels["vmID"]
 	populatorCr, err := r.getVolumePopulator(vmId, vmdkKey)
 	if err != nil {
+		return
+	}
+
+	if populatorCr.Status.Progress == "" {
+		transferredBytes = 0
 		return
 	}
 
@@ -1529,15 +1679,26 @@ func (r *Builder) getVolumePopulator(vmId, vmdkKey string) (api.VSphereXcopyVolu
 	}
 	if len(list.Items) == 0 {
 		return api.VSphereXcopyVolumePopulator{},
-			k8serr.NewNotFound(
-				api.SchemeGroupVersion.WithResource("VSphereXcopyVolumePopulator").GroupResource(), vmdkKey)
+			liberr.New(
+				"No VSphereXcopyVolumePopulator CR found - populator may not have been created or was deleted",
+				"namespace", r.Plan.Spec.TargetNamespace,
+				"migration", string(r.Migration.UID),
+				"vmID", vmId,
+				"vmdkKey", vmdkKey)
 	}
 	if len(list.Items) > 1 {
+		names := make([]string, len(list.Items))
+		for i, item := range list.Items {
+			names[i] = item.Name
+		}
 		return api.VSphereXcopyVolumePopulator{},
 			liberr.New(
-				"Multiple VSphereXcopyVolumePopulator CRs found for the same VMDK disk (with special chars replaced with _)",
-				"vmdkKey",
-				vmdkKey)
+				"Multiple VSphereXcopyVolumePopulator CRs found for the same VMDK disk",
+				"namespace", r.Plan.Spec.TargetNamespace,
+				"migration", string(r.Migration.UID),
+				"vmID", vmId,
+				"vmdkKey", vmdkKey,
+				"populators", strings.Join(names, ", "))
 	}
 	return list.Items[0], nil
 }
@@ -1549,25 +1710,61 @@ func (r *Builder) SetPopulatorDataSourceLabels(vmRef ref.Ref, pvcs []*core.Persi
 
 func (r *Builder) GetPopulatorTaskName(pvc *core.PersistentVolumeClaim) (taskName string, err error) {
 	// copy-offload only
-	taskName = pvc.Annotations[planbase.AnnDiskSource]
+	taskName = baseVolume(pvc.Annotations[planbase.AnnDiskSource], r.Plan.IsWarm())
 	return
 }
 
 // getPlanVM get the plan VM for the given vsphere VM
 func (r *Builder) getPlanVM(vm *model.VM) *plan.VM {
-	for _, planVM := range r.Plan.Spec.VMs {
-		if planVM.ID == vm.ID {
-			return &planVM
+	for i := range r.Plan.Spec.VMs {
+		planVM := &r.Plan.Spec.VMs[i]
+		if planVM.ID != "" && planVM.ID == vm.ID {
+			return planVM
+		}
+	}
+	// Fallback: match by Name when the spec VM has no ID
+	for i := range r.Plan.Spec.VMs {
+		planVM := &r.Plan.Spec.VMs[i]
+		if planVM.ID == "" && planVM.Name != "" && planVM.Name == vm.Name {
+			return planVM
 		}
 	}
 
 	return nil
 }
 
+// shouldMigrateSharedDisks returns whether shared disks should be migrated for the given VM.
+// VM-level setting takes precedence; falls back to plan-level setting.
+func (r *Builder) shouldMigrateSharedDisks(vm *model.VM) bool {
+	if planVM := r.getPlanVM(vm); planVM != nil && planVM.MigrateSharedDisks != nil {
+		return *planVM.MigrateSharedDisks
+	}
+	return r.Context.Plan.Spec.MigrateSharedDisks
+}
+
+// shouldRDMAsLun returns whether RDM disks should be mapped as LUN devices for the given VM.
+// VM-level setting takes precedence; falls back to plan-level setting.
+func (r *Builder) shouldRDMAsLun(vm *model.VM) bool {
+	if planVM := r.getPlanVM(vm); planVM != nil && planVM.RDMAsLun != nil {
+		return *planVM.RDMAsLun
+	}
+	return r.Context.Plan.Spec.RDMAsLun
+}
+
 // getPlanVMStatus get the plan VM status for the given vsphere VM
 func (r *Builder) getPlanVMStatus(vm *model.VM) *plan.VMStatus {
+	if r.Plan == nil || r.Plan.Status.Migration.VMs == nil {
+		return nil
+	}
+
 	for _, planVMStatus := range r.Plan.Status.Migration.VMs {
-		if planVMStatus.ID == vm.ID {
+		if planVMStatus.ID != "" && planVMStatus.ID == vm.ID {
+			return planVMStatus
+		}
+	}
+	// Fallback: match by Name when the status VM has no ID
+	for _, planVMStatus := range r.Plan.Status.Migration.VMs {
+		if planVMStatus.ID == "" && planVMStatus.Name != "" && planVMStatus.Name == vm.Name {
 			return planVMStatus
 		}
 	}
@@ -1579,20 +1776,188 @@ func (r *Builder) executeTemplate(templateText string, templateData any) (string
 	return templateutil.ExecuteTemplate(templateText, templateData)
 }
 
-// GetPVCNameTemplate returns the PVC name template
-func (r *Builder) getPVCNameTemplate(vm *model.VM) string {
-	// Get plan VM
-	planVM := r.getPlanVM(vm)
-	if planVM == nil {
-		return ""
+// TemplateConfig defines configuration for template-based naming
+type TemplateConfig struct {
+	Template        string
+	UseGenerateName bool
+	TemplateType    string
+}
+
+// setObjectNameFromTemplate sets the Name or GenerateName field on an object's metadata
+// based on a template and template data. This refactors the common naming logic.
+func (r *Builder) setObjectNameFromTemplate(objectMeta *metav1.ObjectMeta, templateConfig TemplateConfig, templateData any) error {
+	if templateConfig.Template == "" {
+		return nil
 	}
 
-	// if vm.PVCNameTemplate is set, use it
-	if planVM.PVCNameTemplate != "" {
+	generatedName, err := r.executeTemplate(templateConfig.Template, templateData)
+	if err != nil {
+		r.Log.Info("Failed to generate name using template",
+			"template", templateConfig.Template,
+			"templateType", templateConfig.TemplateType,
+			"error", err)
+		return err
+	}
+
+	if generatedName == "" {
+		return nil
+	}
+
+	// Validate that template output is a valid k8s label
+	errs := k8svalidation.IsDNS1123Label(generatedName)
+	if len(errs) > 0 {
+		err = errors.New("generated name is not valid")
+		r.Log.Info("Generated name is not a valid k8s label",
+			"template", templateConfig.Template,
+			"templateType", templateConfig.TemplateType,
+			"generatedName", generatedName,
+			"errors", errs,
+			"error", err)
+		return err
+	}
+
+	if templateConfig.UseGenerateName {
+		// Ensure generatedName ends with "-"
+		if !strings.HasSuffix(generatedName, "-") {
+			generatedName = generatedName + "-"
+		}
+		objectMeta.GenerateName = generatedName
+	} else {
+		// Ensure generatedName does not end with "-"
+		if strings.HasSuffix(generatedName, "-") {
+			generatedName = strings.Trim(generatedName, "-")
+		}
+		objectMeta.Name = generatedName
+	}
+
+	return nil
+}
+
+func (r *Builder) setColdMigrationDefaultPVCName(objectMeta *metav1.ObjectMeta, vm *model.VM, diskIndex int, disk vsphere.Disk) error {
+	pvcNameTemplate := r.getPVCNameTemplate(vm)
+	if pvcNameTemplate == "" {
+		pvcNameTemplate = "{{trunc 4 .PlanName}}-{{trunc 4 .VmName}}-disk-{{.DiskIndex}}"
+	}
+
+	planVM := r.getPlanVM(vm)
+	rootDiskIndex := 0
+	if planVM != nil {
+		rootDiskIndex = utils.GetBootDiskNumber(planVM.RootDisk)
+	}
+
+	templateData := api.VSpherePVCNameTemplateData{
+		VmName:         r.getPlanVMSafeName(vm),
+		PlanName:       r.Plan.Name,
+		DiskIndex:      diskIndex,
+		RootDiskIndex:  rootDiskIndex,
+		Shared:         disk.Shared,
+		FileName:       extractDiskFileName(baseVolume(disk.File, false)),
+		WinDriveLetter: disk.WinDriveLetter,
+	}
+
+	templateConfig := TemplateConfig{
+		Template:        pvcNameTemplate,
+		UseGenerateName: r.Plan.Spec.PVCNameTemplateUseGenerateName,
+		TemplateType:    "PVC",
+	}
+
+	return r.setObjectNameFromTemplate(objectMeta, templateConfig, &templateData)
+
+}
+
+// setPVCNameFromTemplate sets PVC name/generateName using the PVC template
+func (r *Builder) setPVCNameFromTemplate(objectMeta *metav1.ObjectMeta, vm *model.VM, diskIndex int, disk vsphere.Disk) error {
+	pvcNameTemplate := r.getPVCNameTemplate(vm)
+	if pvcNameTemplate == "" {
+		return nil
+	}
+
+	// Get the VM root disk index
+	planVM := r.getPlanVM(vm)
+	rootDiskIndex := 0
+	if planVM != nil {
+		rootDiskIndex = utils.GetBootDiskNumber(planVM.RootDisk)
+	}
+
+	isWarm := r.Plan.IsWarm()
+
+	// Get plan VM status
+	planVMStatus := r.getPlanVMStatus(vm)
+
+	// Resolve names with safe fallbacks
+	vmName := vm.Name
+	targetVmName := ""
+	if planVMStatus != nil && planVMStatus.NewName != "" {
+		targetVmName = planVMStatus.NewName
+	} else {
+		// Best-effort DNS1123-safe fallback
+		targetVmName = utils.ChangeVmName(vmName)
+	}
+
+	// Create template data
+	templateData := api.VSpherePVCNameTemplateData{
+		VmName:         vmName,
+		TargetVmName:   targetVmName,
+		PlanName:       r.Plan.Name,
+		DiskIndex:      diskIndex,
+		RootDiskIndex:  rootDiskIndex,
+		Shared:         disk.Shared,
+		FileName:       extractDiskFileName(baseVolume(disk.File, isWarm)),
+		WinDriveLetter: disk.WinDriveLetter,
+	}
+
+	templateConfig := TemplateConfig{
+		Template:        pvcNameTemplate,
+		UseGenerateName: r.Plan.Spec.PVCNameTemplateUseGenerateName,
+		TemplateType:    "PVC",
+	}
+
+	return r.setObjectNameFromTemplate(objectMeta, templateConfig, &templateData)
+}
+
+// setVolumeNameFromTemplate generates volume name using volume template
+func (r *Builder) setVolumeNameFromTemplate(vm *model.VM, pvcName string, volumeIndex int) (string, error) {
+	volumeNameTemplate := r.getVolumeNameTemplate(vm)
+	if volumeNameTemplate == "" {
+		return "", nil
+	}
+
+	// Create template data
+	templateData := api.VolumeNameTemplateData{
+		PVCName:     pvcName,
+		VolumeIndex: volumeIndex,
+	}
+
+	return r.executeTemplate(volumeNameTemplate, &templateData)
+}
+
+// setNetworkNameFromTemplate generates network name using network template
+func (r *Builder) setNetworkNameFromTemplate(vm *model.VM, mapped *api.NetworkPair, networkIndex int) (string, error) {
+	networkNameTemplate := r.getNetworkNameTemplate(vm)
+	if networkNameTemplate == "" {
+		return "", nil
+	}
+
+	// Create template data
+	templateData := api.NetworkNameTemplateData{
+		NetworkName:      mapped.Destination.Name,
+		NetworkNamespace: mapped.Destination.Namespace,
+		NetworkType:      mapped.Destination.Type,
+		NetworkIndex:     networkIndex,
+	}
+
+	return r.executeTemplate(networkNameTemplate, &templateData)
+}
+
+// GetPVCNameTemplate returns the PVC name template
+func (r *Builder) getPVCNameTemplate(vm *model.VM) string {
+	// Check VM-level template first
+	planVM := r.getPlanVM(vm)
+	if planVM != nil && planVM.PVCNameTemplate != "" {
 		return planVM.PVCNameTemplate
 	}
 
-	// if planSpec.PVCNameTemplate is set, use it
+	// Check Plan-level template
 	if r.Plan.Spec.PVCNameTemplate != "" {
 		return r.Plan.Spec.PVCNameTemplate
 	}
@@ -1600,10 +1965,10 @@ func (r *Builder) getPVCNameTemplate(vm *model.VM) string {
 	return ""
 }
 
-// getPlenVMSafeName returns a safe name for the VM
+// getPlanVMSafeName returns a safe name for the VM
 // that can be used in the template output
 // The name is sanitized to be a valid k8s label
-func (r *Builder) getPlenVMSafeName(vm *model.VM) string {
+func (r *Builder) getPlanVMSafeName(vm *model.VM) string {
 	// Default to vm name
 	newName := vm.Name
 
@@ -1636,18 +2001,13 @@ func (r *Builder) getPlenVMSafeName(vm *model.VM) string {
 
 // getVolumeNameTemplate returns the volume name template
 func (r *Builder) getVolumeNameTemplate(vm *model.VM) string {
-	// Get plan VM
+	// Check VM-level template first
 	planVM := r.getPlanVM(vm)
-	if planVM == nil {
-		return ""
-	}
-
-	// if vm.VolumeNameTemplate is set, use it
-	if planVM.VolumeNameTemplate != "" {
+	if planVM != nil && planVM.VolumeNameTemplate != "" {
 		return planVM.VolumeNameTemplate
 	}
 
-	// if planSpec.VolumeNameTemplate is set, use it
+	// Check Plan-level template
 	if r.Plan.Spec.VolumeNameTemplate != "" {
 		return r.Plan.Spec.VolumeNameTemplate
 	}
@@ -1657,18 +2017,13 @@ func (r *Builder) getVolumeNameTemplate(vm *model.VM) string {
 
 // getNetworkNameTemplate returns the network name template
 func (r *Builder) getNetworkNameTemplate(vm *model.VM) string {
-	// Get plan VM
+	// Check VM-level template first
 	planVM := r.getPlanVM(vm)
-	if planVM == nil {
-		return ""
-	}
-
-	// if vm.NetworkNameTemplate is set, use it
-	if planVM.NetworkNameTemplate != "" {
+	if planVM != nil && planVM.NetworkNameTemplate != "" {
 		return planVM.NetworkNameTemplate
 	}
 
-	// if planSpec.NetworkNameTemplate is set, use it
+	// Check Plan-level template
 	if r.Plan.Spec.NetworkNameTemplate != "" {
 		return r.Plan.Spec.NetworkNameTemplate
 	}
@@ -1677,13 +2032,28 @@ func (r *Builder) getNetworkNameTemplate(vm *model.VM) string {
 }
 
 // MergeSecrets merges the storage vendor secret into the migration secret
-func (r *Builder) mergeSecrets(migrationSecret, migrationSecretNS, storageVendorSecret, storageVendorSecretNS string) error {
-	dst := &core.Secret{}
+func (r *Builder) mergeSecrets(migrationSecret, migrationSecretNS, storageVendorSecret, storageVendorSecretNS, diskSecretName string, pvc *core.PersistentVolumeClaim) error {
+	baseMigrationSecret := &core.Secret{}
 	if err := r.Destination.Get(context.Background(), client.ObjectKey{
 		Name:      migrationSecret,
-		Namespace: migrationSecretNS}, dst); err != nil {
-		return fmt.Errorf("failed to get migration secret: %w", err)
+		Namespace: migrationSecretNS}, baseMigrationSecret); err != nil {
+		return fmt.Errorf("failed to get base migration secret: %w", err)
 	}
+
+	dst := &core.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      diskSecretName,
+			Namespace: migrationSecretNS,
+			Labels: map[string]string{
+				"migration": string(r.Migration.UID),
+				"plan":      string(r.Plan.GetUID()),
+				"vmID":      pvc.Labels["vmID"],
+			},
+		},
+		Data: make(map[string][]byte),
+	}
+
+	maps.Copy(dst.Data, baseMigrationSecret.Data)
 
 	src := &core.Secret{}
 	if err := r.Destination.Get(context.Background(), client.ObjectKey{
@@ -1693,7 +2063,6 @@ func (r *Builder) mergeSecrets(migrationSecret, migrationSecretNS, storageVendor
 		return fmt.Errorf("failed to get storage secret: %w", err)
 	}
 
-	// Merge the data from storage secret into migration secret
 	if dst.Data == nil {
 		dst.Data = make(map[string][]byte)
 	}
@@ -1704,27 +2073,86 @@ func (r *Builder) mergeSecrets(migrationSecret, migrationSecretNS, storageVendor
 		dst.Data[key] = value
 	}
 
-	// copy the keys into the keys the populator needs
 	for key, value := range dst.Data {
 		switch key {
-		case "url":
-			h, err := liburl.Parse(string(value))
-			if err != nil {
-				// ignore and try to use as is
-				dst.Data["GOVMOMI_HOSTNAME"] = value
-			}
-			dst.Data["GOVMOMI_HOSTNAME"] = []byte(h.Hostname())
 		case "user":
 			dst.Data["GOVMOMI_USERNAME"] = value
+			dst.Data["accessKeyId"] = value
 		case "password":
 			dst.Data["GOVMOMI_PASSWORD"] = value
+			dst.Data["secretKey"] = value
 		case "insecureSkipVerify":
 			dst.Data["GOVMOMI_INSECURE"] = value
 		}
 	}
-	// Update secret1 with the merged data.
-	if err := r.Destination.Update(context.Background(), dst); err != nil {
-		return fmt.Errorf("failed to update secret1: %w", err)
+
+	if r.Plan.IsWarm() {
+		hostsSecret := &core.Secret{}
+		if err := r.Secret(ref.Ref{ID: pvc.Labels["vmID"]}, dst, hostsSecret); err != nil {
+			return fmt.Errorf("failed to get hosts configuration for secret: %w", err)
+		}
+		dst.Data["accessKeyId"] = hostsSecret.Data["accessKeyId"]
+		dst.Data["secretKey"] = hostsSecret.Data["secretKey"]
+	}
+
+	// Always derive GOVMOMI_HOSTNAME from the provider spec, which is the
+	// authoritative source for the vCenter URL.
+	providerURL := r.Source.Provider.Spec.URL
+	if providerURL == "" {
+		return fmt.Errorf("provider %s/%s has an empty spec.url", r.Source.Provider.Namespace, r.Source.Provider.Name)
+	}
+	h, err := liburl.Parse(providerURL)
+	if err != nil {
+		dst.Data["GOVMOMI_HOSTNAME"] = []byte(providerURL)
+	} else {
+		dst.Data["GOVMOMI_HOSTNAME"] = []byte(h.Hostname())
+	}
+
+	// Add provider settings to the secret
+	if esxiCloneMethod, ok := r.Source.Provider.Spec.Settings[api.ESXiCloneMethod]; ok {
+		dst.Data["ESXI_CLONE_METHOD"] = []byte(esxiCloneMethod)
+	}
+
+	// Add controller-level settings for host leases (copy offload)
+	if settings.Settings.Migration.HostLeaseNamespace != "" {
+		dst.Data["HOST_LEASE_NAMESPACE"] = []byte(settings.Settings.Migration.HostLeaseNamespace)
+	}
+	if settings.Settings.Migration.HostLeaseDurationSeconds != "" {
+		dst.Data["HOST_LEASE_DURATION_SECONDS"] = []byte(settings.Settings.Migration.HostLeaseDurationSeconds)
+	}
+
+	// Add SSH keys for vSphere providers
+	if r.Source.Provider.Type() == api.VSphere {
+		err := r.addSSHKeysToSecret(dst)
+		if err != nil {
+			r.Log.Error(err, "Failed to add SSH keys to secret", "secret", dst.Name)
+			// Continue without SSH keys - this will fall back to VIB method or fail gracefully
+		}
+	}
+
+	if err := controllerutil.SetOwnerReference(pvc, dst, r.Scheme()); err != nil {
+		return fmt.Errorf("failed to set owner reference: %w", err)
+	}
+
+	existing := &core.Secret{}
+	if err := r.Destination.Get(context.Background(), client.ObjectKey{
+		Name:      diskSecretName,
+		Namespace: migrationSecretNS,
+	}, existing); err != nil {
+		if !k8serr.IsNotFound(err) {
+			return fmt.Errorf("failed to get disk secret: %w", err)
+		}
+		if err := r.Destination.Create(context.Background(), dst); err != nil {
+			return fmt.Errorf("failed to create disk secret: %w", err)
+		}
+	} else {
+		maps.Copy(existing.Data, dst.Data)
+		if err := controllerutil.SetOwnerReference(pvc, existing, r.Scheme()); err != nil {
+			return fmt.Errorf("failed to set owner reference: %w", err)
+		}
+		if err := r.Destination.Update(context.Background(), existing); err != nil {
+			return fmt.Errorf("failed to update disk secret: %w", err)
+		}
 	}
 
 	return nil
@@ -1752,6 +2180,11 @@ func (r *Builder) ensurePopulatorServiceAccount(namespace string) error {
 				APIGroups: []string{""},
 				Resources: []string{"persistentvolumeclaims"},
 				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"coordination.k8s.io"},
+				Resources: []string{"leases"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "patch"},
 			},
 		},
 	}
@@ -1782,6 +2215,65 @@ func (r *Builder) ensurePopulatorServiceAccount(namespace string) error {
 
 	err = r.Destination.Client.Create(context.TODO(), &binding, &client.CreateOptions{})
 	if err != nil && !k8serr.IsAlreadyExists(err) {
+		return err
+	}
+
+	// Create Role in openshift-mtv namespace for cross-namespace lease access
+	mtvRole := rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "populator-lease-reader",
+			Namespace: "openshift-mtv",
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{"coordination.k8s.io"},
+				Resources: []string{"leases"},
+				Verbs:     []string{"get", "list", "watch", "create", "update"},
+			},
+		},
+	}
+	err = r.Destination.Client.Create(context.TODO(), &mtvRole, &client.CreateOptions{})
+	if err != nil && !k8serr.IsAlreadyExists(err) {
+		return err
+	}
+
+	// Create RoleBinding in openshift-mtv namespace
+	mtvBinding := rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "populator-lease-reader-binding",
+			Namespace: "openshift-mtv",
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      "populator",
+				Namespace: namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			Kind:     "Role",
+			Name:     "populator-lease-reader",
+			APIGroup: "rbac.authorization.k8s.io",
+		},
+	}
+
+	updatedMtvBinding := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: mtvBinding.Name, Namespace: mtvBinding.Namespace}}
+	_, err = controllerutil.CreateOrPatch(
+		context.TODO(),
+		r.Destination.Client,
+		updatedMtvBinding, func() error {
+			if updatedMtvBinding.CreationTimestamp.IsZero() {
+				updatedMtvBinding.Subjects = mtvBinding.Subjects
+				updatedMtvBinding.RoleRef = mtvBinding.RoleRef
+			} else {
+				if !slices.Contains(updatedMtvBinding.Subjects, mtvBinding.Subjects[0]) {
+					updatedMtvBinding.Subjects = append(updatedMtvBinding.Subjects, mtvBinding.Subjects[0])
+				}
+			}
+			return nil
+		})
+
+	if err != nil {
 		return err
 	}
 
@@ -1840,4 +2332,333 @@ func (r *Builder) ensurePopulatorServiceAccount(namespace string) error {
 	}
 
 	return nil
+}
+
+// addSSHKeysToSecret adds SSH keys from provider controller to the migration secret
+func (r *Builder) addSSHKeysToSecret(secret *core.Secret) error {
+	// Generate secret names based on provider name
+	providerName := r.Source.Provider.Name
+	if providerName == "" {
+		return fmt.Errorf("provider name is empty")
+	}
+
+	privateSecretName, err := util.GenerateSSHPrivateSecretName(providerName)
+	if err != nil {
+		return fmt.Errorf("error generating private ssh key %v", err)
+	}
+	publicSecretName, err := util.GenerateSSHPublicSecretName(providerName)
+	if err != nil {
+		return fmt.Errorf("error generating public ssh key %v", err)
+	}
+	// Get SSH private key
+	privateSecret := &core.Secret{}
+	err = r.Get(context.Background(), client.ObjectKey{
+		Name:      privateSecretName,
+		Namespace: r.Source.Provider.Namespace,
+	}, privateSecret)
+	if err != nil {
+		return fmt.Errorf("failed to get SSH private key secret %s: %w", privateSecretName, err)
+	}
+
+	// Get SSH public key
+	publicSecret := &core.Secret{}
+	err = r.Get(context.Background(), client.ObjectKey{
+		Name:      publicSecretName,
+		Namespace: r.Source.Provider.Namespace,
+	}, publicSecret)
+	if err != nil {
+		return fmt.Errorf("failed to get SSH public key secret %s: %w", publicSecretName, err)
+	}
+
+	// Add SSH keys to the migration secret as base64-encoded environment variables
+	if privateKeyData, found := privateSecret.Data["private-key"]; found {
+		secret.Data["SSH_PRIVATE_KEY"] = []byte(base64.StdEncoding.EncodeToString(privateKeyData))
+	} else {
+		return fmt.Errorf("private key not found in secret %s", privateSecretName)
+	}
+
+	if publicKeyData, found := publicSecret.Data["public-key"]; found {
+		secret.Data["SSH_PUBLIC_KEY"] = []byte(base64.StdEncoding.EncodeToString(publicKeyData))
+	} else {
+		return fmt.Errorf("public key not found in secret %s", publicSecretName)
+	}
+
+	r.Log.Info("SSH keys added to migration secret", "secret", secret.Name)
+	return nil
+}
+
+func (r *Builder) isPVCExistsInList(pvc *core.PersistentVolumeClaim, pvcList *core.PersistentVolumeClaimList) bool {
+	return r.findExistingPVCInList(pvc, pvcList) != nil
+}
+
+func (r *Builder) findExistingPVCInList(pvc *core.PersistentVolumeClaim, pvcList *core.PersistentVolumeClaimList) *core.PersistentVolumeClaim {
+	pvcIdentifier := r.ResolvePersistentVolumeClaimIdentifier(pvc)
+	if pvcIdentifier == "" {
+		return nil
+	}
+	for i := range pvcList.Items {
+		item := &pvcList.Items[i]
+		if r.ResolvePersistentVolumeClaimIdentifier(item) == pvcIdentifier {
+			return item
+		}
+	}
+	return nil
+}
+
+func (r *Builder) generatePopulatorSuffix(migrationUID, vmID string, diskKey int32, diskFile string, diskIndex int) string {
+	input := fmt.Sprintf("%s-%s-%d-%s-%d", migrationUID, vmID, diskKey, diskFile, diskIndex)
+	hash := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(hash[:])[:8]
+}
+
+func (r *Builder) ensureXCopyVolumePopulator(vp *api.VSphereXcopyVolumePopulator) error {
+	existingPopulator := &api.VSphereXcopyVolumePopulator{}
+	err := r.Destination.Client.Get(context.TODO(), client.ObjectKey{
+		Namespace: vp.Namespace,
+		Name:      vp.Name,
+	}, existingPopulator)
+	if err != nil {
+		if k8serr.IsNotFound(err) {
+			r.Log.Info("Creating the populator resource", "VSphereXcopyVolumePopulator", vp.Name, "namespace", vp.Namespace)
+			err = r.Destination.Client.Create(context.TODO(), vp, &client.CreateOptions{})
+			if err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	} else {
+		r.Log.Info("Populator already exists", "populator", vp.Name, "namespace", vp.Namespace)
+	}
+	return nil
+}
+
+// ConversionPodConfig returns provider-specific configuration for the virt-v2v conversion pod.
+// vSphere provider does not require any special configuration.
+func (r *Builder) ConversionPodConfig(_ ref.Ref) (*planbase.ConversionPodConfigResult, error) {
+	return &planbase.ConversionPodConfigResult{}, nil
+}
+
+// NetAppShiftPVCs builds PVCs for disks mapped to a NetApp Shift
+// StorageClass. The PVC size is computed using CDIConfig filesystem overhead (same
+// formula CDI applies to DataVolumes). Returns nil when no disks map to Shift classes.
+func (r *Builder) NetAppShiftPVCs(vmRef ref.Ref, labels map[string]string) (pvcs []core.PersistentVolumeClaim, err error) {
+	vm := &model.VM{}
+	if err = r.Source.Inventory.Find(vm, vmRef); err != nil {
+		err = liberr.Wrap(err, "vm", vmRef.String())
+		return
+	}
+	if !r.shouldMigrateSharedDisks(vm) {
+		vm.RemoveSharedDisks()
+	}
+
+	dsMap, err := r.buildDatastoreMap()
+	if err != nil {
+		return
+	}
+
+	disks := vm.SortedDisksAsVmware()
+	for diskIndex, disk := range disks {
+		mapped, found := dsMap[disk.Datastore.ID]
+		if !found {
+			continue
+		}
+
+		isShift, sErr := mapped.Destination.IsNetAppShiftStorageClass(r.Destination.Client)
+		if sErr != nil {
+			err = sErr
+			return
+		}
+		if !isShift {
+			continue
+		}
+
+		storageClass := mapped.Destination.StorageClass
+
+		capacity, cErr := utils.CalculateSpaceWithCDIOverhead(
+			r.Destination.Client, storageClass, disk.Capacity)
+		if cErr != nil {
+			err = liberr.Wrap(cErr, "CDIConfig overhead", storageClass)
+			return
+		}
+
+		fsMode := core.PersistentVolumeFilesystem
+		accessModes := []core.PersistentVolumeAccessMode{core.ReadWriteMany}
+		if mapped.Destination.AccessMode != "" {
+			accessModes = []core.PersistentVolumeAccessMode{mapped.Destination.AccessMode}
+		}
+
+		pvc := &core.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:    r.Plan.Spec.TargetNamespace,
+				Labels:       maps.Clone(labels),
+				Annotations:  make(map[string]string),
+				GenerateName: r.Plan.Name + "-" + vmRef.ID + "-",
+			},
+			Spec: core.PersistentVolumeClaimSpec{
+				AccessModes:      accessModes,
+				VolumeMode:       &fsMode,
+				StorageClassName: &storageClass,
+				Resources: core.VolumeResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceStorage: *resource.NewQuantity(capacity, resource.BinarySI),
+					},
+				},
+			},
+		}
+
+		if err = r.setPVCNameFromTemplate(&pvc.ObjectMeta, vm, diskIndex, disk); err != nil {
+			r.Log.Info("Failed to set PVC name from template", "error", err)
+			err = nil
+		}
+
+		ann := pvc.ObjectMeta.Annotations
+		ann[planbase.AnnDiskSource] = baseVolume(disk.File, r.Plan.IsWarm())
+		ann[planbase.AnnDiskIndex] = fmt.Sprintf("%d", diskIndex)
+		ann[planbase.AnnVmId] = vmRef.ID
+		ann[planbase.AnnVmUUID] = vm.UUID
+		ann[planbase.AnnNetAppShift] = "true"
+
+		ds := &model.Datastore{}
+		if fErr := r.Source.Inventory.Find(ds, ref.Ref{ID: disk.Datastore.ID}); fErr != nil {
+			err = liberr.Wrap(fErr, "datastore", disk.Datastore.ID)
+			return
+		}
+		ann[planbase.AnnNfsPath] = ds.NasRemotePath
+		n := len(ds.NasRemoteHostNames)
+		if n > 0 {
+			ann[planbase.AnnNfsServer] = ds.NasRemoteHostNames[n-1]
+		} else {
+			ann[planbase.AnnNfsServer] = ds.NasRemoteHost
+		}
+
+		if disk.Shared {
+			pvc.Labels[Shareable] = "true"
+		}
+
+		pvcs = append(pvcs, *pvc)
+	}
+	return
+}
+
+// SourceVMLabelsAndAnnotations converts vSphere tags to labels and custom attributes to annotations.
+func (r *Builder) SourceVMLabelsAndAnnotations(vmRef ref.Ref, tagMapping *api.TagMapping) (labels map[string]string, annotations map[string]string, sanitizationReport map[string]string, err error) {
+	vm := &model.VM{}
+	err = r.Source.Inventory.Find(vm, vmRef)
+	if err != nil {
+		err = liberr.Wrap(err, "vm", vmRef.String())
+		return
+	}
+
+	labels = make(map[string]string)
+	annotations = make(map[string]string)
+	sanitizationReport = make(map[string]string)
+
+	// Tags to labels (skipped entirely when tagMapping.Disabled is true)
+	labelOriginalKeys := make(map[string]string)
+	tagsDisabled := tagMapping != nil && tagMapping.Disabled
+	if !tagsDisabled {
+		for _, tag := range vm.Tags {
+			if tagMapping != nil && len(tagMapping.LabelTags) > 0 {
+				if !isInLabelTags(tag.Name, tagMapping.LabelTags) {
+					continue
+				}
+			}
+
+			originalKey := tag.Name
+			sanitizedKey := sanitizeForK8sMetadata(originalKey)
+			if sanitizedKey == "" {
+				continue
+			}
+
+			key := fmt.Sprintf("vsphere.forklift.konveyor.io/%s", sanitizedKey)
+
+			if sanitizedKey != originalKey {
+				sanitizationReport[fmt.Sprintf("tag.name.%s", originalKey)] = sanitizedKey
+			}
+
+			if existingOriginal, exists := labelOriginalKeys[key]; exists {
+				r.Log.Info("Tag key collision, later tag overwrites earlier",
+					"sanitizedKey", key,
+					"previousTag", existingOriginal,
+					"currentTag", originalKey)
+				sanitizationReport[fmt.Sprintf("tag.collision.%s", key)] = fmt.Sprintf("%s overwrites %s", originalKey, existingOriginal)
+			}
+			labelOriginalKeys[key] = originalKey
+
+			originalValue := tag.Description
+			value := sanitizeForK8sMetadata(originalValue)
+			if value != originalValue && originalValue != "" {
+				sanitizationReport[fmt.Sprintf("tag.value.%s", originalKey)] = value
+			}
+
+			labels[key] = value
+		}
+	}
+
+	// Custom attributes to annotations
+	annotationOriginalKeys := make(map[string]string)
+	for _, cv := range vm.CustomValues {
+		for _, def := range vm.CustomDef {
+			if def.Key == cv.Key {
+				originalName := def.Name
+				sanitizedName := sanitizeForK8sMetadata(originalName)
+				if sanitizedName == "" {
+					break
+				}
+				if sanitizedName != originalName {
+					sanitizationReport[fmt.Sprintf("customAttribute.name.%s", originalName)] = sanitizedName
+				}
+
+				key := fmt.Sprintf("vsphere.forklift.konveyor.io/%s", sanitizedName)
+				if existingOriginal, exists := annotationOriginalKeys[key]; exists {
+					r.Log.Info("Custom attribute key collision, later attribute overwrites earlier",
+						"sanitizedKey", key,
+						"previousAttribute", existingOriginal,
+						"currentAttribute", originalName)
+					sanitizationReport[fmt.Sprintf("customAttribute.collision.%s", sanitizedName)] = fmt.Sprintf("%s overwrites %s", originalName, existingOriginal)
+				}
+				annotationOriginalKeys[key] = originalName
+
+				annotations[key] = cv.Value
+				break
+			}
+		}
+	}
+
+	return
+}
+
+func isInLabelTags(tagName string, labelTags []string) bool {
+	for _, lt := range labelTags {
+		if strings.EqualFold(tagName, lt) {
+			return true
+		}
+	}
+	return false
+}
+
+func isValidK8sMetadataValue(s string) bool {
+	if s == "" {
+		return true
+	}
+	errs := k8svalidation.IsValidLabelValue(s)
+	return len(errs) == 0
+}
+
+// sanitizeForK8sMetadata makes a string safe for use as a K8s label key/value.
+func sanitizeForK8sMetadata(s string) string {
+	if s == "" {
+		return ""
+	}
+	if isValidK8sMetadataValue(s) {
+		return s
+	}
+	sanitized := sanitizeNameRx.ReplaceAllString(s, "_")
+	sanitized = strings.Trim(sanitized, "_.-")
+	if len(sanitized) > 63 {
+		sanitized = sanitized[:63]
+		sanitized = strings.TrimRight(sanitized, "_.-")
+	}
+	return sanitized
 }

@@ -1,0 +1,12 @@
+# Spectro Cloud patches applied on top of upstream kubev2v/forklift.
+# Order matters: apply top to bottom.
+#
+# Baseline: v2.12.1
+0001-spectro-raw-import-make-guest-conversion-opt-in-via-.patch
+0002-spectro-remove-virt-v2v-transfer-for-vSphere-VDDK-CD.patch
+0003-spectro-clear-stale-disk-data-before-virt-v2v-in-pla.patch
+0004-spectro-relax-virt-v2v-confinement-outside-OpenShift.patch
+0005-spectro-secure-boot-SMM-vCenter-session-leak-resourc.patch
+0006-spectro-guard-tests-for-the-two-behavioural-inversio.patch
+0007-spectro-fedora-virt-v2v-image-target-and-nbdkit-fix.patch
+0008-spectro-append-PLATFORM_SUFFIX-to-fedora-virt-v2v-im.patch

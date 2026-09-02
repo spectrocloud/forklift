@@ -1,20 +1,21 @@
-FROM registry.access.redhat.com/ubi8/go-toolset:1.25.7-1771287729 AS builder
+FROM registry.access.redhat.com/ubi8/go-toolset:1.25.9-1778589418 AS builder
 ENV GOPATH=$APP_ROOT
 WORKDIR /app
 COPY --chown=1001:0 ./ ./
-ENV GOFLAGS "-mod=vendor -tags=strictfipsruntime"
-ENV GOEXPERIMENT strictfipsruntime
+ENV GOFLAGS="-mod=vendor -tags=strictfipsruntime"
+ENV GOEXPERIMENT=strictfipsruntime
 
-RUN GOOS=linux GOARCH=amd64 go build -o ovirt-populator github.com/kubev2v/forklift/cmd/ovirt-populator
+RUN go build -o ovirt-populator github.com/kubev2v/forklift/cmd/ovirt-populator
 
 FROM quay.io/centos/centos:stream9
 COPY --from=builder /app/ovirt-populator /usr/local/bin/ovirt-populator
-RUN update-crypto-policies --set LEGACY
 RUN dnf install -y centos-release-ovirt45
-RUN dnf config-manager --set-disabled ovirt-45-upstream resilientstorage || true
-RUN dnf install -y --skip-broken python3-ovirt-engine-sdk4 ovirt-imageio-client && dnf clean all
+RUN dnf install -y python3-ovirt-engine-sdk4 ovirt-imageio-client && dnf clean all
 
 ENTRYPOINT ["/usr/local/bin/ovirt-populator"]
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=unknown
+
 LABEL \
         com.redhat.component="forklift-ovirt-populator-container" \
         name="migration-toolkit-virtualization/forklift-ovirt-populator-rhel8" \
@@ -25,4 +26,8 @@ LABEL \
         summary="Migration Toolkit for Virtualization - oVirt Populator" \
         description="Migration Toolkit for Virtualization - oVirt Populator" \
         vendor="Red Hat, Inc." \
-        maintainer="Migration Toolkit for Virtualization Team <migtoolkit-virt@redhat.com>"
+        maintainer="Migration Toolkit for Virtualization Team <migtoolkit-virt@redhat.com>" \
+        org.opencontainers.image.revision="$GIT_COMMIT" \
+        org.opencontainers.image.created="$BUILD_DATE" \
+        org.opencontainers.image.source="https://github.com/kubev2v/forklift"
+

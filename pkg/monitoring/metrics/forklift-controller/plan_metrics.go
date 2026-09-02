@@ -11,6 +11,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+var activePlanStatuses = make(map[string]struct{})
+var activePlanAlertStatuses = make(map[string]struct{})
+var processedPlannedVMs = make(map[string]struct{})
+
 // Calculate Plans metrics every 10 seconds
 func RecordPlanMetrics(c client.Client) {
 	go func() {
@@ -29,6 +33,7 @@ func RecordPlanMetrics(c client.Client) {
 
 			// Initialize or reset the counter map at the beginning of each iteration
 			plansCounterMap := make(map[string]float64)
+			planAlertsMap := make(map[string]struct{})
 
 			for _, m := range plans.Items {
 				sourceProvider := api.Provider{}
@@ -44,7 +49,6 @@ func RecordPlanMetrics(c client.Client) {
 				}
 
 				isLocal := destProvider.Spec.URL == ""
-				isWarm := m.Spec.Warm
 
 				var target, mode, key string
 				if isLocal {
@@ -52,25 +56,75 @@ func RecordPlanMetrics(c client.Client) {
 				} else {
 					target = Remote
 				}
-				if isWarm {
+				switch m.Spec.Type {
+				case api.MigrationWarm:
 					mode = Warm
-				} else {
+				case api.MigrationLive:
+					mode = Live
+				default:
 					mode = Cold
 				}
 
 				provider := sourceProvider.Type().String()
+				planUID := string(m.UID)
+				planName := m.GetName()
+				phase := ""
+
+				for _, vm := range m.Spec.VMs {
+					plannedKey := fmt.Sprintf("%s/%s", planUID, vm.ID)
+					if _, exists := processedPlannedVMs[plannedKey]; !exists {
+						plannedVMsCounter.With(prometheus.Labels{
+							"provider": provider, "mode": mode, "target": target,
+						}).Inc()
+						processedPlannedVMs[plannedKey] = struct{}{}
+					}
+				}
 
 				if m.Status.HasCondition(Succeeded) {
 					key = fmt.Sprintf("%s|%s|%s|%s", Succeeded, provider, mode, target)
 					plansCounterMap[key]++
+
+					// If plan succeeded, create an alert metric
+					phase = Completed
+					alertKey := fmt.Sprintf("%s|%s|%s|%s", key, planUID, planName, phase)
+					activePlanAlertStatuses[alertKey] = struct{}{}
+					planAlertsMap[alertKey] = struct{}{}
 				}
 				if m.Status.HasCondition(Failed) {
 					key = fmt.Sprintf("%s|%s|%s|%s", Failed, provider, mode, target)
 					plansCounterMap[key]++
+
+					// If plan failed, create an alert metric
+					for _, vm := range m.Status.Migration.VMs {
+						if vm.Error != nil {
+							phase = fmt.Sprintf("%s,%s", phase, vm.Error.Phase)
+						}
+					}
+					phase = strings.Trim(phase, ",")
+					alertKey := fmt.Sprintf("%s|%s|%s|%s", key, planUID, planName, phase)
+					activePlanAlertStatuses[alertKey] = struct{}{}
+					planAlertsMap[alertKey] = struct{}{}
 				}
 				if m.Status.HasCondition(Executing) {
 					key = fmt.Sprintf("%s|%s|%s|%s", Executing, provider, mode, target)
 					plansCounterMap[key]++
+
+					// If plan is executing, create an alert metric
+					var totalDataTransferred float64
+					for _, vm := range m.Status.Migration.VMs {
+						for _, step := range vm.Pipeline {
+							if step.Name == "DiskTransferV2v" || step.Name == "DiskTransfer" {
+								for _, task := range step.Tasks {
+									totalDataTransferred += float64(task.Progress.Completed) * 1024 * 1024 // convert to Bytes
+								}
+							}
+						}
+					}
+					dataTransferredGauge.With(prometheus.Labels{"provider": provider, "mode": mode, "target": target, "plan": planUID}).Set(totalDataTransferred)
+					phase = Executing
+					alertKey := fmt.Sprintf("%s|%s|%s|%s", key, planUID, planName, phase)
+					activePlanAlertStatuses[alertKey] = struct{}{}
+					planAlertsMap[alertKey] = struct{}{}
 				}
 				if m.Status.HasCondition(Running) {
 					key = fmt.Sprintf("%s|%s|%s|%s", Running, provider, mode, target)
@@ -97,6 +151,29 @@ func RecordPlanMetrics(c client.Client) {
 			for key, value := range plansCounterMap {
 				parts := strings.Split(key, "|")
 				planStatusGauge.With(prometheus.Labels{"status": parts[0], "provider": parts[1], "mode": parts[2], "target": parts[3]}).Set(value)
+				activePlanStatuses[key] = struct{}{}
+			}
+
+			for planStatus := range activePlanStatuses {
+				if _, exists := plansCounterMap[planStatus]; !exists {
+					parts := strings.Split(planStatus, "|")
+					planStatusGauge.With(prometheus.Labels{"status": parts[0], "provider": parts[1], "mode": parts[2], "target": parts[3]}).Set(0)
+					delete(activePlanStatuses, planStatus)
+				}
+			}
+
+			for key := range planAlertsMap {
+				parts := strings.Split(key, "|")
+				planAlertStatusGauge.With(prometheus.Labels{"status": parts[0], "provider": parts[1], "mode": parts[2], "target": parts[3], "plan": parts[4], "plan_name": parts[5], "phase": parts[6]}).Set(1)
+				activePlanAlertStatuses[key] = struct{}{}
+			}
+
+			for planAlertStatus := range activePlanAlertStatuses {
+				if _, exists := planAlertsMap[planAlertStatus]; !exists {
+					parts := strings.Split(planAlertStatus, "|")
+					planAlertStatusGauge.DeleteLabelValues(parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6])
+					delete(activePlanAlertStatuses, planAlertStatus)
+				}
 			}
 		}
 	}()

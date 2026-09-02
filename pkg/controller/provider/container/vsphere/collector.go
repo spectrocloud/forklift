@@ -8,9 +8,11 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kubev2v/forklift/pkg/lib/util"
+	"github.com/kubev2v/forklift/pkg/settings"
 
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	"github.com/kubev2v/forklift/pkg/controller/base"
@@ -21,6 +23,8 @@ import (
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/session"
+	"github.com/vmware/govmomi/vapi/rest"
+	"github.com/vmware/govmomi/vapi/tags"
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/methods"
 	"github.com/vmware/govmomi/vim25/soap"
@@ -35,6 +39,8 @@ const (
 	RetryDelay = time.Second * 5
 	// Max object in each update.
 	MaxObjectUpdates = 10000
+	// Connection timeout for provider operations.
+	ConnectionTimeout = 30 * time.Second
 )
 
 // Types
@@ -74,26 +80,28 @@ const (
 	fDrsVmBehavior = "configuration.drsConfig.defaultVmBehavior"
 	fDrsVmCfg      = "configuration.drsVmConfig"
 	// Host
-	fVm             = "vm"
-	fOverallStatus  = "overallStatus"
-	fProductName    = "config.product.name"
-	fProductVersion = "config.product.version"
-	fVSwitch        = "config.network.vswitch"
-	fPortGroup      = "config.network.portgroup"
-	fPNIC           = "config.network.pnic"
-	fVNIC           = "config.network.vnic"
-	fTimezone       = "config.dateTimeInfo.timeZone.name"
-	fInMaintMode    = "summary.runtime.inMaintenanceMode"
-	fCpuSockets     = "summary.hardware.numCpuPkgs"
-	fCpuCores       = "summary.hardware.numCpuCores"
-	fThumbprint     = "summary.config.sslThumbprint"
-	fMgtServerIp    = "summary.managementServerIp"
-	fScsiLun        = "config.storageDevice.scsiLun"
-	fHostBusAdapter = "config.storageDevice.hostBusAdapter"
-	fScsiTopology   = "config.storageDevice.scsiTopology.adapter"
-	fAdvancedOption = "configManager.advancedOption"
-	fmodel          = "hardware.systemInfo.model"
-	fvendor         = "hardware.systemInfo.vendor"
+	fVm                   = "vm"
+	fOverallStatus        = "overallStatus"
+	fProductName          = "config.product.name"
+	fProductVersion       = "config.product.version"
+	fVSwitch              = "config.network.vswitch"
+	fPortGroup            = "config.network.portgroup"
+	fPNIC                 = "config.network.pnic"
+	fVNIC                 = "config.network.vnic"
+	fVirtualNicManagerNet = "config.virtualNicManagerInfo.netConfig"
+	fTimezone             = "config.dateTimeInfo.timeZone.name"
+	fInMaintMode          = "summary.runtime.inMaintenanceMode"
+	fCpuSockets           = "summary.hardware.numCpuPkgs"
+	fCpuCores             = "summary.hardware.numCpuCores"
+	fHostMemorySize       = "summary.hardware.memorySize"
+	fThumbprint           = "summary.config.sslThumbprint"
+	fMgtServerIp          = "summary.managementServerIp"
+	fScsiLun              = "config.storageDevice.scsiLun"
+	fHostBusAdapter       = "config.storageDevice.hostBusAdapter"
+	fScsiTopology         = "config.storageDevice.scsiTopology.adapter"
+	fAdvancedOption       = "configManager.advancedOption"
+	fmodel                = "hardware.systemInfo.model"
+	fvendor               = "hardware.systemInfo.vendor"
 	// Network
 	fTag     = "tag"
 	fSummary = "summary"
@@ -113,6 +121,7 @@ const (
 	fVmfsExtent  = "info"
 	// VM
 	fUUID                     = "config.uuid"
+	fInstanceUUID             = "config.instanceUuid"
 	fFirmware                 = "config.firmware"
 	fFtInfo                   = "config.ftInfo"
 	fBootOptions              = "config.bootOptions"
@@ -137,12 +146,20 @@ const (
 	fRuntimeHost              = "runtime.host"
 	fPowerState               = "runtime.powerState"
 	fConnectionState          = "runtime.connectionState"
+	fConsolidationNeeded      = "runtime.consolidationNeeded"
 	fSnapshot                 = "snapshot"
 	fIsTemplate               = "config.template"
 	fGuestNet                 = "guest.net"
 	fGuestDisk                = "guest.disk"
 	fGuestIpStack             = "guest.ipStack"
 	fHostName                 = "guest.hostName"
+	// fToolsStatus is deprecated since vSphere API 4.0; use fToolsRunningStatus instead
+	fToolsStatus        = "guest.toolsStatus"
+	fToolsRunningStatus = "guest.toolsRunningStatus"
+	// fToolsVersionStatus is deprecated since vSphere API 5.1; use fToolsVersionStatus2 for more detailed status
+	fToolsVersionStatus = "guest.toolsVersionStatus2"
+	fAvailableField     = "availableField"
+	fCustomValue        = "customValue"
 )
 
 // Selections
@@ -274,7 +291,8 @@ type Collector struct {
 	// logger.
 	log logging.LevelLogger
 	// client.
-	client *govmomi.Client
+	client     *govmomi.Client
+	restClient *rest.Client
 	// cancel function.
 	cancel func()
 	// has parity.
@@ -335,20 +353,17 @@ func (r *Collector) Follow(moRef interface{}, p []string, dst interface{}) error
 	}
 
 	ctx := context.Background()
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, ConnectionTimeout)
 	defer cancel()
 	client, err := r.buildClient(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		// PVM-113: every Login here must be paired with a Logout, otherwise
-		// each Follow call leaks a vCenter session for the lifetime of the
-		// inventory web API.
+		// Every Login here must be paired with a Logout, otherwise each Follow
+		// call leaks a vCenter session for the lifetime of the inventory API.
 		if logoutErr := client.Logout(context.Background()); logoutErr != nil {
-			r.log.V(1).Info(
-				"vsphere logout (Follow) failed",
-				"err", logoutErr)
+			r.log.V(1).Info("vsphere logout (Follow) failed", "err", logoutErr)
 		}
 		client.CloseIdleConnections()
 	}()
@@ -358,8 +373,9 @@ func (r *Collector) Follow(moRef interface{}, p []string, dst interface{}) error
 // Test connect/logout.
 func (r *Collector) Test() (status int, err error) {
 	ctx := context.Background()
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, ConnectionTimeout)
 	defer cancel()
+	// Release the client even when connect() fails part-way.
 	defer r.close()
 	status, err = r.connect(ctx)
 	return
@@ -443,7 +459,7 @@ func (r *Collector) getUpdates(ctx context.Context) error {
 	}()
 
 	filter := r.filter(pc)
-	err = pc.CreateFilter(ctx, filter.CreateFilter)
+	_, err = pc.CreateFilter(ctx, filter.CreateFilter)
 	if err != nil {
 		return liberr.Wrap(err)
 	}
@@ -524,6 +540,173 @@ func (r *Collector) getUpdates(ctx context.Context) error {
 	return nil
 }
 
+func (r *Collector) getVMsWithTags(ctx context.Context) (map[string][]model.Tag, error) {
+	if r.restClient == nil {
+		return make(map[string][]model.Tag), nil
+	}
+	tagManager := tags.NewManager(r.restClient)
+
+	// Step 1: List all tag IDs (single API call).
+	tagIDs, err := tagManager.ListTags(ctx)
+	if err != nil {
+		r.log.Error(err, "Failed to list tags")
+		return nil, err
+	}
+
+	if len(tagIDs) == 0 {
+		return make(map[string][]model.Tag), nil
+	}
+
+	// Step 2: Get attached objects in a single batch API call and filter to
+	// only tags that are attached to at least one VirtualMachine.
+	attachedObjectsList, err := tagManager.ListAttachedObjectsOnTags(ctx, tagIDs)
+	if err != nil {
+		r.log.Error(err, "Failed to retrieve attached objects for tags", "tagCount", len(tagIDs))
+		return nil, err
+	}
+
+	type vmAttachment struct {
+		tagID string
+		vmIDs []string
+	}
+	var vmAttachments []vmAttachment
+	vmRelevantTagIDs := make(map[string]struct{})
+
+	for _, attached := range attachedObjectsList {
+		var vmIDs []string
+		for _, resource := range attached.ObjectIDs {
+			if resource.Reference().Type == VirtualMachine {
+				vmIDs = append(vmIDs, resource.Reference().Value)
+			}
+		}
+		if len(vmIDs) > 0 {
+			vmAttachments = append(vmAttachments, vmAttachment{tagID: attached.TagID, vmIDs: vmIDs})
+			vmRelevantTagIDs[attached.TagID] = struct{}{}
+		}
+	}
+
+	if len(vmRelevantTagIDs) == 0 {
+		return make(map[string][]model.Tag), nil
+	}
+
+	// Step 3: Fetch tag details only for VM-relevant tags, concurrently.
+	type tagResult struct {
+		tag tags.Tag
+		err error
+	}
+	relevantIDs := make([]string, 0, len(vmRelevantTagIDs))
+	for id := range vmRelevantTagIDs {
+		relevantIDs = append(relevantIDs, id)
+	}
+
+	results := make([]tagResult, len(relevantIDs))
+	concurrency := settings.Settings.VsphereTagFetchConcurrency
+	if concurrency <= 0 {
+		concurrency = settings.DefaultVsphereTagFetchConcurrency
+	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	fetchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var firstErr error
+	var firstErrOnce sync.Once
+
+	for i, id := range relevantIDs {
+		wg.Add(1)
+		go func(idx int, tagID string) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-fetchCtx.Done():
+				return
+			}
+			defer func() { <-sem }()
+
+			tag, err := tagManager.GetTag(fetchCtx, tagID)
+			if err != nil {
+				firstErrOnce.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				results[idx] = tagResult{err: err}
+				return
+			}
+			results[idx] = tagResult{tag: *tag}
+		}(i, id)
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		r.log.Error(firstErr, "Failed to retrieve tag details")
+		return nil, firstErr
+	}
+
+	tagDetailsMap := make(map[string]tags.Tag, len(relevantIDs))
+	for _, res := range results {
+		if res.tag.ID == "" {
+			continue
+		}
+		tagDetailsMap[res.tag.ID] = res.tag
+	}
+
+	// Step 4: Combine tag details + attachments locally.
+	vmTagsMap := make(map[string][]model.Tag)
+	for _, att := range vmAttachments {
+		tag, ok := tagDetailsMap[att.tagID]
+		if !ok {
+			continue
+		}
+		tagDetails := model.Tag{
+			ID:          tag.ID,
+			Description: tag.Description,
+			Name:        tag.Name,
+			CategoryID:  tag.CategoryID,
+			UsedBy:      tag.UsedBy,
+		}
+		for _, vmID := range att.vmIDs {
+			vmTagsMap[vmID] = append(vmTagsMap[vmID], tagDetails)
+		}
+	}
+
+	return vmTagsMap, nil
+}
+
+func (r *Collector) updateVMWithTags(tx *libmodel.Tx, vmID string, vmTagsMap map[string][]model.Tag) error {
+	vm := &model.VM{
+		Base: model.Base{
+			ID: vmID,
+		},
+	}
+	err := tx.Get(vm)
+	if err != nil {
+		r.log.Error(err, "Failed to retrieve VM from DB", "VMID", vm.ID)
+		return err
+	}
+
+	if tags, found := vmTagsMap[vm.ID]; found {
+		if !tagsEqual(tags, vm.Tags) {
+			vm.Tags = make([]model.Tag, len(tags))
+			copy(vm.Tags, tags)
+			err = tx.Update(vm)
+			if err != nil {
+				r.log.Error(err, "Failed to update VM with tags", "VMID", vm.ID)
+				return err
+			}
+		}
+	} else if len(vm.Tags) > 0 { // VM no longer in vmTagsMap - clear stale tags
+
+		vm.Tags = nil
+		err = tx.Update(vm)
+		if err != nil {
+			r.log.Error(err, "Failed to clear VM tags", "VMID", vm.ID)
+			return err
+		}
+	}
+
+	return nil
+}
+
 // Add model watches.
 func (r *Collector) watch() (list []*libmodel.Watch) {
 	// Cluster
@@ -576,15 +759,41 @@ func (r *Collector) watch() (list []*libmodel.Watch) {
 // Build the client.
 func (r *Collector) connect(ctx context.Context) (status int, err error) {
 	r.close()
-	client, err := r.buildClient(ctx)
+	r.client, err = r.buildClient(ctx)
 	if err != nil {
 		if strings.Contains(err.Error(), "incorrect") && strings.Contains(err.Error(), "password") {
 			return http.StatusUnauthorized, err
 		}
 		return
 	}
-	r.client = client
+
+	if err = r.validateServerType(); err != nil {
+		r.close()
+		return
+	}
+
+	if r.client.IsVC() {
+		r.restClient = rest.NewClient(r.client.Client)
+		userInfo := liburl.UserPassword(r.user(), r.password())
+		err = r.restClient.Login(ctx, userInfo)
+		if err != nil {
+			r.close()
+			return 0, liberr.Wrap(err)
+		}
+	}
 	return http.StatusOK, nil
+}
+
+func (r *Collector) validateServerType() error {
+	sdkEndpoint := r.provider.Spec.Settings[api.SDK]
+	isVC := r.client.IsVC()
+	if sdkEndpoint == api.VCenter && !isVC {
+		return liberr.New("provider sdkEndpoint is set to vCenter but the URL points to an ESXi host")
+	}
+	if sdkEndpoint == api.ESXI && isVC {
+		return liberr.New("provider sdkEndpoint is set to ESXi but the URL points to a vCenter server")
+	}
+	return nil
 }
 
 // Build the client.
@@ -618,19 +827,23 @@ func (r *Collector) buildClient(ctx context.Context) (*govmomi.Client, error) {
 		Client:         vimClient,
 	}
 	if err = client.Login(ctx, url.User); err != nil {
-		// PVM-113: mirror govmomi.NewClient — on Login failure, best-effort
-		// Logout (in case a partial session was established) and release the
-		// underlying TCP/TLS keep-alive sockets, then return a nil client so
-		// callers cannot accidentally reference a half-built one.
+		// Mirror govmomi.NewClient: on Login failure best-effort Logout (a
+		// partial session may exist), release keep-alive sockets, and return a
+		// nil client so callers cannot reference a half-built one.
 		_ = client.Logout(context.Background())
 		client.CloseIdleConnections()
 		return nil, err
 	}
 	return client, nil
+
 }
 
 // Close connections.
 func (r *Collector) close() {
+	if r.restClient != nil {
+		_ = r.restClient.Logout(context.TODO())
+		r.restClient = nil
+	}
 	if r.client != nil {
 		_ = r.client.Logout(context.TODO())
 		r.client.CloseIdleConnections()
@@ -673,9 +886,8 @@ func (r *Collector) filter(pc *property.Collector) *property.WaitFilter {
 				PropSet: r.propertySpec(),
 			},
 		},
-		Options: &types.WaitOptions{
-			MaxObjectUpdates: MaxObjectUpdates,
-		},
+		WaitOptions: property.WaitOptions{Options: &types.WaitOptions{
+			MaxObjectUpdates: MaxObjectUpdates}},
 	}
 }
 
@@ -748,12 +960,14 @@ func (r *Collector) propertySpec() []types.PropertySpec {
 				fInMaintMode,
 				fCpuSockets,
 				fCpuCores,
+				fHostMemorySize,
 				fDatastore,
 				fNetwork,
 				fVSwitch,
 				fPortGroup,
 				fPNIC,
 				fVNIC,
+				fVirtualNicManagerNet,
 				fScsiLun,
 				fAdvancedOption,
 				fHostBusAdapter,
@@ -822,6 +1036,7 @@ func (r *Collector) vmPathSet() []string {
 		fName,
 		fParent,
 		fUUID,
+		fInstanceUUID,
 		fFirmware,
 		fFtInfo,
 		fCpuAffinity,
@@ -848,11 +1063,17 @@ func (r *Collector) vmPathSet() []string {
 		fRuntimeHost,
 		fPowerState,
 		fConnectionState,
+		fConsolidationNeeded,
 		fIsTemplate,
 		fSnapshot,
 		fChangeTracking,
 		fGuestIpStack,
 		fHostName,
+		fToolsStatus,
+		fToolsRunningStatus,
+		fToolsVersionStatus,
+		fAvailableField,
+		fCustomValue,
 	}
 
 	apiVer := strings.Split(r.client.ServiceContent.About.ApiVersion, ".")
@@ -866,6 +1087,11 @@ func (r *Collector) vmPathSet() []string {
 
 // Apply updates.
 func (r *Collector) apply(ctx context.Context, tx *libmodel.Tx, updates []types.ObjectUpdate) (err error) {
+
+	var vmTagsMap map[string][]model.Tag
+	var vmTagsErr error
+	var vmTagsFetched bool
+
 	for _, u := range updates {
 		switch string(u.Kind) {
 		case Enter:
@@ -878,6 +1104,25 @@ func (r *Collector) apply(ctx context.Context, tx *libmodel.Tx, updates []types.
 		if err != nil {
 			err = liberr.Wrap(err)
 			break
+		}
+
+		if u.Obj.Type == VirtualMachine {
+			if !vmTagsFetched {
+				vmTagsMap, vmTagsErr = r.getVMsWithTags(ctx)
+				if vmTagsErr != nil {
+					r.log.Error(vmTagsErr, "Failed to retrieve VMs with tags")
+				}
+				vmTagsFetched = true
+			}
+
+			if vmTagsErr == nil {
+				err = r.updateVMWithTags(tx, u.Obj.Value, vmTagsMap)
+				if err != nil {
+					r.log.Error(err, "Failed to update VM tags")
+					err = liberr.Wrap(err)
+					break
+				}
+			}
 		}
 	}
 
@@ -1060,7 +1305,7 @@ func (r Collector) applyLeave(tx *libmodel.Tx, u types.ObjectUpdate) error {
 				ID: u.Obj.Value,
 			},
 		}
-	case Network:
+	case Network, OpaqueNetwork, DVPortGroup, DVSwitch:
 		deleted = &model.Network{
 			Base: model.Base{
 				ID: u.Obj.Value,
@@ -1089,4 +1334,46 @@ func (r Collector) applyLeave(tx *libmodel.Tx, u types.ObjectUpdate) error {
 	}
 
 	return nil
+}
+
+func tagsEqual(a, b []model.Tag) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	tagMap := make(map[string]model.Tag)
+	for _, tag := range a {
+		tagMap[tag.ID] = tag
+	}
+
+	for _, tag := range b {
+		if existingTag, found := tagMap[tag.ID]; !found {
+			return false
+		} else if !tagsAreSame(existingTag, tag) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func tagsAreSame(t1, t2 model.Tag) bool {
+	if t1.Name != t2.Name || t1.Description != t2.Description ||
+		t1.CategoryID != t2.CategoryID {
+		return false
+	}
+	if len(t1.UsedBy) != len(t2.UsedBy) {
+		return false
+	}
+	usedBySet := make(map[string]struct{}, len(t1.UsedBy))
+	for _, u := range t1.UsedBy {
+		usedBySet[u] = struct{}{}
+	}
+	for _, u := range t2.UsedBy {
+		if _, exists := usedBySet[u]; !exists {
+			return false
+		}
+	}
+
+	return true
 }

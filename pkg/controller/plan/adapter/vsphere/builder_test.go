@@ -1,9 +1,12 @@
 package vsphere
 
 import (
+	"context"
+	"fmt"
+
 	v1beta1 "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
+	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
-	container "github.com/kubev2v/forklift/pkg/controller/provider/container/vsphere"
 	"github.com/kubev2v/forklift/pkg/controller/provider/model/vsphere"
 	model "github.com/kubev2v/forklift/pkg/controller/provider/web/vsphere"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
@@ -11,7 +14,13 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/vmware/govmomi/vim25/types"
 	v1 "k8s.io/api/apps/v1"
+	core "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	k8stypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -20,6 +29,564 @@ var builderLog = logging.WithName("vsphere-builder-test")
 const ManualOrigin = string(types.NetIpConfigInfoIpAddressOriginManual)
 
 var _ = Describe("vSphere builder", func() {
+	Context("PopulatorVolumes", func() {
+		It("should created new secret with the provider secret and the storage secret data", func() {
+			builder := createBuilder(
+				&core.Secret{
+					ObjectMeta: meta.ObjectMeta{Name: "storage-test-secret", Namespace: "test"},
+					Data: map[string][]byte{
+						"storagekey": []byte("storageval"),
+					},
+				},
+				&core.Secret{
+					ObjectMeta: meta.ObjectMeta{Name: "migration-test-secret", Namespace: "test"},
+					Data: map[string][]byte{
+						"providerkey": []byte("providerval"),
+					},
+				},
+				&core.Secret{
+					ObjectMeta: meta.ObjectMeta{Name: "offload-ssh-keys-test-vsphere-provider-private", Namespace: "test"},
+					Data: map[string][]byte{
+						"private-key": []byte("fake-private-key"),
+					},
+				},
+				&core.Secret{
+					ObjectMeta: meta.ObjectMeta{Name: "offload-ssh-keys-test-vsphere-provider-public", Namespace: "test"},
+					Data: map[string][]byte{
+						"public-key": []byte("fake-public-key"),
+					},
+				},
+				&core.PersistentVolumeClaim{
+					ObjectMeta: meta.ObjectMeta{Name: "test-pvc", Namespace: "test"},
+				},
+			)
+
+			// Execute
+			pvc := &core.PersistentVolumeClaim{
+				ObjectMeta: meta.ObjectMeta{Name: "test-pvc", Namespace: "test"},
+			}
+			err := builder.mergeSecrets("migration-test-secret", "test", "storage-test-secret", "test", "merged-test-secret", pvc)
+			underTest := core.Secret{}
+			errGet := builder.Destination.Get(context.Background(), client.ObjectKey{
+				Name:      "merged-test-secret",
+				Namespace: "test"}, &underTest)
+
+			// Assert
+			Expect(err).NotTo(HaveOccurred())
+			Expect(errGet).NotTo(HaveOccurred())
+			Expect(underTest.Data).To(HaveLen(5))
+			Expect(underTest.Data).To(HaveKeyWithValue("storagekey", []byte("storageval")))
+			Expect(underTest.Data).To(HaveKeyWithValue("providerkey", []byte("providerval")))
+			Expect(underTest.Data).To(HaveKeyWithValue("GOVMOMI_HOSTNAME", []byte("vcenter.test.example.com")))
+			Expect(underTest.Data).To(HaveKey("SSH_PRIVATE_KEY"))
+			Expect(underTest.Data).To(HaveKey("SSH_PUBLIC_KEY"))
+			Expect(underTest.OwnerReferences).To(HaveLen(1))
+			Expect(underTest.OwnerReferences[0].Name).To(Equal("test-pvc"))
+		})
+		It("should set default access mode to ReadWriteMany for block volumes", func() {
+			// Setup
+			builder := createBuilder(
+				&core.Secret{
+					ObjectMeta: meta.ObjectMeta{Name: "test-secret", Namespace: "test"},
+					Data: map[string][]byte{
+						"foo": []byte("bar"),
+					},
+				},
+			)
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{
+						ID:   "test-vm-id",
+						Name: "test",
+					},
+					Disks: []vsphere.Disk{
+						{
+							Datastore: vsphere.Ref{ID: "ds-1"},
+							File:      "[datastore1] vm-123/vm-123.vmdk",
+							Bus:       vsphere.SCSI,
+							Capacity:  1024 * 1024 * 1024, // 1 GiB
+							Key:       2000,
+						},
+					},
+				},
+			}
+
+			dsMap := []v1beta1.StoragePair{
+				{
+					Source: ref.Ref{ID: "ds-1"},
+					Destination: v1beta1.DestinationStorage{
+						StorageClass: "test-sc",
+					},
+					OffloadPlugin: &v1beta1.OffloadPlugin{
+						VSphereXcopyPluginConfig: &v1beta1.VSphereXcopyPluginConfig{
+							StorageVendorProduct: "test-vendor",
+							SecretRef:            "test-secret",
+						},
+					},
+				},
+			}
+			storageMap := v1beta1.StorageMap{
+				Spec: v1beta1.StorageMapSpec{
+					Map: dsMap,
+				},
+			}
+			annotations := map[string]string{"test-annotation": "true"}
+			secretName := "test-secret"
+
+			// Mock inventory
+			inventory := &mockInventory{
+				ds: model.Datastore{Resource: model.Resource{ID: "ds-1"}},
+				vm: vm,
+			}
+			builder.Source.Inventory = inventory
+			builder.Context.Map.Storage = &storageMap
+
+			// Execute
+			pvcs, err := builder.PopulatorVolumes(ref.Ref{ID: vm.ID}, annotations, secretName)
+
+			// Assert
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pvcs).To(HaveLen(1))
+			pvc := pvcs[0]
+			Expect(pvc.Spec.AccessModes).To(ContainElement(core.ReadWriteMany))
+			Expect(pvc.Spec.VolumeMode).To(Equal(ptr.To(core.PersistentVolumeBlock)))
+		})
+		It("should set default PVC template name", func() {
+			// Setup
+			builder := createBuilder(
+				&core.Secret{
+					ObjectMeta: meta.ObjectMeta{Name: "test-secret", Namespace: "test"},
+					Data: map[string][]byte{
+						"foo": []byte("bar"),
+					},
+				},
+			)
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{
+						ID:   "test-vm-id",
+						Name: "customer-frontend-server",
+					},
+					Disks: []vsphere.Disk{
+						{
+							Datastore: vsphere.Ref{ID: "ds-1"},
+							File:      "[datastore1] vm-123/vm-123.vmdk",
+							Bus:       vsphere.SCSI,
+							Capacity:  1024 * 1024 * 1024, // 1 GiB
+							Key:       2000,
+						},
+					},
+				},
+			}
+
+			dsMap := []v1beta1.StoragePair{
+				{
+					Source: ref.Ref{ID: "ds-1"},
+					Destination: v1beta1.DestinationStorage{
+						StorageClass: "test-sc",
+					},
+					OffloadPlugin: &v1beta1.OffloadPlugin{
+						VSphereXcopyPluginConfig: &v1beta1.VSphereXcopyPluginConfig{
+							StorageVendorProduct: "test-vendor",
+							SecretRef:            "test-secret",
+						},
+					},
+				},
+			}
+			storageMap := v1beta1.StorageMap{
+				Spec: v1beta1.StorageMapSpec{
+					Map: dsMap,
+				},
+			}
+			annotations := map[string]string{"test-annotation": "true"}
+			secretName := "test-secret"
+
+			// Mock inventory
+			inventory := &mockInventory{
+				ds: model.Datastore{Resource: model.Resource{ID: "ds-1"}},
+				vm: vm,
+			}
+			builder.Source.Inventory = inventory
+			builder.Context.Map.Storage = &storageMap
+
+			// Execute
+			pvcs, err := builder.PopulatorVolumes(ref.Ref{ID: vm.ID}, annotations, secretName)
+
+			// Assert
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pvcs).To(HaveLen(1))
+			pvc := pvcs[0]
+			// The default template now uses trunc 4 for both plan and VM names
+			Expect(pvc.Name).Should(HavePrefix(fmt.Sprintf("%.4s-%.4s-disk-", builder.Plan.Name, vm.Name)))
+			Expect(pvc.Spec.DataSourceRef.Kind).To(Equal(v1beta1.VSphereXcopyVolumePopulatorKind))
+			Expect(pvc.Spec.DataSourceRef.APIGroup).To(Equal(&v1beta1.SchemeGroupVersion.Group))
+			Expect(pvc.Spec.DataSourceRef.Name).To(Equal(pvc.Name))
+		})
+
+		It("should honor explicit AccessMode StorageMap and ignore VolumeMode from StorageMap", func() {
+			builder := createBuilder(&core.Secret{ObjectMeta: meta.ObjectMeta{Name: "test-secret", Namespace: "test"}})
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{ID: "vm-2", Name: "vm"},
+					Disks: []vsphere.Disk{
+						{
+							Datastore: vsphere.Ref{ID: "ds-2"},
+							File:      "[datastore2] vm-2/vm-2.vmdk",
+							Bus:       vsphere.SCSI, Capacity: 1 << 20, Key: 2000,
+						},
+					},
+				},
+			}
+			builder.Source.Inventory = &mockInventory{ds: model.Datastore{Resource: model.Resource{ID: "ds-2"}}, vm: vm}
+			builder.Context.Map.Storage = &v1beta1.StorageMap{
+				Spec: v1beta1.StorageMapSpec{
+					Map: []v1beta1.StoragePair{{
+						Source: ref.Ref{ID: "ds-2"},
+						Destination: v1beta1.DestinationStorage{
+							StorageClass: "test-sc",
+							AccessMode:   core.ReadWriteOnce,
+							VolumeMode:   core.PersistentVolumeFilesystem,
+						},
+						OffloadPlugin: &v1beta1.OffloadPlugin{
+							VSphereXcopyPluginConfig: &v1beta1.VSphereXcopyPluginConfig{
+								StorageVendorProduct: "test-vendor",
+								SecretRef:            "test-secret",
+							},
+						},
+					}},
+				},
+			}
+			pvcs, err := builder.PopulatorVolumes(ref.Ref{ID: vm.ID}, nil, "test-secret")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pvcs).To(HaveLen(1))
+			Expect(pvcs[0].Spec.AccessModes).To(ConsistOf(core.ReadWriteOnce))
+			Expect(pvcs[0].Spec.VolumeMode).To(Equal(ptr.To(core.PersistentVolumeBlock)))
+		})
+	})
+
+	Context("formatHostAddress", func() {
+		DescribeTable("should format addresses correctly", func(address string, expected string) {
+			result := formatHostAddress(address)
+			Expect(result).To(Equal(expected))
+		},
+			Entry("IPv4 address (no brackets)",
+				"192.168.1.100",
+				"192.168.1.100",
+			),
+			Entry("IPv6 address (add brackets)",
+				"2001:db8::1",
+				"[2001:db8::1]",
+			),
+			Entry("Invalid/Hostname (no change)",
+				"not-an-ip",
+				"not-an-ip",
+			),
+		)
+	})
+
+	Context("SourceVMLabelsAndAnnotations", func() {
+		It("should convert all tags to labels when no tagMapping is provided", func() {
+			builder := createBuilder()
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				},
+				Tags: []vsphere.Tag{
+					{Name: "owner", Description: "platform-team"},
+					{Name: "environment", Description: "production"},
+					{Name: "cost-center", Description: "cc-123"},
+				},
+			}
+			builder.Source.Inventory = &mockInventory{vm: vm}
+
+			labels, annotations, sanitizationReport, err := builder.SourceVMLabelsAndAnnotations(ref.Ref{ID: "vm-1"}, nil)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(labels).To(HaveLen(3))
+			Expect(labels["vsphere.forklift.konveyor.io/owner"]).To(Equal("platform-team"))
+			Expect(labels["vsphere.forklift.konveyor.io/environment"]).To(Equal("production"))
+			Expect(labels["vsphere.forklift.konveyor.io/cost-center"]).To(Equal("cc-123"))
+			Expect(annotations).To(BeEmpty())
+			Expect(sanitizationReport).To(BeEmpty())
+		})
+
+		It("should convert only specified tags to labels when tagMapping is provided", func() {
+			builder := createBuilder()
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				},
+				Tags: []vsphere.Tag{
+					{Name: "owner", Description: "platform-team"},
+					{Name: "environment", Description: "production"},
+					{Name: "cost-center", Description: "cc-123"},
+					{Name: "internal-tag", Description: "should-be-ignored"},
+				},
+			}
+			builder.Source.Inventory = &mockInventory{vm: vm}
+
+			tagMapping := &v1beta1.TagMapping{
+				LabelTags: []string{"owner", "cost-center"},
+			}
+			labels, annotations, _, err := builder.SourceVMLabelsAndAnnotations(ref.Ref{ID: "vm-1"}, tagMapping)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(labels).To(HaveLen(2))
+			Expect(labels["vsphere.forklift.konveyor.io/owner"]).To(Equal("platform-team"))
+			Expect(labels["vsphere.forklift.konveyor.io/cost-center"]).To(Equal("cc-123"))
+			Expect(labels).NotTo(HaveKey("vsphere.forklift.konveyor.io/environment"))
+			Expect(labels).NotTo(HaveKey("vsphere.forklift.konveyor.io/internal-tag"))
+			Expect(annotations).To(BeEmpty())
+		})
+
+		It("should match tag names case-insensitively", func() {
+			builder := createBuilder()
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				},
+				Tags: []vsphere.Tag{
+					{Name: "Owner", Description: "platform-team"},
+					{Name: "ENVIRONMENT", Description: "production"},
+				},
+			}
+			builder.Source.Inventory = &mockInventory{vm: vm}
+
+			tagMapping := &v1beta1.TagMapping{
+				LabelTags: []string{"owner", "environment"},
+			}
+			labels, _, _, err := builder.SourceVMLabelsAndAnnotations(ref.Ref{ID: "vm-1"}, tagMapping)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(labels).To(HaveLen(2))
+			Expect(labels["vsphere.forklift.konveyor.io/Owner"]).To(Equal("platform-team"))
+			Expect(labels["vsphere.forklift.konveyor.io/ENVIRONMENT"]).To(Equal("production"))
+		})
+
+		It("should convert custom attributes to annotations", func() {
+			builder := createBuilder()
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				},
+				CustomDef: []vsphere.CustomFieldDef{
+					{Key: 100, Name: "app-name"},
+					{Key: 101, Name: "app-version"},
+				},
+				CustomValues: []vsphere.CustomFieldValue{
+					{Key: 100, Value: "my-application"},
+					{Key: 101, Value: "v1.2.3"},
+				},
+			}
+			builder.Source.Inventory = &mockInventory{vm: vm}
+
+			labels, annotations, _, err := builder.SourceVMLabelsAndAnnotations(ref.Ref{ID: "vm-1"}, nil)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(labels).To(BeEmpty())
+			Expect(annotations).To(HaveLen(2))
+			Expect(annotations["vsphere.forklift.konveyor.io/app-name"]).To(Equal("my-application"))
+			Expect(annotations["vsphere.forklift.konveyor.io/app-version"]).To(Equal("v1.2.3"))
+		})
+
+		It("should sanitize invalid tag names and descriptions and report them", func() {
+			builder := createBuilder()
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				},
+				Tags: []vsphere.Tag{
+					{Name: "invalid tag name", Description: "invalid description value"},
+					{Name: "valid-tag", Description: "valid-value"},
+				},
+			}
+			builder.Source.Inventory = &mockInventory{vm: vm}
+
+			labels, _, sanitizationReport, err := builder.SourceVMLabelsAndAnnotations(ref.Ref{ID: "vm-1"}, nil)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(labels).To(HaveLen(2))
+			Expect(labels["vsphere.forklift.konveyor.io/invalid_tag_name"]).To(Equal("invalid_description_value"))
+			Expect(labels["vsphere.forklift.konveyor.io/valid-tag"]).To(Equal("valid-value"))
+			Expect(sanitizationReport).To(HaveLen(2))
+			Expect(sanitizationReport["tag.name.invalid tag name"]).To(Equal("invalid_tag_name"))
+			Expect(sanitizationReport["tag.value.invalid tag name"]).To(Equal("invalid_description_value"))
+		})
+
+		It("should skip tags with empty names after sanitization", func() {
+			builder := createBuilder()
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				},
+				Tags: []vsphere.Tag{
+					{Name: "", Description: "no-name"},
+					{Name: "valid-tag", Description: "valid-value"},
+				},
+			}
+			builder.Source.Inventory = &mockInventory{vm: vm}
+
+			labels, _, _, err := builder.SourceVMLabelsAndAnnotations(ref.Ref{ID: "vm-1"}, nil)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(labels).To(HaveLen(1))
+			Expect(labels["vsphere.forklift.konveyor.io/valid-tag"]).To(Equal("valid-value"))
+		})
+
+		It("should convert both tags and custom attributes together", func() {
+			builder := createBuilder()
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				},
+				Tags: []vsphere.Tag{
+					{Name: "owner", Description: "platform-team"},
+				},
+				CustomDef: []vsphere.CustomFieldDef{
+					{Key: 100, Name: "app-name"},
+				},
+				CustomValues: []vsphere.CustomFieldValue{
+					{Key: 100, Value: "my-application"},
+				},
+			}
+			builder.Source.Inventory = &mockInventory{vm: vm}
+
+			labels, annotations, _, err := builder.SourceVMLabelsAndAnnotations(ref.Ref{ID: "vm-1"}, nil)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(labels).To(HaveLen(1))
+			Expect(labels["vsphere.forklift.konveyor.io/owner"]).To(Equal("platform-team"))
+			Expect(annotations).To(HaveLen(1))
+			Expect(annotations["vsphere.forklift.konveyor.io/app-name"]).To(Equal("my-application"))
+		})
+
+		It("should convert no tags to labels when tagMapping.Disabled is true", func() {
+			builder := createBuilder()
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				},
+				Tags: []vsphere.Tag{
+					{Name: "owner", Description: "platform-team"},
+					{Name: "environment", Description: "production"},
+				},
+				CustomDef: []vsphere.CustomFieldDef{
+					{Key: 100, Name: "app-name"},
+				},
+				CustomValues: []vsphere.CustomFieldValue{
+					{Key: 100, Value: "my-application"},
+				},
+			}
+			builder.Source.Inventory = &mockInventory{vm: vm}
+
+			tagMapping := &v1beta1.TagMapping{
+				Disabled: true,
+			}
+			labels, annotations, _, err := builder.SourceVMLabelsAndAnnotations(ref.Ref{ID: "vm-1"}, tagMapping)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(labels).To(BeEmpty())
+			Expect(annotations).To(HaveLen(1))
+			Expect(annotations["vsphere.forklift.konveyor.io/app-name"]).To(Equal("my-application"))
+		})
+
+		It("should ignore LabelTags when tagMapping.Disabled is true", func() {
+			builder := createBuilder()
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				},
+				Tags: []vsphere.Tag{
+					{Name: "owner", Description: "platform-team"},
+					{Name: "environment", Description: "production"},
+				},
+			}
+			builder.Source.Inventory = &mockInventory{vm: vm}
+
+			tagMapping := &v1beta1.TagMapping{
+				Disabled:  true,
+				LabelTags: []string{"owner"},
+			}
+			labels, _, _, err := builder.SourceVMLabelsAndAnnotations(ref.Ref{ID: "vm-1"}, tagMapping)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(labels).To(BeEmpty())
+		})
+
+		It("should convert all tags when tagMapping has empty LabelTags", func() {
+			builder := createBuilder()
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				},
+				Tags: []vsphere.Tag{
+					{Name: "owner", Description: "platform-team"},
+					{Name: "environment", Description: "production"},
+				},
+			}
+			builder.Source.Inventory = &mockInventory{vm: vm}
+
+			tagMapping := &v1beta1.TagMapping{
+				LabelTags: []string{},
+			}
+			labels, _, _, err := builder.SourceVMLabelsAndAnnotations(ref.Ref{ID: "vm-1"}, tagMapping)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(labels).To(HaveLen(2))
+			Expect(labels["vsphere.forklift.konveyor.io/owner"]).To(Equal("platform-team"))
+			Expect(labels["vsphere.forklift.konveyor.io/environment"]).To(Equal("production"))
+		})
+
+		It("should report sanitized custom attribute names", func() {
+			builder := createBuilder()
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				},
+				CustomDef: []vsphere.CustomFieldDef{
+					{Key: 100, Name: "invalid attr name"},
+				},
+				CustomValues: []vsphere.CustomFieldValue{
+					{Key: 100, Value: "some-value"},
+				},
+			}
+			builder.Source.Inventory = &mockInventory{vm: vm}
+
+			_, annotations, sanitizationReport, err := builder.SourceVMLabelsAndAnnotations(ref.Ref{ID: "vm-1"}, nil)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(annotations).To(HaveLen(1))
+			Expect(annotations["vsphere.forklift.konveyor.io/invalid_attr_name"]).To(Equal("some-value"))
+			Expect(sanitizationReport).To(HaveLen(1))
+			Expect(sanitizationReport["customAttribute.name.invalid attr name"]).To(Equal("invalid_attr_name"))
+		})
+
+		It("should skip custom attributes whose name sanitizes to empty", func() {
+			builder := createBuilder()
+			vm := model.VM{
+				VM1: model.VM1{
+					VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				},
+				CustomDef: []vsphere.CustomFieldDef{
+					{Key: 100, Name: "!@#$"},
+					{Key: 101, Name: "valid-attr"},
+				},
+				CustomValues: []vsphere.CustomFieldValue{
+					{Key: 100, Value: "should-be-skipped"},
+					{Key: 101, Value: "kept"},
+				},
+			}
+			builder.Source.Inventory = &mockInventory{vm: vm}
+
+			_, annotations, _, err := builder.SourceVMLabelsAndAnnotations(ref.Ref{ID: "vm-1"}, nil)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(annotations).To(HaveLen(1))
+			Expect(annotations["vsphere.forklift.konveyor.io/valid-attr"]).To(Equal("kept"))
+			Expect(annotations).NotTo(HaveKey("vsphere.forklift.konveyor.io/"))
+		})
+	})
+
 	builder := createBuilder()
 	DescribeTable("should", func(vm *model.VM, outputMap string) {
 		Expect(builder.mapMacStaticIps(vm)).Should(Equal(outputMap))
@@ -182,84 +749,152 @@ var _ = Describe("vSphere builder", func() {
 	)
 
 	DescribeTable("should", func(disks []vsphere.Disk, output []vsphere.Disk) {
-		Expect(builder.sortedDisksAsLibvirt(disks)).Should(Equal(output))
+		vm := &model.VM1{}
+		vm.Disks = disks
+		Expect(vm.SortedDisksAsLibvirt()).Should(Equal(output))
 	},
 		Entry("sort all disks by buses",
 			[]vsphere.Disk{
-				{Key: 1, Bus: container.IDE},
-				{Key: 1, Bus: container.SATA},
-				{Key: 1, Bus: container.SCSI},
-				{Key: 2, Bus: container.SCSI},
+				{Key: 1, Bus: vsphere.IDE},
+				{Key: 1, Bus: vsphere.SATA},
+				{Key: 1, Bus: vsphere.SCSI},
+				{Key: 2, Bus: vsphere.SCSI},
 			},
 			[]vsphere.Disk{
-				{Key: 1, Bus: container.SCSI},
-				{Key: 2, Bus: container.SCSI},
-				{Key: 1, Bus: container.SATA},
-				{Key: 1, Bus: container.IDE},
+				{Key: 1, Bus: vsphere.SCSI},
+				{Key: 2, Bus: vsphere.SCSI},
+				{Key: 1, Bus: vsphere.SATA},
+				{Key: 1, Bus: vsphere.IDE},
 			},
 		),
 		Entry("sort IDE and SATA disks by buses",
 			[]vsphere.Disk{
-				{Key: 1, Bus: container.IDE},
-				{Key: 1, Bus: container.SATA},
+				{Key: 1, Bus: vsphere.IDE},
+				{Key: 1, Bus: vsphere.SATA},
 			},
 			[]vsphere.Disk{
-				{Key: 1, Bus: container.SATA},
-				{Key: 1, Bus: container.IDE},
+				{Key: 1, Bus: vsphere.SATA},
+				{Key: 1, Bus: vsphere.IDE},
 			},
 		),
 		Entry("sort multiple SATA disks by buses",
 			[]vsphere.Disk{
-				{Key: 3, Bus: container.SATA},
-				{Key: 1, Bus: container.SATA},
-				{Key: 2, Bus: container.SATA},
+				{Key: 3, Bus: vsphere.SATA},
+				{Key: 1, Bus: vsphere.SATA},
+				{Key: 2, Bus: vsphere.SATA},
 			},
 			[]vsphere.Disk{
-				{Key: 1, Bus: container.SATA},
-				{Key: 2, Bus: container.SATA},
-				{Key: 3, Bus: container.SATA},
+				{Key: 1, Bus: vsphere.SATA},
+				{Key: 2, Bus: vsphere.SATA},
+				{Key: 3, Bus: vsphere.SATA},
 			},
 		),
 		Entry("sort multiple SATA and multiple SCSI disks by buses",
 			[]vsphere.Disk{
-				{Key: 3, Bus: container.SATA},
-				{Key: 3, Bus: container.SCSI},
-				{Key: 2, Bus: container.SCSI},
-				{Key: 1, Bus: container.SATA},
-				{Key: 2, Bus: container.SATA},
-				{Key: 1, Bus: container.SCSI},
+				{Key: 3, Bus: vsphere.SATA},
+				{Key: 3, Bus: vsphere.SCSI},
+				{Key: 2, Bus: vsphere.SCSI},
+				{Key: 1, Bus: vsphere.SATA},
+				{Key: 2, Bus: vsphere.SATA},
+				{Key: 1, Bus: vsphere.SCSI},
 			},
 			[]vsphere.Disk{
-				{Key: 1, Bus: container.SCSI},
-				{Key: 2, Bus: container.SCSI},
-				{Key: 3, Bus: container.SCSI},
-				{Key: 1, Bus: container.SATA},
-				{Key: 2, Bus: container.SATA},
-				{Key: 3, Bus: container.SATA},
+				{Key: 1, Bus: vsphere.SCSI},
+				{Key: 2, Bus: vsphere.SCSI},
+				{Key: 3, Bus: vsphere.SCSI},
+				{Key: 1, Bus: vsphere.SATA},
+				{Key: 2, Bus: vsphere.SATA},
+				{Key: 3, Bus: vsphere.SATA},
 			},
 		),
 		Entry("sort multiple all disks by buses",
 			[]vsphere.Disk{
-				{Key: 2, Bus: container.IDE},
-				{Key: 3, Bus: container.SATA},
-				{Key: 3, Bus: container.SCSI},
-				{Key: 2, Bus: container.SCSI},
-				{Key: 3, Bus: container.IDE},
-				{Key: 1, Bus: container.SATA},
-				{Key: 2, Bus: container.SATA},
-				{Key: 1, Bus: container.SCSI},
-				{Key: 1, Bus: container.IDE},
+				{Key: 2, Bus: vsphere.IDE},
+				{Key: 3, Bus: vsphere.SATA},
+				{Key: 3, Bus: vsphere.SCSI},
+				{Key: 2, Bus: vsphere.SCSI},
+				{Key: 3, Bus: vsphere.IDE},
+				{Key: 1, Bus: vsphere.SATA},
+				{Key: 2, Bus: vsphere.SATA},
+				{Key: 1, Bus: vsphere.SCSI},
+				{Key: 1, Bus: vsphere.IDE},
 			},
 			[]vsphere.Disk{
-				{Key: 1, Bus: container.SCSI},
-				{Key: 2, Bus: container.SCSI},
-				{Key: 3, Bus: container.SCSI},
-				{Key: 1, Bus: container.SATA},
-				{Key: 2, Bus: container.SATA},
-				{Key: 3, Bus: container.SATA},
-				{Key: 1, Bus: container.IDE},
-				{Key: 2, Bus: container.IDE},
-				{Key: 3, Bus: container.IDE},
+				{Key: 1, Bus: vsphere.SCSI},
+				{Key: 2, Bus: vsphere.SCSI},
+				{Key: 3, Bus: vsphere.SCSI},
+				{Key: 1, Bus: vsphere.SATA},
+				{Key: 2, Bus: vsphere.SATA},
+				{Key: 3, Bus: vsphere.SATA},
+				{Key: 1, Bus: vsphere.IDE},
+				{Key: 2, Bus: vsphere.IDE},
+				{Key: 3, Bus: vsphere.IDE},
+			},
+		),
+		Entry("sort NVMe disks with other buses",
+			[]vsphere.Disk{
+				{Key: 1, Bus: vsphere.NVME},
+				{Key: 1, Bus: vsphere.SCSI},
+				{Key: 2, Bus: vsphere.NVME},
+				{Key: 1, Bus: vsphere.SATA},
+			},
+			[]vsphere.Disk{
+				{Key: 1, Bus: vsphere.SCSI},
+				{Key: 1, Bus: vsphere.SATA},
+				{Key: 1, Bus: vsphere.NVME},
+				{Key: 2, Bus: vsphere.NVME},
+			},
+		),
+		Entry("sort multiple NVMe disks by key",
+			[]vsphere.Disk{
+				{Key: 3, Bus: vsphere.NVME},
+				{Key: 1, Bus: vsphere.NVME},
+				{Key: 2, Bus: vsphere.NVME},
+			},
+			[]vsphere.Disk{
+				{Key: 1, Bus: vsphere.NVME},
+				{Key: 2, Bus: vsphere.NVME},
+				{Key: 3, Bus: vsphere.NVME},
+			},
+		),
+		Entry("sort all disk types including NVMe",
+			[]vsphere.Disk{
+				{Key: 2, Bus: vsphere.NVME},
+				{Key: 2, Bus: vsphere.IDE},
+				{Key: 3, Bus: vsphere.SATA},
+				{Key: 3, Bus: vsphere.SCSI},
+				{Key: 1, Bus: vsphere.NVME},
+				{Key: 2, Bus: vsphere.SCSI},
+				{Key: 3, Bus: vsphere.IDE},
+				{Key: 1, Bus: vsphere.SATA},
+				{Key: 2, Bus: vsphere.SATA},
+				{Key: 1, Bus: vsphere.SCSI},
+				{Key: 1, Bus: vsphere.IDE},
+			},
+			[]vsphere.Disk{
+				{Key: 1, Bus: vsphere.SCSI},
+				{Key: 2, Bus: vsphere.SCSI},
+				{Key: 3, Bus: vsphere.SCSI},
+				{Key: 1, Bus: vsphere.SATA},
+				{Key: 2, Bus: vsphere.SATA},
+				{Key: 3, Bus: vsphere.SATA},
+				{Key: 1, Bus: vsphere.IDE},
+				{Key: 2, Bus: vsphere.IDE},
+				{Key: 3, Bus: vsphere.IDE},
+				{Key: 1, Bus: vsphere.NVME},
+				{Key: 2, Bus: vsphere.NVME},
+			},
+		),
+		Entry("sort SCSI disks by controller key then unit when device keys are not monotonic",
+			[]vsphere.Disk{
+				{Key: 2000, Bus: vsphere.SCSI, ControllerKey: 1001, UnitNumber: 0},
+				{Key: 1800, Bus: vsphere.SCSI, ControllerKey: 1000, UnitNumber: 2},
+				{Key: 1700, Bus: vsphere.SCSI, ControllerKey: 1000, UnitNumber: 0},
+			},
+			[]vsphere.Disk{
+				{Key: 1700, Bus: vsphere.SCSI, ControllerKey: 1000, UnitNumber: 0},
+				{Key: 1800, Bus: vsphere.SCSI, ControllerKey: 1000, UnitNumber: 2},
+				{Key: 2000, Bus: vsphere.SCSI, ControllerKey: 1001, UnitNumber: 0},
 			},
 		),
 	)
@@ -269,6 +904,8 @@ var _ = Describe("vSphere builder", func() {
 func createBuilder(objs ...runtime.Object) *Builder {
 	scheme := runtime.NewScheme()
 	_ = v1.AddToScheme(scheme)
+	_ = core.AddToScheme(scheme)
+	_ = rbacv1.AddToScheme(scheme)
 	v1beta1.SchemeBuilder.AddToScheme(scheme)
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -279,11 +916,23 @@ func createBuilder(objs ...runtime.Object) *Builder {
 			Destination: plancontext.Destination{
 				Client: client,
 			},
-			Plan: createPlan(),
-			Log:  builderLog,
-
-			// To make sure r.Scheme is not nil
-			Client: client,
+			Source: plancontext.Source{
+				Provider: &v1beta1.Provider{
+					ObjectMeta: meta.ObjectMeta{Name: "test-vsphere-provider", Namespace: "test"},
+					Spec: v1beta1.ProviderSpec{
+						Type: (*v1beta1.ProviderType)(ptr.To("vsphere")),
+						URL:  "https://vcenter.test.example.com/sdk",
+					},
+				},
+				Inventory: nil,
+				Secret: &core.Secret{
+					ObjectMeta: meta.ObjectMeta{Name: "test-provider-secret", Namespace: "test"},
+				},
+			},
+			Plan:      createPlan(),
+			Migration: &v1beta1.Migration{ObjectMeta: meta.ObjectMeta{UID: k8stypes.UID("123")}},
+			Log:       builderLog,
+			Client:    client,
 		},
 	}
 }

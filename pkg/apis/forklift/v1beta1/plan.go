@@ -17,6 +17,9 @@ limitations under the License.
 package v1beta1
 
 import (
+	"context"
+
+	k8snet "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/provider"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
@@ -25,6 +28,25 @@ import (
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	cnv "kubevirt.io/api/core/v1"
+	k8sclient "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// MigrationType defines the type of migration to perform
+type MigrationType string
+
+const (
+	// Migration types
+	MigrationCold           MigrationType = "cold"
+	MigrationWarm           MigrationType = "warm"
+	MigrationLive           MigrationType = "live"
+	MigrationOnlyConversion MigrationType = "conversion"
+)
+
+const (
+	// namespaceLabelPrimaryUDN is the label key used to identify namespaces with primary user-defined networks
+	namespaceLabelPrimaryUDN = "k8s.ovn.org/primary-user-defined-network"
+	// nadLabelUDN is the label key used to identify NetworkAttachmentDefinitions that are user-defined networks
+	nadLabelUDN = "k8s.ovn.org/user-defined-network"
 )
 
 // PlanSpec defines the desired state of Plan.
@@ -33,6 +55,73 @@ type PlanSpec struct {
 	Description string `json:"description,omitempty"`
 	// Target namespace.
 	TargetNamespace string `json:"targetNamespace"`
+	// ServiceAccount is the name of the ServiceAccount to use for migration
+	// pods in the target namespace. Overrides the global setting.
+	// If empty, falls back to ForkliftController's controller_migration_service_account,
+	// then to the namespace default.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	ServiceAccount string `json:"serviceAccount,omitempty"`
+	// TargetLabels are labels that should be applied to the target virtual machines.
+	// Note: System-managed labels (migration, plan, vmID, app) will override any user-defined
+	// labels with the same keys to ensure proper system functionality.
+	// See Pod Labels documentation for more details,
+	// https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#labels
+	TargetLabels map[string]string `json:"targetLabels,omitempty"`
+	// TargetNodeSelector, constrains the scheduler to only schedule VMs on nodes,
+	// which contain the specified labels.
+	// See virtual machine instance NodeSelector documentation for more details,
+	// https://kubevirt.io/user-guide/compute/node_assignment/#nodeselector
+	TargetNodeSelector map[string]string `json:"targetNodeSelector,omitempty"`
+	// TargetAffinity allows specifying hard- and soft-affinity for VMs.
+	// it is possible to write matching rules against workloads (VMs and Pods) and Nodes.
+	// Since VMs are a workload type based on Pods, Pod-affinity affects VMs as well.
+	// See virtual machine instance Affinity documentation for more details,
+	// https://kubevirt.io/user-guide/compute/node_assignment/#affinity-and-anti-affinity
+	// +structType=atomic
+	TargetAffinity *core.Affinity `json:"targetAffinity,omitempty"`
+	// ConvertorLabels are labels that should be applied to the virt-v2v convertor pods.
+	// The convertor pods run virt-v2v to convert VMware disks, install KVM guest agents and drivers,
+	// and handle disk data migration for cold migrations from VMware to KubeVirt.
+	// Note: System-managed labels (migration, plan, vmID, forklift.app) will override any user-defined
+	// labels with the same keys to ensure proper system functionality.
+	// See Pod Labels documentation for more details,
+	// https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#labels
+	ConvertorLabels map[string]string `json:"convertorLabels,omitempty"`
+	// ConvertorNodeSelector constrains the scheduler to only schedule virt-v2v convertor pods on nodes
+	// which contain the specified labels. This is useful for dedicating specific nodes for disk conversion
+	// workloads that require high I/O performance or network access to source VMware infrastructure.
+	// See Pod NodeSelector documentation for more details,
+	// https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector
+	ConvertorNodeSelector map[string]string `json:"convertorNodeSelector,omitempty"`
+	// ConvertorAffinity allows specifying hard- and soft-affinity for virt-v2v convertor pods.
+	// This can be used to optimize placement for disk conversion performance, such as co-locating
+	// with storage or ensuring network proximity to VMware infrastructure for cold migration data transfers.
+	// See Pod Affinity documentation for more details,
+	// https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity
+	// +structType=atomic
+	ConvertorAffinity *core.Affinity `json:"convertorAffinity,omitempty"`
+	// ConversionTempStorageClass specifies the storage class to use for temporary conversion storage.
+	// When specified, virt-v2v conversion pods will use a temporary PVC from this storage class
+	// instead of using the node's ephemeral storage for the conversion scratch space.
+	// This is useful for:
+	//   - Large VM migrations (10+ TB disks) where fstrim operations create large overlays
+	//   - OVA imports that require full uncompressed disk copies in temporary storage
+	//   - Nodes with limited ephemeral storage that may cause pod eviction due to storage pressure
+	// The temporary PVC is automatically created and deleted with the conversion pod.
+	// +optional
+	ConversionTempStorageClass string `json:"conversionTempStorageClass,omitempty"`
+	// ConversionTempStorageSize specifies the size of the temporary conversion storage PVC.
+	// Only used when ConversionTempStorageClass is specified.
+	// User specification allows for buffer space beyond the largest disk size to accommodate:
+	//   - Temporary files during conversion
+	//   - Multiple concurrent conversions
+	//   - OVA imports requiring full uncompressed copies
+	// Recommended minimum: size of the largest VM disk being migrated.
+	// Format: standard Kubernetes resource quantity (e.g., "30Gi", "1Ti")
+	// +optional
+	ConversionTempStorageSize string `json:"conversionTempStorageSize,omitempty"`
 	// Providers.
 	Provider provider.Pair `json:"provider"`
 	// Resource mapping.
@@ -40,6 +129,7 @@ type PlanSpec struct {
 	// List of VMs.
 	VMs []plan.VM `json:"vms"`
 	// Whether this is a warm migration.
+	// Deprecated: this field will be deprecated in 2.10. Use Type instead.
 	Warm bool `json:"warm,omitempty"`
 	// The network attachment definition that should be used for disk transfer.
 	TransferNetwork *core.ObjectReference `json:"transferNetwork,omitempty"`
@@ -48,33 +138,73 @@ type PlanSpec struct {
 	// Preserve the CPU model and flags the VM runs with in its oVirt cluster.
 	PreserveClusterCPUModel bool `json:"preserveClusterCpuModel,omitempty"`
 	// Preserve static IPs of VMs in vSphere
+	// +kubebuilder:default:=true
 	PreserveStaticIPs bool `json:"preserveStaticIPs,omitempty"`
+	// SkipZoneNodeSelector controls whether to skip adding a zone-based node selector to
+	// migrated VMs. By default, the migration automatically reads the availability zone from
+	// the source provider's spec.settings.target-az configuration and adds a node selector
+	// (topology.kubernetes.io/zone=<target-az>) to the target VM. This ensures VMs are
+	// scheduled on nodes in the same zone as their EBS volumes, which is required for
+	// volume attachment by the CSI driver.
+	// Currently supported for EC2 provider only.
+	// - false (default): Add zone-based node selector using value from provider's spec.settings.target-az
+	// - true: Skip adding zone-based node selector
+	// +optional
+	SkipZoneNodeSelector bool `json:"skipZoneNodeSelector,omitempty"`
 	// Deprecated: this field will be deprecated in 2.8.
 	DiskBus cnv.DiskBus `json:"diskBus,omitempty"`
 	// PVCNameTemplate is a template for generating PVC names for VM disks.
-	// It follows Go template syntax and has access to the following variables:
-	//   - .VmName: name of the VM
+	// Generated names must be valid DNS-1123 labels (lowercase alphanumerics, '-' allowed, max 63 chars).
+	// It follows Go template syntax and has access to provider-specific variables.
+	//
+	// Common variables (all providers):
+	//   - .VmName: name of the VM in the source cluster (original source name)
+	//   - .TargetVmName: final VM name in the target cluster (may equal .VmName if no rename/normalization)
 	//   - .PlanName: name of the migration plan
 	//   - .DiskIndex: initial volume index of the disk
-	//   - .WinDriveLetter: Windows drive letter (lower case, if applicable, e.g. "c", require guest agent)
+	//
+	// VMware (vSphere) specific variables:
+	//   - .WinDriveLetter: Windows drive letter (lowercase, if applicable, e.g. "c", requires guest agent)
 	//   - .RootDiskIndex: index of the root disk
 	//   - .Shared: true if the volume is shared by multiple VMs, false otherwise
-	//   - .FileName: name of the file in the source provider (vmWare only, require guest agent)
+	//   - .FileName: name of the file in the source provider (filename includes the .vmdk suffix)
+	//
+	// OpenShift specific variables:
+	//   - .SourcePVCName: name of the PVC in the source cluster
+	//   - .SourcePVCNamespace: namespace of the PVC in the source cluster
+	//
+	// Default behavior when not set:
+	//   - VMware: generates names like "{{trunc 4 .PlanName}}-{{trunc 4 .VmName}}-disk-{{.DiskIndex}}"
+	//   - OpenShift: uses the original source PVC name ("{{.SourcePVCName}}")
+	//
 	// Note:
 	//   This template can be overridden at the individual VM level.
 	// Examples:
-	//   "{{.VmName}}-disk-{{.DiskIndex}}"
-	//   "{{if eq .DiskIndex .RootDiskIndex}}root{{else}}data{{end}}-{{.DiskIndex}}"
-	//   "{{if .Shared}}shared-{{end}}{{.VmName}}-{{.DiskIndex}}"
+	//   "{{.TargetVmName}}-disk-{{.DiskIndex}}"
+	//   "{{if eq .DiskIndex .RootDiskIndex}}root{{else}}data{{end}}-{{.DiskIndex}}" (VMware)
+	//   "{{.TargetVmName}}-{{.SourcePVCName}}" (OpenShift)
+	// See:
+	// 	 https://github.com/kubev2v/forklift/tree/main/pkg/templateutil for template functions.
 	// +optional
 	PVCNameTemplate string `json:"pvcNameTemplate,omitempty"`
 	// PVCNameTemplateUseGenerateName indicates if the PVC name template should use generateName instead of name.
-	// Setting this to false will use the name field of the PVCNameTemplate.
-	// This is useful when using a template that generates a name without a suffix.
-	// For example, if the template is "{{.VmName}}-disk-{{.DiskIndex}}", setting this to false will result in
-	// the PVC name being "{{.VmName}}-disk-{{.DiskIndex}}", which may not be unique.
-	// but will be more predictable.
-	// **DANGER** When set to false, the generated PVC name may not be unique and may cause conflicts.
+	// This field controls whether the template output is used as an exact name or as a prefix for generated names.
+	//
+	// Provider-specific behavior:
+	//
+	// VMware (vSphere):
+	//   - true (default): Template output is used as generateName prefix, Kubernetes adds a random suffix
+	//     (e.g., "my-vm-disk-0-" becomes "my-vm-disk-0-abc12")
+	//   - false: Template output is used as the exact PVC name
+	//     **DANGER**: May cause conflicts if the generated name is not unique
+	//
+	// OpenShift:
+	//   - Supported when a custom pvcNameTemplate is set (plan-level or VM-level).
+	//   - When no custom template is set, the default "{{.SourcePVCName}}" always uses exact names
+	//     regardless of this field.
+	//   - true: Template output is used as generateName prefix, Kubernetes adds a random suffix
+	//   - false: Template output is used as the exact PVC name
+	//
 	// +optional
 	// +kubebuilder:default:=true
 	PVCNameTemplateUseGenerateName bool `json:"pvcNameTemplateUseGenerateName,omitempty"`
@@ -82,9 +212,14 @@ type PlanSpec struct {
 	// It follows Go template syntax and has access to the following variables:
 	//   - .PVCName: name of the PVC mounted to the VM using this volume
 	//   - .VolumeIndex: sequential index of the volume interface (0-based)
+	//
+	// Provider support:
+	//   - VMware (vSphere): Supported. Default naming is "vol-{index}".
+	//   - OpenShift: Not supported. Volume names are preserved from the source VM.
+	//
 	// Note:
 	//   - This template can be overridden at the individual VM level
-	//   - If not specified on VM level and on Plan leverl, default naming conventions will be used
+	//   - If not specified on VM level and on Plan level, default naming conventions will be used
 	// Examples:
 	//   "disk-{{.VolumeIndex}}"
 	//   "pvc-{{.PVCName}}"
@@ -97,9 +232,14 @@ type PlanSpec struct {
 	//   - .NetworkType: type of the network ("Multus" or "Pod")
 	//   - .NetworkIndex: sequential index of the network interface (0-based)
 	// The template can be used to customize network interface names based on target network configuration.
+	//
+	// Provider support:
+	//   - VMware (vSphere): Supported. Network interface names can be customized.
+	//   - OpenShift: Not supported. Network interface names are preserved from the source VM.
+	//
 	// Note:
 	//   - This template can be overridden at the individual VM level
-	//   - If not specified on VM level and on Plan leverl, default naming conventions will be used
+	//   - If not specified on VM level and on Plan level, default naming conventions will be used
 	// Examples:
 	//   "net-{{.NetworkIndex}}"
 	//   "{{if eq .NetworkType "Pod"}}pod{{else}}multus-{{.NetworkIndex}}{{end}}"
@@ -108,12 +248,31 @@ type PlanSpec struct {
 	// Determines if the plan should migrate shared disks.
 	// +kubebuilder:default:=true
 	MigrateSharedDisks bool `json:"migrateSharedDisks,omitempty"`
+	// RDMAsLun controls whether RDM (Raw Device Mapping) disks from VMware should be
+	// mapped as LUN devices in the target KubeVirt VM instead of regular disk devices.
+	// When true, RDM disks are attached using lun: {} which allows the guest to execute
+	// arbitrary SCSI command passthrough (SGIO).
+	// This is useful when the source VM uses RDM disks for applications that require
+	// direct SCSI access, such as shared storage clusters or database applications.
+	// +optional
+	RDMAsLun bool `json:"rdmAsLun,omitempty"`
 	// DeleteGuestConversionPod determines if the guest conversion pod should be deleted after successful migration.
 	// Note:
 	//   - If this option is enabled and migration succeeds then the pod will get deleted. However the VM could still not boot and the virt-v2v logs, with additional information, will be deleted alongside guest conversion pod.
 	//   - If migration fails the conversion pod will remain present even if this option is enabled.
 	// +optional
 	DeleteGuestConversionPod bool `json:"deleteGuestConversionPod,omitempty"`
+	// DeleteVmOnFailMigration controls whether the target VM created by this Plan is deleted when a migration fails.
+	// When true and the migration fails after the target VM has been created, the controller
+	// will delete the target VM (and related target-side resources) during failed-migration cleanup
+	// and when the Plan is deleted. When false (default), the target VM is preserved to aid
+	// troubleshooting. The source VM is never modified.
+	//
+	// Note: If the Plan-level option is set to true, the VM-level option will be ignored.
+	//
+	// +optional
+	// +kubebuilder:default:=true
+	DeleteVmOnFailMigration bool `json:"deleteVmOnFailMigration,omitempty"`
 	// InstallLegacyDrivers determines whether to install legacy windows drivers in the VM.
 	//The following Vm's are lack of SHA-2 support and need legacy drivers:
 	// Windows XP (all)
@@ -129,8 +288,26 @@ type PlanSpec struct {
 	// - If set to false, legacy drivers will be skipped, and the system will fall back to using the standard (SHA-2 signed) drivers.
 	//
 	// When enabled, legacy drivers are exposed to the virt-v2v conversion process via the VIRTIO_WIN environment variable,
-	// which points to the legacy ISO at /usr/local/virtio-win.iso.
+	// which points to the legacy ISO at /usr/local/virtio-win-legacy.iso.
 	InstallLegacyDrivers *bool `json:"installLegacyDrivers,omitempty"`
+	// EnableNestedVirtualization controls whether nested virtualization CPU features (vmx for Intel,
+	// svm for AMD) are requested on the target VM.
+	//
+	// - nil (default): Auto-detect from the source VM settings. If the source had nested
+	//   virtualization enabled, the target will request it; otherwise no CPU feature is added.
+	// - true: Request nested virtualization on the target VM (overrides source settings).
+	//   Both vmx and svm CPU features are added with policy "optional", meaning the VM will
+	//   have nested virtualization only if the underlying host hardware supports it.
+	//   This does NOT guarantee nested virtualization; it is a best-effort hint to the hypervisor.
+	// - false: Explicitly disable nested virtualization on the target VM (overrides source settings).
+	//   Both vmx and svm CPU features are added with policy "disable", unconditionally preventing
+	//   nested virtualization regardless of host capability.
+	//
+	// Both vmx and svm are added together so the VM is portable across Intel and AMD hosts.
+	// The "optional" policy activates only the feature the host CPU supports; the other is ignored.
+	//
+	// +optional
+	EnableNestedVirtualization *bool `json:"enableNestedVirtualization,omitempty"`
 	// Determines if the plan should skip the guest conversion.
 	// +kubebuilder:default:=false
 	SkipGuestConversion bool `json:"skipGuestConversion,omitempty"`
@@ -140,12 +317,77 @@ type PlanSpec struct {
 	// - false: Use high-performance VirtIO devices (requires VirtIO drivers already installed in source VM)
 	// +kubebuilder:default:=true
 	UseCompatibilityMode bool `json:"useCompatibilityMode,omitempty"`
+	// Migration type. e.g. "cold", "warm", "live", "conversion". Supersedes the `warm` boolean if set.
+	// +optional
+	// +kubebuilder:validation:Enum=cold;warm;live;conversion
+	Type MigrationType `json:"type,omitempty"`
+	// TargetPowerState specifies the desired power state of the target VM after migration.
+	// - "on": Target VM will be powered on after migration
+	// - "off": Target VM will be powered off after migration
+	// - "auto" or nil (default): Target VM will match the source VM's power state
+	// +optional
+	// +kubebuilder:validation:Enum=on;off;auto
+	TargetPowerState plan.TargetPowerState `json:"targetPowerState,omitempty"`
+	// RunPreflightInspection controls whether an inspection step on VM base disks is performed before starting the first disk transfer. Applies only to warm migrations from VMWare.
+	// - true (default): Inspection step runs before transferring any disks and may fail if it detects the migration would fail.
+	// - false: No inspection is performed before disk transfer.
+	// +kubebuilder:default:=true
+	RunPreflightInspection bool `json:"runPreflightInspection,omitempty"`
+	// CustomizationScripts references a ConfigMap containing customization scripts
+	// to run during guest conversion. The ConfigMap must exist in the specified
+	// namespace and contain script files with keys following these patterns:
+	//   - Windows: [0-9]+_win_firstboot_[description_text].ps1
+	//   - Linux: [0-9]+_linux_(run|firstboot)_[description_text].sh
+	// Scripts are mounted at /mnt/dynamic_scripts in the conversion pod and
+	// executed by virt-customize. The number at the start of the key determines the
+	// execution order. If not specified, no custom scripts are injected.
+	// +optional
+	CustomizationScripts *core.ObjectReference `json:"customizationScripts,omitempty"`
+	// VirtV2vImage overrides the global virt-v2v container image for this plan.
+	// When set, virt-v2v pods created by this plan will use this image instead
+	// of the cluster-wide VIRT_V2V_IMAGE setting.
+	// Use this to run different virt-v2v builds for specific migration scenarios
+	VirtV2vImage string `json:"virtV2vImage,omitempty"`
+	// XfsCompatibility overrides the global virt-v2v container image for this plan.
+	// When set, virt-v2v pods created by this plan will use the XFS compatible image
+	// VIRT_V2V_IMAGE_XFS instead of the cluster-wide VIRT_V2V_IMAGE setting.
+	// Use this to enable XFSv4 compatibility mode for specific plan.
+	// Warning: Enabling XFSv4 support will drop support for BTRFS for the specific plan. Ensure that the plan only selects VMs with supported filesystem.
+	// +kubebuilder:default:=false
+	XfsCompatibility bool `json:"xfsCompatibility,omitempty"`
+	// TagMapping configures how vSphere tags are converted to Kubernetes labels on the destination VM.
+	// Only applicable to vSphere sources; ignored for other providers (EC2, Hyper-V, oVirt, OpenStack).
+	// If not specified, all tags become labels (default behavior).
+	// If specified with Disabled: true, no tags become labels.
+	// If specified with LabelTags, only those tags become labels; others are ignored.
+	// Custom attributes always become annotations regardless of this setting.
+	// Examples:
+	//   tagMapping:
+	//     disabled: true
+	//
+	//   tagMapping:
+	//     labelTags:
+	//       - owner
+	//       - cost-center
+	//       - environment
+	// +optional
+	TagMapping *TagMapping `json:"tagMapping,omitempty"`
 }
 
 // Find a planned VM.
 func (r *PlanSpec) FindVM(ref ref.Ref) (v *plan.VM, found bool) {
-	for _, vm := range r.VMs {
-		if vm.ID == ref.ID {
+	for i := range r.VMs {
+		vm := r.VMs[i]
+		if vm.ID != "" && vm.ID == ref.ID {
+			found = true
+			v = &vm
+			return
+		}
+	}
+	// Fallback: match by Name when the spec VM has no ID
+	for i := range r.VMs {
+		vm := r.VMs[i]
+		if vm.ID == "" && vm.Name != "" && vm.Name == ref.Name {
 			found = true
 			v = &vm
 			return
@@ -185,35 +427,18 @@ type Plan struct {
 	Referenced `json:"-"`
 }
 
-// // If the plan calls for the vm to be cold migrated to the local cluster, we can
-// // just use virt-v2v directly to convert the vm while copying data over. In other
-// // cases, we use CDI to transfer disks to the destination cluster and then use
-// // virt-v2v-in-place to convert these disks after cutover.
-// func (p *Plan) VSphereColdLocal() (bool, error) {
-// 	source := p.Referenced.Provider.Source
-// 	if source == nil {
-// 		return false, liberr.New("Cannot analyze plan, source provider is missing.")
-// 	}
-// 	destination := p.Referenced.Provider.Destination
-// 	if destination == nil {
-// 		return false, liberr.New("Cannot analyze plan, destination provider is missing.")
-// 	}
+// IsWarm returns true if the plan is a warm migration.
+// Supports both the deprecated 'warm: true' field (for backward compatibility)
+// and the current 'type: warm' field.
+func (p *Plan) IsWarm() bool {
+	return p.Spec.Warm || p.Spec.Type == MigrationWarm
+}
 
-//		switch source.Type() {
-//		case VSphere:
-//			return !p.Spec.Warm && destination.IsHost(), nil
-//		case Ova:
-//			return true, nil
-//		default:
-//			return false, nil
-//		}
-//	}
-//
 // If the plan calls for the vm to be cold migrated to the local cluster, we can
 // just use virt-v2v directly to convert the vm while copying data over. In other
 // cases, we use CDI to transfer disks to the destination cluster and then use
 // virt-v2v-in-place to convert these disks after cutover.
-func (p *Plan) ShouldUseV2vForTransfer() (bool, error) {
+func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref, destinationClient k8sclient.Client) (bool, error) {
 	source := p.Referenced.Provider.Source
 	if source == nil {
 		return false, liberr.New("Cannot analyze plan, source provider is missing.")
@@ -225,14 +450,54 @@ func (p *Plan) ShouldUseV2vForTransfer() (bool, error) {
 
 	switch source.Type() {
 	case VSphere:
-		// The virt-v2v transferes all disks attached to the VM. If we want to skip the shared disks so we don't transfer
-		// them multiple times we need to manage the transfer using KubeVirt CDI DataVolumes and v2v-in-place.
-		return !p.Spec.Warm && destination.IsHost() && p.Spec.MigrateSharedDisks && !p.Spec.SkipGuestConversion, nil
-	case Ova:
+		// Spectro: the virt-v2v transfer path is removed for vSphere. CDI+VDDK
+		// always copies the disks and virt-v2v only converts in place, so this
+		// always reports false. Upstream instead weighs warm/host/shared-disk/
+		// NetApp-shift/offload conditions here to decide between the two paths.
+		//
+		// Returning false here is what drives, via BasePredicate.Evaluate:
+		//   CDIDiskCopy      -> true  (PhaseCopyDisks runs)
+		//   VirtV2vDiskCopy  -> false (PhaseAllocateDisks + PhaseCopyDisksVirtV2V skipped)
+		// and, via KubeVirt.ResolveConversionType, api.InPlace (V2V_inPlace=1).
+		//
+		// OVA/HyperV deliberately keep upstream behaviour below.
+		return false, nil
+	case Ova, HyperV:
 		return true, nil
 	default:
 		return false, nil
 	}
+}
+
+func (r *Plan) DestinationHasUdnNetwork(client k8sclient.Client) bool {
+	key := k8sclient.ObjectKey{
+		Name: r.Spec.TargetNamespace,
+	}
+	namespace := &core.Namespace{}
+	err := client.Get(context.TODO(), key, namespace)
+	if err != nil {
+		return false
+	}
+	_, hasUdnLabel := namespace.ObjectMeta.Labels[namespaceLabelPrimaryUDN]
+	if !hasUdnLabel {
+		return false
+	}
+
+	nadList := &k8snet.NetworkAttachmentDefinitionList{}
+	listOpts := []k8sclient.ListOption{
+		k8sclient.InNamespace(r.Spec.TargetNamespace),
+		k8sclient.MatchingLabels{nadLabelUDN: ""},
+	}
+
+	err = client.List(context.TODO(), nadList, listOpts...)
+	if err != nil {
+		return false
+	}
+
+	if len(nadList.Items) > 0 {
+		return true
+	}
+	return false
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -264,15 +529,47 @@ func (r *Plan) IsSourceProviderOVA() bool {
 	return r.Provider.Source.Type() == Ova
 }
 
-// PVCNameTemplateData contains fields used in naming templates.
-type PVCNameTemplateData struct {
+func (r *Plan) ShouldRunPreflightInspection() bool {
+	return r.IsSourceProviderVSphere() &&
+		r.IsWarm() &&
+		!r.Spec.SkipGuestConversion &&
+		r.Spec.RunPreflightInspection
+}
+
+// IsUsingOffloadPlugin determines if any of the mappings is using storage offload
+func (r *Plan) IsUsingOffloadPlugin() bool {
+	if r.Map.Storage == nil {
+		return false
+	}
+	dsMapIn := r.Map.Storage.Spec.Map
+	for _, m := range dsMapIn {
+		if m.OffloadPlugin != nil && m.OffloadPlugin.VSphereXcopyPluginConfig != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// VSpherePVCNameTemplateData contains fields used in PVC naming templates for vSphere migrations.
+type VSpherePVCNameTemplateData struct {
 	VmName         string `json:"vmName"`
+	TargetVmName   string `json:"targetVmName"`
 	PlanName       string `json:"planName"`
 	DiskIndex      int    `json:"diskIndex"`
 	WinDriveLetter string `json:"winDriveLetter,omitempty"`
 	RootDiskIndex  int    `json:"rootDiskIndex"`
 	Shared         bool   `json:"shared,omitempty"`
 	FileName       string `json:"fileName,omitempty"`
+}
+
+// OCPPVCNameTemplateData contains fields used in PVC naming templates for OpenShift migrations.
+type OCPPVCNameTemplateData struct {
+	VmName             string `json:"vmName"`
+	TargetVmName       string `json:"targetVmName"`
+	PlanName           string `json:"planName"`
+	DiskIndex          int    `json:"diskIndex"`
+	SourcePVCName      string `json:"sourcePVCName"`
+	SourcePVCNamespace string `json:"sourcePVCNamespace"`
 }
 
 // VolumeNameTemplateData contains fields used in naming templates.
@@ -291,4 +588,15 @@ type NetworkNameTemplateData struct {
 	NetworkType string `json:"networkType,omitempty"`
 	// NetworkIndex is the sequential index of the network interface (0-based)
 	NetworkIndex int `json:"networkIndex,omitempty"`
+}
+
+type TagMapping struct {
+	// Disabled completely prevents all tags from being converted to labels.
+	// When true, LabelTags is ignored and no tag labels are applied.
+	// +optional
+	Disabled bool `json:"disabled,omitempty"`
+	// LabelTags filters which vSphere tags become labels (case-insensitive).
+	// Empty means all tags become labels. Ignored when Disabled is true.
+	// +optional
+	LabelTags []string `json:"labelTags,omitempty"`
 }

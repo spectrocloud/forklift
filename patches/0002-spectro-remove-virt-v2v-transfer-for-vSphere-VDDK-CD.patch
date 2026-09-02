@@ -1,0 +1,134 @@
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 14:10:13 -0700
+Subject: [PATCH] spectro: remove virt-v2v transfer for vSphere - VDDK+CDI is
+ compulsory
+
+Re-derived on upstream v2.12.1. Replaces 58efb0e46 + 4d3702189 + cb469fa97
++ ea6ee1f36 from the 2.9.2 line, which hand-rolled an itinerary and
+commented out branches because 2.9.2 lacked a predicate framework.
+
+v2.12.1 has that framework, so the whole behaviour now falls out of one
+change: ShouldUseV2vForTransfer() reports false for vSphere.
+
+  BasePredicate.Evaluate  CDIDiskCopy     -> true   PhaseCopyDisks runs
+                          VirtV2vDiskCopy -> false  PhaseAllocateDisks and
+                                                    PhaseCopyDisksVirtV2V skipped
+  ResolveConversionType                   -> InPlace (V2V_inPlace=1)
+
+vsphere DataVolumes() drops the Blank/VDDK branch and always emits a
+DataVolumeSourceVDDK; AnnVddkExtraArgs is applied whenever a vddk
+ConfigMap exists.
+
+OVA and HyperV keep upstream behaviour, matching the 2.9.2 fork where
+CopyDisksVirtV2V stayed gated on OvaImageMigration.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ pkg/apis/forklift/v1beta1/plan.go             | 35 ++++++----------
+ .../plan/adapter/vsphere/builder.go           | 40 +++++++------------
+ 2 files changed, 26 insertions(+), 49 deletions(-)
+
+diff --git a/pkg/apis/forklift/v1beta1/plan.go b/pkg/apis/forklift/v1beta1/plan.go
+index 0000000..0000000 100644
+--- a/pkg/apis/forklift/v1beta1/plan.go
++++ b/pkg/apis/forklift/v1beta1/plan.go
+@@ -450,29 +450,18 @@ func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref, destinationClient k8sclien
+ 
+ 	switch source.Type() {
+ 	case VSphere:
+-		// The virt-v2v transfers all disks attached to the VM. If we want to skip the shared disks so we don't transfer
+-		// them multiple times we need to manage the transfer using KubeVirt CDI DataVolumes and v2v-in-place.
+-		migrateSharedDisks := p.Spec.MigrateSharedDisks
+-		if vm, found := p.Spec.FindVM(vmRef); found && vm.MigrateSharedDisks != nil {
+-			migrateSharedDisks = *vm.MigrateSharedDisks
+-		}
+-		if p.IsWarm() || !destination.IsHost() || !migrateSharedDisks ||
+-			p.Spec.SkipGuestConversion || p.Spec.Type == MigrationOnlyConversion {
+-			return false, nil
+-		}
+-		if p.Map.Storage != nil {
+-			hasNetAppShift, err := p.Map.Storage.HasNetAppShiftDestination(destinationClient)
+-			if err != nil {
+-				return false, err
+-			}
+-			if hasNetAppShift {
+-				return false, nil
+-			}
+-		}
+-		if p.IsUsingOffloadPlugin() {
+-			return false, nil
+-		}
+-		return true, nil
++		// Spectro: the virt-v2v transfer path is removed for vSphere. CDI+VDDK
++		// always copies the disks and virt-v2v only converts in place, so this
++		// always reports false. Upstream instead weighs warm/host/shared-disk/
++		// NetApp-shift/offload conditions here to decide between the two paths.
++		//
++		// Returning false here is what drives, via BasePredicate.Evaluate:
++		//   CDIDiskCopy      -> true  (PhaseCopyDisks runs)
++		//   VirtV2vDiskCopy  -> false (PhaseAllocateDisks + PhaseCopyDisksVirtV2V skipped)
++		// and, via KubeVirt.ResolveConversionType, api.InPlace (V2V_inPlace=1).
++		//
++		// OVA/HyperV deliberately keep upstream behaviour below.
++		return false, nil
+ 	case Ova, HyperV:
+ 		return true, nil
+ 	default:
+diff --git a/pkg/controller/plan/adapter/vsphere/builder.go b/pkg/controller/plan/adapter/vsphere/builder.go
+index 0000000..0000000 100644
+--- a/pkg/controller/plan/adapter/vsphere/builder.go
++++ b/pkg/controller/plan/adapter/vsphere/builder.go
+@@ -564,31 +564,19 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
+ 		}
+ 
+ 		storageClass := mapped.Destination.StorageClass
+-		var dvSource cdi.DataVolumeSource
+-		useV2vForTransfer, vErr := r.Context.Plan.ShouldUseV2vForTransfer(vmRef, r.Context.Destination.Client)
+-		if vErr != nil {
+-			err = vErr
+-			return
+-		}
+-		if useV2vForTransfer {
+-			// Let virt-v2v do the copying
+-			dvSource = cdi.DataVolumeSource{
+-				Blank: &cdi.DataVolumeBlankImage{},
+-			}
+-		} else {
+-			vddkImage := settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
+-
+-			// Let CDI do the copying
+-			dvSource = cdi.DataVolumeSource{
+-				VDDK: &cdi.DataVolumeSourceVDDK{
+-					BackingFile:  baseVolume(disk.File, r.Plan.IsWarm()),
+-					UUID:         vm.UUID,
+-					URL:          url,
+-					SecretRef:    secret.Name,
+-					Thumbprint:   thumbprint,
+-					InitImageURL: vddkImage,
+-				},
+-			}
++		// Spectro: the virt-v2v transfer path is removed. CDI+VDDK always copies
++		// the disks and virt-v2v is reduced to in-place conversion, so VDDK is a
++		// hard requirement for vSphere migrations.
++		vddkImage := settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
++		dvSource := cdi.DataVolumeSource{
++			VDDK: &cdi.DataVolumeSourceVDDK{
++				BackingFile:  baseVolume(disk.File, r.Plan.IsWarm()),
++				UUID:         vm.UUID,
++				URL:          url,
++				SecretRef:    secret.Name,
++				Thumbprint:   thumbprint,
++				InitImageURL: vddkImage,
++			},
+ 		}
+ 		alignedCapacity := utils.RoundUp(disk.Capacity, utils.DefaultAlignBlockSize)
+ 		dvSpec := cdi.DataVolumeSpec{
+@@ -639,7 +627,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
+ 			}
+ 		}
+ 
+-		if !useV2vForTransfer && vddkConfigMap != nil {
++		if vddkConfigMap != nil {
+ 			dv.ObjectMeta.Annotations[planbase.AnnVddkExtraArgs] = vddkConfigMap.Name
+ 		}
+ 		dvs = append(dvs, *dv)

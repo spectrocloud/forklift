@@ -17,13 +17,17 @@ limitations under the License.
 package v1beta1
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/provider"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
 	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
 	core "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Mapped network destination.
@@ -41,10 +45,19 @@ type DestinationNetwork struct {
 	Name string `json:"name,omitempty"`
 }
 
+// NetworkSourceRef extends Ref with an optional VLAN qualifier for network disambiguation.
+type NetworkSourceRef struct {
+	ref.Ref `json:",inline"`
+	// VLAN identifier (numeric string, valid range 1-4094) for network disambiguation.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([1-9]|[1-9][0-9]{1,2}|[1-3][0-9]{3}|40[0-8][0-9]|409[0-4])$`
+	Vlan string `json:"vlan,omitempty"`
+}
+
 // Mapped network.
 type NetworkPair struct {
 	// Source network.
-	Source ref.Ref `json:"source"`
+	Source NetworkSourceRef `json:"source"`
 	// Destination network.
 	Destination DestinationNetwork `json:"destination"`
 }
@@ -61,20 +74,28 @@ type OffloadPlugin struct {
 type StorageVendorProduct string
 
 const (
+	StorageVendorProductFlashSystem    StorageVendorProduct = "flashsystem"
 	StorageVendorProductVantara        StorageVendorProduct = "vantara"
 	StorageVendorProductOntap          StorageVendorProduct = "ontap"
 	StorageVendorProductPrimera3Par    StorageVendorProduct = "primera3par"
 	StorageVendorProductPureFlashArray StorageVendorProduct = "pureFlashArray"
 	StorageVendorProductPowerFlex      StorageVendorProduct = "powerflex"
+	StorageVendorProductPowerMax       StorageVendorProduct = "powermax"
+	StorageVendorProductPowerStore     StorageVendorProduct = "powerstore"
+	StorageVendorProductInfinibox      StorageVendorProduct = "infinibox"
 )
 
 func StorageVendorProducts() []StorageVendorProduct {
 	return []StorageVendorProduct{
+		StorageVendorProductFlashSystem,
 		StorageVendorProductVantara,
 		StorageVendorProductOntap,
 		StorageVendorProductPrimera3Par,
 		StorageVendorProductPureFlashArray,
 		StorageVendorProductPowerFlex,
+		StorageVendorProductPowerMax,
+		StorageVendorProductPowerStore,
+		StorageVendorProductInfinibox,
 	}
 }
 
@@ -85,7 +106,7 @@ type VSphereXcopyPluginConfig struct {
 	// The secret should reside in the same namespace where the source provider is.
 	SecretRef string `json:"secretRef"`
 	// StorageVendorProduct the string identifier of the storage vendor product
-	// +kubebuilder:validation:Enum=vantara;ontap;primera3par;pureFlashArray;powerflex
+	// +kubebuilder:validation:Enum=flashsystem;vantara;ontap;primera3par;pureFlashArray;powerflex;powermax;powerstore;infinibox
 	StorageVendorProduct StorageVendorProduct `json:"storageVendorProduct"`
 }
 
@@ -109,6 +130,26 @@ type DestinationStorage struct {
 	// Access mode.
 	// +kubebuilder:validation:Enum=ReadWriteOnce;ReadWriteMany;ReadOnlyMany
 	AccessMode core.PersistentVolumeAccessMode `json:"accessMode,omitempty"`
+}
+
+const (
+	AnnotationNetAppShiftStorageClassType = "shift.netapp.io/storage-class-type"
+	ValueNetAppShiftStorageClassType      = "shift"
+)
+
+func (d *DestinationStorage) IsNetAppShiftStorageClass(client k8sclient.Client) (bool, error) {
+	if client == nil || d == nil || d.StorageClass == "" {
+		return false, nil
+	}
+	sc := &storagev1.StorageClass{}
+	err := client.Get(context.TODO(), k8sclient.ObjectKey{Name: d.StorageClass}, sc)
+	if k8serr.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return sc.Annotations[AnnotationNetAppShiftStorageClassType] == ValueNetAppShiftStorageClassType, nil
 }
 
 // Network map spec.
@@ -195,6 +236,43 @@ func (r *NetworkMap) FindNetworkByNameAndNamespace(namespace, name string) (pair
 	return
 }
 
+// FindAllNetworks returns all network map entries matching the given source ID.
+func (r *NetworkMap) FindAllNetworks(networkID string) []NetworkPair {
+	var pairs []NetworkPair
+	for _, pair := range r.Spec.Map {
+		if pair.Source.ID == networkID {
+			pairs = append(pairs, pair)
+		}
+	}
+	return pairs
+}
+
+// FindAllNetworksByType returns all network map entries matching the given source type.
+func (r *NetworkMap) FindAllNetworksByType(networkType string) []NetworkPair {
+	var pairs []NetworkPair
+	for _, pair := range r.Spec.Map {
+		if pair.Source.Type == networkType {
+			pairs = append(pairs, pair)
+		}
+	}
+	return pairs
+}
+
+// FindAllNetworksByNameAndNamespace returns all network map entries matching the given source namespace and name.
+func (r *NetworkMap) FindAllNetworksByNameAndNamespace(namespace, name string) []NetworkPair {
+	var pairs []NetworkPair
+	for _, pair := range r.Spec.Map {
+		if pair.Source.Namespace != "" {
+			if pair.Source.Namespace == namespace && pair.Source.Name == name {
+				pairs = append(pairs, pair)
+			}
+		} else if pair.Source.Name == fmt.Sprintf("%s/%s", namespace, name) {
+			pairs = append(pairs, pair)
+		}
+	}
+	return pairs
+}
+
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type NetworkMapList struct {
 	meta.TypeMeta `json:",inline"`
@@ -240,6 +318,29 @@ func (r *StorageMap) FindStorageByName(storageName string) (pair StoragePair, fo
 	}
 
 	return
+}
+
+// HasNetAppShiftDestination is true if any map entry's destination StorageClass, resolved
+// against the destination cluster, is a NetApp Shift/Trident class. Unique class names are
+// queried at most once. When c is nil or the map is nil, returns (false, nil).
+func (r *StorageMap) HasNetAppShiftDestination(c k8sclient.Client) (bool, error) {
+	if c == nil || r == nil {
+		return false, nil
+	}
+	for _, pair := range r.Spec.Map {
+		name := pair.Destination.StorageClass
+		if name == "" {
+			continue
+		}
+		shift, err := pair.Destination.IsNetAppShiftStorageClass(c)
+		if err != nil {
+			return false, err
+		}
+		if shift {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

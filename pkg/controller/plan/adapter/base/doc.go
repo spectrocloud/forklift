@@ -15,6 +15,9 @@ import (
 
 // Annotations
 const (
+	// JSON map of original → sanitized label/annotation keys on the destination VM.
+	AnnSanitizedMetadata = "forklift.konveyor.io/sanitized-metadata"
+
 	// Used on DataVolume, contains disk source -- e.g. backing file in
 	// VMware or disk ID in oVirt.
 	AnnDiskSource = "forklift.konveyor.io/disk-source"
@@ -42,9 +45,89 @@ const (
 	// Add extra vddk configmap, in the Forklift used to pass AIO configuration to the VDDK.
 	// Related to https://github.com/kubevirt/containerized-data-importer/pull/3572
 	AnnVddkExtraArgs = "cdi.kubevirt.io/storage.pod.vddk.extraargs"
+
+	// CDI import backing file annotation on PVC
+	AnnImportBackingFile = "cdi.kubevirt.io/storage.import.backingFile"
+
+	// Source URL, on PVC
+	AnnEndpoint = "cdi.kubevirt.io/storage.import.endpoint"
+
+	// Secret name for source credentials, on PVC
+	AnnSecret = "cdi.kubevirt.io/storage.import.secretName"
+
+	// VM UUID, on PVC
+	AnnUUID = "cdi.kubevirt.io/storage.import.uuid"
+
+	// VDDK-specific thumbprint
+	AnnThumbprint = "cdi.kubevirt.io/storage.import.vddk.thumbprint"
+
+	// VDDK image, on PVC
+	AnnVddkInitImageURL = "cdi.kubevirt.io/storage.pod.vddk.initimageurl"
+
+	// Importer pod progress phase, on PVC
+	AnnPodPhase = "cdi.kubevirt.io/storage.pod.phase"
+
+	// True if the current checkpoint is the one taken for the cutover, on PVC
+	AnnFinalCheckpoint = "cdi.kubevirt.io/storage.checkpoint.final"
+
+	// Current checkpoint reference, on PVC
+	AnnCurrentCheckpoint = "cdi.kubevirt.io/storage.checkpoint.current"
+
+	// Previous checkpoint reference, on PVC
+	AnnPreviousCheckpoint = "cdi.kubevirt.io/storage.checkpoint.previous"
+
+	// Not a whole annotation but a prefix, append a snapshot name to mark that the snapshot was already copied (on PVC)
+	AnnCheckpointsCopied = "cdi.kubevirt.io/storage.checkpoint.copied"
+
+	// Allow DataVolume to adopt a PVC, on DataVolume
+	AnnAllowClaimAdoption = "cdi.kubevirt.io/allowClaimAdoption"
+
+	// Inform CDI that the DataVolume is already filled up, on DataVolume
+	AnnPrePopulated = "cdi.kubevirt.io/storage.prePopulated"
+
+	// Tell CDI which importer to use, on PVC
+	AnnSource = "cdi.kubevirt.io/storage.import.source"
+
+	// Name of the current importer pod, on PVC
+	AnnImportPod = "cdi.kubevirt.io/storage.import.importPod"
+
+	// In a UDN namespace we can't directly reach the virt-v2v pod unless we specify default opened ports on the pod network.
+	AnnOpenDefaultPorts = "k8s.ovn.org/open-default-ports"
+
+	// UDN L2 bridge binding, needed for KubeVirt VMs with UDN
+	UdnL2bridge = "l2bridge"
+
+	// Enhancement doc: https://github.com/openshift/enhancements/pull/1793
+	// Example: network.kubevirt.io/addresses: '{"iface1": ["192.168.0.1/24", "fd23:3214::123/64"]}'
+	AnnStaticUdnIp = "network.kubevirt.io/addresses"
+
+	// Explicitly disable CDI's populator auto-detection to avoid webhook validation errors
+	AnnUsePopulator = "cdi.kubevirt.io/storage.usePopulator"
+
+	// Consumer-side disk metadata used by NetApp Shift/Trident integration.
+	AnnNfsServer   = "forklift.konveyor.io/nfs-server"
+	AnnNfsPath     = "forklift.konveyor.io/nfs-path"
+	AnnVmId        = "forklift.konveyor.io/vm-id"
+	AnnVmUUID      = "forklift.konveyor.io/vm-uuid"
+	AnnNetAppShift = "forklift.konveyor.io/netapp-shift"
 )
 
 var VolumePopulatorNotSupportedError = liberr.New("provider does not support volume populators")
+
+// ConversionPodConfigResult contains provider-specific configuration for the virt-v2v conversion pod.
+// All fields are optional - nil means no provider-specific configuration for that aspect.
+type ConversionPodConfigResult struct {
+	// NodeSelector specifies provider-required node selection constraints.
+	// These are merged with (but can be overridden by) Plan.Spec.ConvertorNodeSelector.
+	NodeSelector map[string]string
+
+	// Labels specifies provider-specific labels to add to the conversion pod.
+	// These are merged with (but can be overridden by) Plan.Spec.ConvertorLabels.
+	Labels map[string]string
+
+	// Annotations specifies provider-specific annotations to add to the conversion pod.
+	Annotations map[string]string
+}
 
 // Adapter API.
 // Constructs provider-specific implementations
@@ -55,9 +138,11 @@ type Adapter interface {
 	// Construct VM client.
 	Client(ctx *plancontext.Context) (Client, error)
 	// Construct validator.
-	Validator(plan *api.Plan) (Validator, error)
+	Validator(ctx *plancontext.Context) (Validator, error)
 	// Construct DestinationClient.
 	DestinationClient(ctx *plancontext.Context) (DestinationClient, error)
+	// Ensurer
+	Ensurer(ctx *plancontext.Context) (ensure Ensurer, err error)
 }
 
 // Builder API.
@@ -98,6 +183,20 @@ type Builder interface {
 	GetPopulatorTaskName(pvc *core.PersistentVolumeClaim) (taskName string, err error)
 	// Get the virtual machine preference name
 	PreferenceName(vmRef ref.Ref, configMap *core.ConfigMap) (name string, err error)
+	// Build VM ConfigMaps
+	ConfigMaps(vmRef ref.Ref) (list []core.ConfigMap, err error)
+	// Build VM Secrets
+	Secrets(vmRef ref.Ref) (list []core.Secret, err error)
+	// ConversionPodConfig returns provider-specific configuration for the virt-v2v conversion pod.
+	// Returns an empty struct if no provider-specific configuration is needed.
+	// The returned config is merged with user settings from Plan.Spec (user settings take precedence).
+	ConversionPodConfig(vmRef ref.Ref) (*ConversionPodConfigResult, error)
+	// NetAppShiftPVCs builds PVCs for disks mapped to NetApp Shift StorageClasses.
+	// Returns nil for non-vSphere providers or when no Shift mappings exist.
+	NetAppShiftPVCs(vmRef ref.Ref, labels map[string]string) ([]core.PersistentVolumeClaim, error)
+	// SourceVMLabelsAndAnnotations returns provider-specific labels and annotations
+	// derived from source VM metadata (e.g. vSphere tags and custom attributes).
+	SourceVMLabelsAndAnnotations(vmRef ref.Ref, tagMapping *api.TagMapping) (labels map[string]string, annotations map[string]string, sanitizationReport map[string]string, err error)
 }
 
 // Client API.
@@ -146,14 +245,34 @@ type Validator interface {
 	MaintenanceMode(vmRef ref.Ref) (bool, error)
 	// Validate whether warm migration is supported from this provider type.
 	WarmMigration() bool
-	// Validate that no more than one of a VM's networks is mapped to the pod network.
-	PodNetwork(vmRef ref.Ref) (bool, error)
+	// Validate whether the migration type is supported by this provider.
+	MigrationType() bool
+	// Return one source-network ref per VM NIC.
+	NICNetworkRefs(vmRef ref.Ref) ([]ref.Ref, error)
 	// Validate that we have information about static IPs for every virtual NIC
 	StaticIPs(vmRef ref.Ref) (bool, error)
+	// Validate if the UDN subnet matches the VM IP
+	UdnStaticIPs(vmRef ref.Ref, client client.Client) (ok bool, err error)
 	// Validate the shared disk, returns msg and category as the errors depends on the provider implementations
 	SharedDisks(vmRef ref.Ref, client client.Client) (ok bool, msg string, category string, err error)
 	// Validate that the vm has the change tracking enabled
 	ChangeTrackingEnabled(vmRef ref.Ref) (bool, error)
+	// Validate that VM has no pre-existing snapshots for warm migration
+	HasSnapshot(vmRef ref.Ref) (ok bool, msg string, category string, err error)
+	// Validate that the VM power state is compatible with the migration type.
+	PowerState(vmRef ref.Ref) (bool, error)
+	// Validate that the VM is inherently compatible with the migration type.
+	VMMigrationType(vmRef ref.Ref) (bool, error)
+	// Validate that the VM disks have valid sizes (> 0).
+	InvalidDiskSizes(vmRef ref.Ref) ([]string, error)
+	// Validate that the VM MAC addresses don't conflict with existing destination VMs.
+	MacConflicts(vmRef ref.Ref) ([]MacConflict, error)
+	// Validate that the PVC name template is valid
+	PVCNameTemplate(vmRef ref.Ref, pvcNameTemplate string) (bool, error)
+	// Validate guest tools installation and status (e.g., VMware Tools, VirtIO drivers).
+	GuestToolsInstalled(vmRef ref.Ref) (ok bool, err error)
+	// Validate that VM does not need to collapse any snapshots into a single base file
+	ConsolidationNeeded(vmRef ref.Ref) (needed bool, err error)
 }
 
 // DestinationClient API.
@@ -163,4 +282,15 @@ type DestinationClient interface {
 	DeletePopulatorDataSource(vm *planapi.VMStatus) error
 	// Set the VolumePopulator CustomResource Ownership.
 	SetPopulatorCrOwnership() error
+}
+
+// Ensurer API
+// Ensures creates or check that the resources are present
+type Ensurer interface {
+	// SharedConfigMaps ensures that shared ConfigMap with VM are present
+	SharedConfigMaps(vm *planapi.VMStatus, configMaps []core.ConfigMap) (err error)
+	// SharedSecrets ensures that shared Secret with VM are present
+	SharedSecrets(vm *planapi.VMStatus, secrets []core.Secret) (err error)
+	// PersistentVolumeClaims ensures that PVCs are present on the destination.
+	PersistentVolumeClaims(vm *planapi.VMStatus, pvcs []core.PersistentVolumeClaim) (err error)
 }

@@ -1,14 +1,15 @@
-FROM registry.redhat.io/ubi10/go-toolset:1.25.7-1772540555 AS builder
+FROM registry.redhat.io/ubi10/go-toolset:1.25.9-1778589469 AS builder
 WORKDIR /app
 COPY --chown=1001:0 ./ ./
 ENV GOFLAGS="-mod=vendor -tags=strictfipsruntime"
 ENV GOEXPERIMENT=strictfipsruntime
 
-RUN GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o virt-v2v-monitor github.com/kubev2v/forklift/cmd/virt-v2v-monitor
-RUN GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o image-converter github.com/kubev2v/forklift/cmd/image-converter
-RUN GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o virt-v2v-wrapper github.com/kubev2v/forklift/cmd/virt-v2v
+RUN GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags="-w -s" -o virt-v2v-monitor github.com/kubev2v/forklift/cmd/virt-v2v-monitor
+RUN GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags="-w -s" -o image-converter github.com/kubev2v/forklift/cmd/image-converter
+RUN GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags="-w -s" -o virt-v2v-wrapper github.com/kubev2v/forklift/cmd/virt-v2v
+RUN GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags="-w -s" -o forklift-wait-for-reboot github.com/kubev2v/forklift/cmd/forklift-wait-for-reboot
 
-FROM registry.redhat.io/ubi10:10.0-1747220028
+FROM registry.redhat.io/ubi10:10.2-1777462922
 
 RUN rm /etc/pki/tls/fips_local.cnf && \
     echo -e '[fips_sect]\ntls1-prf-ems-check = 0\nactivate = 1' > /etc/pki/tls/fips_local.cnf && \
@@ -54,16 +55,28 @@ RUN \
 # LIBGUESTFS_BACKEND=direct is required to work around the following bug:
 # https://issues.redhat.com/browse/RHEL-104684
 # and it can be removed when that bug gets fixed.
-#
-# It is also required during contianer runtime to work around the following bug:
-# https://issues.redhat.com/browse/RHEL-105490
-ENV LIBGUESTFS_BACKEND=direct
-
 RUN mkdir -p /usr/local/lib/guestfs/appliance && \
     cd /usr/local/lib/guestfs/appliance && \
-    libguestfs-make-fixed-appliance . && \
+    LIBGUESTFS_BACKEND=direct libguestfs-make-fixed-appliance . && \
     qemu-img convert -c -O qcow2 root root.qcow2 && \
     mv -vf root.qcow2 root
+
+
+# This prevents libvirt from attempting to create files in the root directory,
+# which would lead to permission errors.
+# Refer to: https://issues.redhat.com/browse/RHEL-105490
+RUN mkdir /home/qemu && chown qemu:qemu /home/qemu
+ENV HOME=/home/qemu
+
+# The libvirt can hang when destroying libguestfs domains due to the
+# absence of an init process to clean up zombie processes. 'catatonit' acts
+# as PID 1 to resolve this.
+# Refer to: https://issues.redhat.com/browse/RHEL-105529
+RUN dnf install -y catatonit
+
+# This ensures that the 'libvirt:qemu:///session' connection method, which is
+# the officially tested and supported flow, is utilized instead of direct connections.
+ENV LIBGUESTFS_BACKEND=libvirt:qemu:///session
 
 RUN mkdir -p /usr/lib64/guestfs/appliance
 
@@ -73,9 +86,19 @@ COPY --from=builder /app/image-converter /usr/local/bin/image-converter
 
 COPY --from=builder /app/virt-v2v-wrapper /usr/bin/virt-v2v-wrapper
 
-ENTRYPOINT ["/usr/bin/virt-v2v-wrapper"]
+COPY --from=builder /app/forklift-wait-for-reboot /usr/local/bin/forklift-wait-for-reboot
 
-ARG VERSION
+# Replace xfs_repair with a wrapper that can ignore failures; register the
+# original binary in supermin hostfiles so both get copied into the appliance.
+COPY build/virt-v2v/xfs_repair_wrapper.sh /tmp/xfs_repair_wrapper.sh
+RUN cp /usr/sbin/xfs_repair /usr/sbin/xfs_repair.original && \
+    cp /tmp/xfs_repair_wrapper.sh /usr/sbin/xfs_repair && \
+    chmod 755 /usr/sbin/xfs_repair && \
+    echo '/usr/sbin/xfs_repair.original' >> /usr/lib64/guestfs/supermin.d/hostfiles
+
+ENTRYPOINT ["/usr/libexec/catatonit/catatonit", "/usr/bin/virt-v2v-wrapper"]
+
+ARG MTV_VERSION
 ARG REGISTRY
 ARG REVISION
 
@@ -89,5 +112,5 @@ LABEL \
     summary="Migration Toolkit for Virtualization - Virt-V2V" \
     description="Migration Toolkit for Virtualization - Virt-V2V" \
     maintainer="Migration Toolkit for Virtualization Team <migtoolkit-virt@redhat.com>" \
-    version="$VERSION" \ 
+    version="$MTV_VERSION" \ 
     revision="$REVISION"

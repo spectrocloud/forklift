@@ -4,10 +4,12 @@ import (
 	"flag"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	populator_machinery "github.com/kubev2v/forklift/pkg/lib-volume-populator/populator-machinery"
+	"github.com/kubev2v/forklift/pkg/settings"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -16,11 +18,12 @@ import (
 )
 
 const (
-	prefix     = "forklift.konveyor.io"
-	mountPath  = "/mnt/"
-	devicePath = "/dev/block"
-	groupName  = "forklift.konveyor.io"
-	apiVersion = "v1beta1"
+	prefix                  = "forklift.konveyor.io"
+	mountPath               = "/mnt/"
+	devicePath              = "/dev/block"
+	groupName               = "forklift.konveyor.io"
+	apiVersion              = "v1beta1"
+	maxPopulatorInFlightEnv = "MAX_POPULATOR_INFLIGHT"
 )
 
 type populator struct {
@@ -50,7 +53,7 @@ var populators = map[string]populator{
 		kind:            "VSphereXcopyVolumePopulator",
 		resource:        "vspherexcopyvolumepopulators",
 		controllerFunc:  getVXPopulatorPodArgs,
-		imageVar:        "VSPHERE_XCOPY_VOLUME_POPULATOR_IMAGE",
+		imageVar:        "VSPHERE_COPY_OFFLOAD_POPULATOR_IMAGE",
 		metricsEndpoint: ":8082",
 	},
 }
@@ -67,9 +70,13 @@ func main() {
 	flag.StringVar(&masterURL, "master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
 	// Metrics args
 	flag.StringVar(&metricsPath, "metrics-path", "/metrics", "The HTTP path where prometheus metrics will be exposed. Default is `/metrics`.")
-
 	klog.InitFlags(nil)
 	flag.Parse()
+
+	resources, err := getResources()
+	if err != nil {
+		klog.Fatalf("Failed to parse resources: %v", err)
+	}
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -85,17 +92,28 @@ func main() {
 			klog.Warning("Couldn't find", "imageVar", populator.imageVar)
 			continue
 		}
+		maxInFlight := getEnvInt(maxPopulatorInFlightEnv, 20)
 		gk := schema.GroupKind{Group: groupName, Kind: populator.kind}
 		gvr := schema.GroupVersionResource{Group: groupName, Version: apiVersion, Resource: populator.resource}
 		controllerFunc := populator.controllerFunc
 		metricsEndpoint := populator.metricsEndpoint
 		go func() {
 			populator_machinery.RunController(masterURL, kubeconfig, imageName, metricsEndpoint, metricsPath,
-				prefix, gk, gvr, mountPath, devicePath, controllerFunc)
+				prefix, gk, gvr, mountPath, devicePath, controllerFunc, resources, maxInFlight)
 			<-stop
 		}()
 	}
 	<-stop
+}
+
+func getEnvInt(name string, def int) int {
+	if s, found := os.LookupEnv(name); found {
+		parsed, err := strconv.Atoi(s)
+		if err == nil {
+			return parsed
+		}
+	}
+	return def
 }
 
 func getOvirtPopulatorPodArgs(rawBlock bool, u *unstructured.Unstructured, _ corev1.PersistentVolumeClaim) ([]string, error) {
@@ -158,4 +176,21 @@ func getVolumePath(rawBlock bool) string {
 	} else {
 		return mountPath + "disk.img"
 	}
+}
+
+func getResources() (*corev1.ResourceRequirements, error) {
+	cpuLimit := settings.Settings.Migration.PopulatorContainerLimitsCpu
+	memoryLimit := settings.Settings.Migration.PopulatorContainerLimitsMemory
+	cpuRequest := settings.Settings.Migration.PopulatorContainerRequestsCpu
+	memoryRequest := settings.Settings.Migration.PopulatorContainerRequestsMemory
+	return &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    cpuLimit,
+			corev1.ResourceMemory: memoryLimit,
+		},
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    cpuRequest,
+			corev1.ResourceMemory: memoryRequest,
+		},
+	}, nil
 }

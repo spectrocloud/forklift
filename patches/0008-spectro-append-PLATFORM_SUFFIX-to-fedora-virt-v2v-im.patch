@@ -1,0 +1,30 @@
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 18:02:54 -0700
+Subject: [PATCH 8/8] spectro: append PLATFORM_SUFFIX to fedora virt-v2v image
+ tag
+
+The operator bundle passes VIRT_V2V_IMAGE + PLATFORM_SUFFIX, so the tag
+must carry the suffix or the CSV points at an image that does not exist.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ Makefile | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 0000000..0000000 100644
+--- a/Makefile
++++ b/Makefile
+@@ -360,10 +360,10 @@ push-virt-v2v-xfs-image: build-virt-v2v-xfs-image
+ 
+ build-virt-v2v-fedora-image: check_container_runtime
+ 	$(eval VIRT_V2V_IMAGE=$(REGISTRY)/$(REGISTRY_ORG)/forklift-virt-v2v:$(REGISTRY_TAG))
+-	$(CONTAINER_CMD) build $(PLATFORM_FLAG) -t $(VIRT_V2V_IMAGE) -f build/virt-v2v/Containerfile-upstream-fedora .
++	$(CONTAINER_CMD) build $(PLATFORM_FLAG) -t $(VIRT_V2V_IMAGE)$(PLATFORM_SUFFIX) -f build/virt-v2v/Containerfile-upstream-fedora .
+ 
+ push-virt-v2v-fedora-image: build-virt-v2v-fedora-image
+-	$(CONTAINER_CMD) push $(VIRT_V2V_IMAGE)
++	$(CONTAINER_CMD) push $(VIRT_V2V_IMAGE)$(PLATFORM_SUFFIX)
+ 
+ build-operator-bundle-image: check_container_runtime
+ 	$(CONTAINER_CMD) build $(PLATFORM_FLAG) $(BUILD_LABEL_ARGS) \

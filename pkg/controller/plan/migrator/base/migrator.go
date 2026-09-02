@@ -10,10 +10,8 @@ import (
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	libitr "github.com/kubev2v/forklift/pkg/lib/itinerary"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
+	"github.com/kubev2v/forklift/pkg/settings"
 )
-
-// Package logger.
-var log = logging.WithName("migrator|base")
 
 type BaseMigrator struct {
 	*plancontext.Context
@@ -32,14 +30,21 @@ func (r *BaseMigrator) Init() (err error) {
 	return
 }
 
-func (r *BaseMigrator) Cleanup(status *plan.VMStatus, successful bool) (err error) {
+func (r *BaseMigrator) Logger() (logger logging.LevelLogger) {
+	return r.Log
+}
+
+func (r *BaseMigrator) Begin() (err error) {
 	return
+}
+
+func (r *BaseMigrator) Complete(vm *plan.VMStatus) {
 }
 
 func (r *BaseMigrator) Status(vm plan.VM) (status *plan.VMStatus) {
 	if current, found := r.Context.Plan.Status.Migration.FindVM(vm.Ref); !found {
 		status = &plan.VMStatus{VM: vm}
-		if r.Context.Plan.Spec.Warm {
+		if r.Context.Plan.IsWarm() {
 			status.Warm = &plan.Warm{}
 		}
 	} else {
@@ -48,21 +53,21 @@ func (r *BaseMigrator) Status(vm plan.VM) (status *plan.VMStatus) {
 	return
 }
 
-func (r *BaseMigrator) Reset(status *plan.VMStatus, pipeline []*plan.Step) {
-	status.DeleteCondition(api.ConditionCanceled, api.ConditionFailed)
-	status.MarkReset()
-	itr := r.Itinerary(&BasePredicate{vm: &status.VM, context: r.Context})
+func (r *BaseMigrator) Reset(vm *plan.VMStatus, pipeline []*plan.Step) {
+	vm.DeleteCondition(api.ConditionCanceled, api.ConditionFailed)
+	vm.MarkReset()
+	itr := r.Itinerary(vm.VM)
 	step, _ := itr.First()
-	status.Phase = step.Name
-	status.Pipeline = pipeline
-	status.Error = nil
-	if r.Context.Plan.Spec.Warm {
-		status.Warm = &plan.Warm{}
+	vm.Phase = step.Name
+	vm.Pipeline = pipeline
+	vm.Error = nil
+	if r.Context.Plan.IsWarm() {
+		vm.Warm = &plan.Warm{}
 	}
 }
 
 func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
-	itinerary := r.Itinerary(&BasePredicate{vm: &vm, context: r.Context})
+	itinerary := r.Itinerary(vm)
 	step, _ := itinerary.First()
 	for {
 		switch step.Name {
@@ -88,7 +93,7 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 						Phase:       api.StepPending,
 					},
 				})
-		case api.PhaseCopyDisks, api.PhaseCopyDisksVirtV2V, api.PhaseConvertOpenstackSnapshot:
+		case api.PhaseAllocateDisks, api.PhaseCopyDisks, api.PhaseCopyDisksVirtV2V, api.PhaseConvertOpenstackSnapshot:
 			tasks, pErr := r.builder.Tasks(vm.Ref)
 			if pErr != nil {
 				err = liberr.Wrap(pErr)
@@ -103,6 +108,9 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 			case api.PhaseCopyDisks:
 				taskName = DiskTransfer
 				taskDescription = "Transfer disks."
+			case api.PhaseAllocateDisks:
+				taskName = DiskAllocation
+				taskDescription = "Allocate disks."
 			case api.PhaseCopyDisksVirtV2V:
 				taskName = DiskTransferV2v
 				taskDescription = "Copy disks."
@@ -187,6 +195,39 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 						Progress:    libitr.Progress{Total: 1},
 					},
 				})
+		case api.PhaseWaitForGuestReboots:
+			pipeline = append(
+				pipeline,
+				&plan.Step{
+					Task: plan.Task{
+						Name:        api.PhaseWaitForGuestReboots,
+						Description: "Wait for Windows guest reboot after conversion.",
+						Phase:       api.StepPending,
+						Progress:    libitr.Progress{Total: 1},
+					},
+				})
+		case api.PhasePreflightInspection:
+			pipeline = append(
+				pipeline,
+				&plan.Step{
+					Task: plan.Task{
+						Name:        PreflightInspection,
+						Description: "Inspect VM before migration.",
+						Phase:       api.StepPending,
+						Progress:    libitr.Progress{Total: 1},
+					},
+				})
+		case api.PhaseWaitForFinalSnapshotRemoval:
+			pipeline = append(
+				pipeline,
+				&plan.Step{
+					Task: plan.Task{
+						Name:        WaitForSnapshotConsolidation,
+						Description: "Waiting for final snapshot removal and consolidation",
+						Phase:       api.StepPending,
+						Progress:    libitr.Progress{Total: 1},
+					},
+				})
 		}
 		next, done, _ := itinerary.Next(step.Name)
 		if !done {
@@ -208,28 +249,16 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 	return
 }
 
-func (r *BaseMigrator) Itinerary(predicate libitr.Predicate) (itinerary libitr.Itinerary) {
-	if r.Context.Plan.Spec.Warm {
-		itinerary = WarmItinerary
+func (r *BaseMigrator) Itinerary(vm plan.VM) (itinerary *libitr.Itinerary) {
+	// Plan.Spec.Type supersedes the deprecated Warm boolean.
+	if r.Context.Plan.Spec.Type == api.MigrationOnlyConversion {
+		itinerary = r.onlyConversionItinerary()
+	} else if r.Context.Plan.IsWarm() {
+		itinerary = r.warmItinerary()
 	} else {
-		itinerary = ColdItinerary
+		itinerary = r.coldItinerary()
 	}
-	itinerary.Predicate = predicate
-	return
-}
-
-func (r *BaseMigrator) Next(status *plan.VMStatus) (next string) {
-	itinerary := r.Itinerary(&BasePredicate{vm: &status.VM, context: r.Context})
-	step, done, err := itinerary.Next(status.Phase)
-	if done || err != nil {
-		next = api.PhaseCompleted
-		if err != nil {
-			log.Error(err, "Next phase failed.")
-		}
-	} else {
-		next = step.Name
-	}
-	r.Log.Info("Itinerary transition", "current phase", status.Phase, "next phase", next)
+	itinerary.Predicate = &BasePredicate{vm: &vm, context: r.Context}
 	return
 }
 
@@ -242,16 +271,24 @@ func (r *BaseMigrator) ExecutePhase(vm *plan.VMStatus) (ok bool, err error) {
 // Step gets the name of the pipeline step corresponding to the current VM phase.
 func (r *BaseMigrator) Step(status *plan.VMStatus) (step string) {
 	switch status.Phase {
-	case api.PhaseStarted, api.PhaseCreateInitialSnapshot, api.PhaseWaitForInitialSnapshot,
-		api.PhaseStoreInitialSnapshotDeltas, api.PhaseCreateDataVolumes:
+	case api.PhaseStarted, api.PhaseCreateInitialSnapshot, api.PhaseWaitForInitialSnapshot, api.PhaseStoreInitialSnapshotDeltas:
 		step = Initialize
-	case api.PhaseCopyDisks, api.PhaseCopyingPaused, api.PhaseRemovePreviousSnapshot, api.PhaseWaitForPreviousSnapshotRemoval,
-		api.PhaseCreateSnapshot, api.PhaseWaitForSnapshot, api.PhaseStoreSnapshotDeltas, api.PhaseAddCheckpoint,
-		api.PhaseConvertOpenstackSnapshot, api.PhaseWaitForDataVolumesStatus:
+	case api.PhaseAllocateDisks:
+		step = DiskAllocation
+	case api.PhaseCopyDisks, api.PhaseCopyingPaused, api.PhaseRemovePreviousSnapshot,
+		api.PhaseWaitForPreviousSnapshotRemoval, api.PhaseCreateSnapshot, api.PhaseWaitForSnapshot,
+		api.PhaseStoreSnapshotDeltas, api.PhaseAddCheckpoint, api.PhaseConvertOpenstackSnapshot:
 		step = DiskTransfer
+	case api.PhaseCreateDataVolumes:
+		// This phase should be present in DiskTransfer step only when executing Preflight Inspection to avoid UI pipeline artifacts.
+		// If not executing Preflight Inspection, keep the Initialize step.
+		if r.Context.Plan.ShouldRunPreflightInspection() {
+			step = DiskTransfer
+		} else {
+			step = Initialize
+		}
 	case api.PhaseRemovePenultimateSnapshot, api.PhaseWaitForPenultimateSnapshotRemoval, api.PhaseCreateFinalSnapshot,
-		api.PhaseWaitForFinalSnapshot, api.PhaseAddFinalCheckpoint, api.PhaseFinalize, api.PhaseRemoveFinalSnapshot,
-		api.PhaseWaitForFinalSnapshotRemoval, api.PhaseWaitForFinalDataVolumesStatus:
+		api.PhaseWaitForFinalSnapshot, api.PhaseAddFinalCheckpoint, api.PhaseFinalize, api.PhaseRemoveFinalSnapshot:
 		step = Cutover
 	case api.PhaseCreateGuestConversionPod, api.PhaseConvertGuest:
 		step = ImageConversion
@@ -259,18 +296,109 @@ func (r *BaseMigrator) Step(status *plan.VMStatus) (step string) {
 		step = DiskTransferV2v
 	case api.PhaseCreateVM:
 		step = VMCreation
+	case api.PhaseWaitForGuestReboots:
+		step = api.PhaseWaitForGuestReboots
 	case api.PhasePreHook, api.PhasePostHook:
 		step = status.Phase
 	case api.PhaseStorePowerState, api.PhasePowerOffSource, api.PhaseWaitForPowerOff:
-		if r.Context.Plan.Spec.Warm {
+		if r.Context.Plan.IsWarm() {
 			step = Cutover
 		} else {
 			step = Initialize
 		}
+	case api.PhasePreflightInspection:
+		step = PreflightInspection
+	case api.PhaseWaitForFinalSnapshotRemoval:
+		step = WaitForSnapshotConsolidation
 	default:
 		step = Unknown
 	}
 	return
+}
+
+func (r *BaseMigrator) warmItinerary() *libitr.Itinerary {
+	return &libitr.Itinerary{
+		Name: "Warm",
+		Pipeline: libitr.Pipeline{
+			{Name: api.PhaseStarted},
+			{Name: api.PhasePreHook, All: HasPreHook},
+			{Name: api.PhaseCreateInitialSnapshot},
+			{Name: api.PhaseWaitForInitialSnapshot},
+			{Name: api.PhaseStoreInitialSnapshotDeltas, All: VSphere},
+			{Name: api.PhasePreflightInspection, All: RunInspection},
+			{Name: api.PhaseCreateDataVolumes},
+			// Precopy loop start
+			{Name: api.PhaseCopyDisks},
+			{Name: api.PhaseCopyingPaused},
+			{Name: api.PhaseRemovePreviousSnapshot, All: VSphere},
+			{Name: api.PhaseWaitForPreviousSnapshotRemoval, All: VSphere},
+			{Name: api.PhaseCreateSnapshot},
+			{Name: api.PhaseWaitForSnapshot},
+			{Name: api.PhaseStoreSnapshotDeltas, All: VSphere},
+			{Name: api.PhaseAddCheckpoint},
+			// Precopy loop end
+			{Name: api.PhaseStorePowerState},
+			{Name: api.PhasePowerOffSource},
+			{Name: api.PhaseWaitForPowerOff},
+			{Name: api.PhaseRemovePenultimateSnapshot, All: VSphere},
+			{Name: api.PhaseWaitForPenultimateSnapshotRemoval, All: VSphere},
+			{Name: api.PhaseCreateFinalSnapshot},
+			{Name: api.PhaseWaitForFinalSnapshot},
+			{Name: api.PhaseAddFinalCheckpoint},
+			{Name: api.PhaseFinalize},
+			{Name: api.PhaseRemoveFinalSnapshot, All: VSphere},
+			{Name: api.PhaseCreateGuestConversionPod, All: RequiresConversion},
+			{Name: api.PhaseConvertGuest, All: RequiresConversion},
+			{Name: api.PhaseCreateVM},
+			{Name: api.PhaseWaitForGuestReboots, All: WindowsWaitForGuestReboot},
+			{Name: api.PhasePostHook, All: HasPostHook},
+			{Name: api.PhaseWaitForFinalSnapshotRemoval, All: VSphere | WaitForFinalSnapshotConsolidation},
+			{Name: api.PhaseCompleted},
+		},
+	}
+}
+
+func (r *BaseMigrator) coldItinerary() *libitr.Itinerary {
+	return &libitr.Itinerary{
+		Name: "",
+		Pipeline: libitr.Pipeline{
+			{Name: api.PhaseStarted},
+			{Name: api.PhasePreHook, All: HasPreHook},
+			{Name: api.PhaseStorePowerState},
+			{Name: api.PhasePowerOffSource},
+			{Name: api.PhaseWaitForPowerOff},
+			{Name: api.PhaseCreateDataVolumes},
+			{Name: api.PhaseCopyDisks, All: CDIDiskCopy},
+			{Name: api.PhaseAllocateDisks, All: VirtV2vDiskCopy},
+			{Name: api.PhaseCreateGuestConversionPod, All: RequiresConversion},
+			{Name: api.PhaseConvertGuest, All: RequiresConversion},
+			{Name: api.PhaseCopyDisksVirtV2V, All: RequiresConversion | VirtV2vDiskCopy},
+			{Name: api.PhaseConvertOpenstackSnapshot, All: OpenstackImageMigration},
+			{Name: api.PhaseCreateVM},
+			{Name: api.PhaseWaitForGuestReboots, All: WindowsWaitForGuestReboot},
+			{Name: api.PhasePostHook, All: HasPostHook},
+			{Name: api.PhaseCompleted},
+		},
+	}
+}
+
+func (r *BaseMigrator) onlyConversionItinerary() *libitr.Itinerary {
+	return &libitr.Itinerary{
+		Name: "OnlyConversion",
+		Pipeline: libitr.Pipeline{
+			{Name: api.PhaseStarted},
+			{Name: api.PhasePreHook, All: HasPreHook},
+			{Name: api.PhaseStorePowerState},
+			{Name: api.PhasePowerOffSource},
+			{Name: api.PhaseWaitForPowerOff},
+			{Name: api.PhaseCreateGuestConversionPod, All: RequiresConversion},
+			{Name: api.PhaseConvertGuest, All: RequiresConversion},
+			{Name: api.PhaseCreateVM},
+			{Name: api.PhaseWaitForGuestReboots, All: WindowsWaitForGuestReboot},
+			{Name: api.PhasePostHook, All: HasPostHook},
+			{Name: api.PhaseCompleted},
+		},
+	}
 }
 
 // Step predicate.
@@ -283,7 +411,7 @@ type BasePredicate struct {
 
 // Evaluate predicate flags.
 func (r *BasePredicate) Evaluate(flag libitr.Flag) (allowed bool, err error) {
-	useV2vForTransfer, vErr := r.context.Plan.ShouldUseV2vForTransfer()
+	useV2vForTransfer, vErr := r.context.Plan.ShouldUseV2vForTransfer(r.vm.Ref, r.context.Destination.Client)
 	if vErr != nil {
 		err = vErr
 		return
@@ -304,11 +432,31 @@ func (r *BasePredicate) Evaluate(flag libitr.Flag) (allowed bool, err error) {
 		allowed = r.context.Plan.IsSourceProviderOpenstack()
 	case VSphere:
 		allowed = r.context.Plan.IsSourceProviderVSphere()
+	case RunInspection:
+		allowed = r.context.Plan.ShouldRunPreflightInspection()
+	case WindowsWaitForGuestReboot:
+		if !settings.Settings.WindowsWaitForReboot {
+			break
+		}
+		target := r.vm.TargetPowerState
+		if target == "" {
+			target = r.context.Plan.Spec.TargetPowerState
+		}
+		if target == plan.TargetPowerStateOff {
+			break
+		}
+		win, _ := IsWindowsFromInventory(r.context.Source.Inventory, r.vm.Ref)
+		if !win {
+			break
+		}
+		allowed = r.context.Source.Provider.RequiresConversion() && !r.context.Plan.Spec.SkipGuestConversion
+	case WaitForFinalSnapshotConsolidation:
+		allowed = settings.Settings.WaitForFinalSnapshotConsolidation
 	}
 
 	return
 }
 
 func (r *BasePredicate) Count() int {
-	return 0x40
+	return 0x200
 }

@@ -1,37 +1,53 @@
 package config
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 )
 
 type MountPath string
 
 // Enviroment variables
 const (
-	EnvLibvirtUrlName             = "V2V_libvirtURL"
-	EnvFingerprintName            = "V2V_fingerprint"
-	EnvInPlaceName                = "V2V_inPlace"
-	EnvExtraArgsName              = "V2V_extra_args"
-	EnvNewNameName                = "V2V_NewName"
-	EnvVmNameName                 = "V2V_vmName"
-	EnvRootDiskName               = "V2V_RootDisk"
-	EnvStaticIPsName              = "V2V_staticIPs"
-	EnvSourceName                 = "V2V_source"
-	EnvDiskPathName               = "V2V_diskPath"
-	EnvSecretKeyName              = "V2V_secretKey"
-	EnvLocalMigrationName         = "LOCAL_MIGRATION"
-	EnvVirtIoWinLegacyDriversName = "VIRTIO_WIN"
-	EnvHostName                   = "V2V_HOSTNAME"
-	EnvMultipleIpsPerNicName      = "V2V_multipleIPsPerNic"
+	EnvLibvirtUrlName                   = "V2V_libvirtURL"
+	EnvFingerprintName                  = "V2V_fingerprint"
+	EnvInPlaceName                      = "V2V_inPlace"
+	EnvExtraArgsName                    = "V2V_extra_args"
+	EnvInspectorExtraArgsName           = "V2V_inspector_extra_args"
+	EnvNewNameName                      = "V2V_NewName"
+	EnvVmNameName                       = "V2V_vmName"
+	EnvRootDiskName                     = "V2V_RootDisk"
+	EnvStaticIPsName                    = "V2V_staticIPs"
+	EnvSourceName                       = "V2V_source"
+	EnvDiskPathName                     = "V2V_diskPath"
+	EnvSecretKeyName                    = "V2V_secretKey"
+	EnvLocalMigrationName               = "LOCAL_MIGRATION"
+	EnvVirtIoWinLegacyDriversName       = "VIRTIO_WIN"
+	EnvHostName                         = "V2V_HOSTNAME"
+	EnvNbdeClevis                       = "V2V_NBDE_CLEVIS"
+	EnvMultipleIpsPerNicName            = "V2V_multipleIPsPerNic"
+	EnvRemoteInspection                 = "V2V_remoteInspection"
+	EnvRemoteInspectionDisk             = "V2V_remoteInspectDisk_"
+	EnvMemSizeName                      = "V2V_memSize"
+	EnvSmpName                          = "V2V_smp"
+	EnvVsphereVmwareDriverRemovalName   = "V2V_vsphereVmwareDriverRemoval"
+	EnvWindowsRegistryNetworkConfigName = "V2V_windowsRegistryNetworkConfig"
+	EnvWaitForGuestRebootName           = "V2V_waitForGuestReboot"
+	EnvXfsCompatibilityName             = "V2V_xfsCompatibility"
+	EnvXfsRepairIgnoreName              = "V2V_xfsRepairIgnore"
 )
 
 const (
 	OVA     = "ova"
 	VSPHERE = "vSphere"
+	EC2     = "ec2"
+	HYPERV  = "hyperv"
 )
 
 // Disk globs
@@ -49,9 +65,10 @@ const (
 	VddkConfFile            = "/mnt/vddk-conf/vddk-config-file"
 	DynamicScriptsMountPath = "/mnt/dynamic_scripts"
 
-	SecretKey = "/etc/secret/secretKey"
+	AccessKeyId = "/etc/secret/accessKeyId"
+	SecretKey   = "/etc/secret/secretKey"
 
-	V2vInPlaceLibvirtDomain = "/mnt/v2v/input.xml"
+	V2vInPlaceLibvirtDomain = "/tmp/input.xml"
 )
 
 type AppConfig struct {
@@ -63,6 +80,8 @@ type AppConfig struct {
 	IsInPlace bool
 	// V2V_extra_args
 	ExtraArgs []string
+	// V2V_inspector_extra_args
+	InspectorExtraArgs []string
 	// LOCAL_MIGRATION
 	IsLocalMigration bool
 	// V2V_NewName
@@ -79,10 +98,32 @@ type AppConfig struct {
 	DiskPath string
 	// V2V_secretKey
 	SecretKey string
+	// V2V_AccessKeyId
+	AccessKeyId string
 	// V2V_virtIoWinDrivers
 	VirtIoWinLegacyDrivers string
 	// hostname
 	HostName string
+
+	// V2V_remoteInspection
+	IsRemoteInspection bool
+	// RemoteInspectionDisks
+	RemoteInspectionDisks []string
+	// V2V_memSize
+	MemSize int
+	// V2V_smp
+	Smp int
+	// V2V_vsphereVmwareDriverRemoval
+	VsphereVmwareDriverRemoval bool
+	// V2V_windowsRegistryNetworkConfig
+	WindowsRegistryNetworkConfig bool
+	// V2V_waitForGuestReboot — upload first-boot script signaling CONVERSION_DONE on COM1
+	WaitForGuestReboot bool
+	// V2V_xfsCompatibility — use XFS-capable virt-v2v; omit --no-fstrim when true
+	XfsCompatibility bool
+	// SupportsNoFstrim is true when the virt-v2v binary supports --no-fstrim
+	// (RHEL-only downstream patch. upstream CentOS/Fedora builds lack this flag)
+	SupportsNoFstrim bool
 
 	// V2V_multipleIPsPerNic
 	MultipleIpsPerNicName string
@@ -90,6 +131,7 @@ type AppConfig struct {
 	VddkConfFile         string
 	InspectionOutputFile string
 	Luksdir              string
+	NbdeClevis           bool
 	DynamicScriptsDir    string
 	Workdir              string
 	VddkLibDir           string
@@ -98,8 +140,10 @@ type AppConfig struct {
 
 func (s *AppConfig) Load() (err error) {
 	s.ExtraArgs = s.getExtraArgs()
+	s.InspectorExtraArgs = s.getInspectorExtraArgs()
 	flag.BoolVar(&s.IsLocalMigration, "local-migration", s.getEnvBool(EnvLocalMigrationName, true), "Migration is in local or remote cluster")
 	flag.BoolVar(&s.IsInPlace, "in-place", s.getEnvBool(EnvInPlaceName, false), "Run virt-v2v-in-place on already populated disks")
+	flag.BoolVar(&s.NbdeClevis, "nbde-clevis", s.getEnvBool(EnvNbdeClevis, false), "virt-v2v should unencrypt the disks via clevis client")
 	flag.StringVar(&s.Source, "source", os.Getenv(EnvSourceName), "Source of VM ['ova','vSphere']")
 	flag.StringVar(&s.LibvirtUrl, "libvirt-url", os.Getenv(EnvLibvirtUrlName), "Libvirt domain to the vSphere")
 	flag.StringVar(&s.Fingerprint, "fingerprint", os.Getenv(EnvFingerprintName), "Fingerprint for the vddk")
@@ -107,7 +151,8 @@ func (s *AppConfig) Load() (err error) {
 	flag.StringVar(&s.VmName, "vm-name", os.Getenv(EnvVmNameName), "Original VM name")
 	flag.StringVar(&s.RootDisk, "root-disk", os.Getenv(EnvRootDiskName), "Specify which disk should be converted (default \"first\")")
 	flag.StringVar(&s.StaticIPs, "static-ips", os.Getenv(EnvStaticIPsName), "Preserve static IPs, format <mac:network|bridge|ip:out>_<mac:network|bridge|ip:out>")
-	flag.StringVar(&s.DiskPath, "disk-path", os.Getenv(EnvDiskPathName), "Path to the OVA disk")
+	flag.StringVar(&s.DiskPath, "disk-path", os.Getenv(EnvDiskPathName), "Path to disk(s) - single for OVA, comma-separated for HyperV")
+	flag.StringVar(&s.AccessKeyId, "access-key", AccessKeyId, "Path to the Username for the vSphere")
 	flag.StringVar(&s.SecretKey, "secret-key", SecretKey, "Path to the secret to the vSphere")
 	flag.StringVar(&s.Luksdir, "luks-dir", Luksdir, "Directory path containing the luks keys")
 	flag.StringVar(&s.DynamicScriptsDir, "dynamic-scripts-dir", DynamicScriptsMountPath, "Directory path to specify dynamic scripts which will edit the guest")
@@ -119,7 +164,27 @@ func (s *AppConfig) Load() (err error) {
 	flag.StringVar(&s.VirtIoWinLegacyDrivers, "virtio-win-legacy-drivers", os.Getenv(EnvVirtIoWinLegacyDriversName), "Path to the virtio-win legacy drivers ISO")
 	flag.StringVar(&s.HostName, "hostname", os.Getenv(EnvHostName), "Hostname of the vm")
 	flag.StringVar(&s.MultipleIpsPerNicName, "multiple-ips-per-nic", os.Getenv(EnvMultipleIpsPerNicName), "Multiple IPs per NIC")
+	flag.BoolVar(&s.IsRemoteInspection, "remote-inspection", s.getEnvBool(EnvRemoteInspection, false), "Run virt-v2v-inspection on remote disks")
+	flag.IntVar(&s.MemSize, "memsize", s.getEnvInt(EnvMemSizeName, 0), "Amount of memory (in MB) allocated for the conversion appliance")
+	flag.IntVar(&s.Smp, "smp", s.getEnvInt(EnvSmpName, 0), "Number of virtual CPUs used for the conversion appliance")
+	flag.BoolVar(&s.VsphereVmwareDriverRemoval, "vsphere-vmware-driver-removal", s.getEnvBool(EnvVsphereVmwareDriverRemovalName, false), "Run VMware driver removal scripts during Windows vSphere conversion")
+	flag.BoolVar(&s.WindowsRegistryNetworkConfig, "windows-registry-network-config", s.getEnvBool(EnvWindowsRegistryNetworkConfigName, false), "Use registry-based network configuration scripts for Windows static IP setup")
+	flag.BoolVar(&s.WaitForGuestReboot, "wait-for-guest-reboot", s.getEnvBool(EnvWaitForGuestRebootName, false), "Inject first-boot script to signal conversion completion on guest serial (COM1)")
+	flag.BoolVar(&s.XfsCompatibility, "xfs-compatibility", s.getEnvBool(EnvXfsCompatibilityName, false), "XFS compatibility mode: do not pass --no-fstrim to virt-v2v")
+	s.RemoteInspectionDisks = s.getRemoteInspectionDisks()
 	flag.Parse()
+
+	s.SupportsNoFstrim = detectNoFstrimSupport("/etc/os-release")
+
+	if s.getEnvBool(EnvXfsRepairIgnoreName, false) {
+		const token = "xfs_repair_ignore=1"
+		if existing := os.Getenv("LIBGUESTFS_APPEND"); existing != "" {
+			_ = os.Setenv("LIBGUESTFS_APPEND", existing+" "+token)
+		} else {
+			_ = os.Setenv("LIBGUESTFS_APPEND", token)
+		}
+		fmt.Fprintf(os.Stderr, "xfs_repair ignore enabled (LIBGUESTFS_APPEND += %s)\n", token)
+	}
 
 	return s.validate()
 }
@@ -138,6 +203,51 @@ func (s *AppConfig) getExtraArgs() []string {
 	return extraArgs
 }
 
+func (s *AppConfig) getInspectorExtraArgs() []string {
+	var extraArgs []string
+	if envExtraArgs, found := os.LookupEnv(EnvInspectorExtraArgsName); found && envExtraArgs != "" {
+		if err := json.Unmarshal([]byte(envExtraArgs), &extraArgs); err != nil {
+			return nil
+		}
+	}
+	return extraArgs
+}
+
+func (s *AppConfig) getRemoteInspectionDisks() []string {
+	// Create the array filled with disk keys from env variable
+	var keys []string
+	for _, envVar := range os.Environ() {
+		key, _, ok := strings.Cut(envVar, "=")
+		if ok && strings.HasPrefix(key, EnvRemoteInspectionDisk) {
+			keys = append(keys, key)
+		}
+	}
+
+	// Sort the key array
+	sort.Slice(keys, func(i, j int) bool {
+		si, _ := strconv.Atoi(keys[i][len(EnvRemoteInspectionDisk):])
+		sj, _ := strconv.Atoi(keys[j][len(EnvRemoteInspectionDisk):])
+		return si < sj
+	})
+
+	// Get disk names from array
+	disks := make([]string, len(keys))
+	for i, key := range keys {
+		disks[i] = os.Getenv(key)
+	}
+	return disks
+}
+
+func (s *AppConfig) getEnvInt(name string, def int) int {
+	if val, found := os.LookupEnv(name); found {
+		parsed, err := strconv.Atoi(val)
+		if err == nil {
+			return parsed
+		}
+	}
+	return def
+}
+
 // Get boolean.
 func (s *AppConfig) getEnvBool(name string, def bool) bool {
 	if s, found := os.LookupEnv(name); found {
@@ -153,10 +263,33 @@ func (s *AppConfig) envMissingError(env string) error {
 	return fmt.Errorf("the env variable '%s' is needed for the migration", env)
 }
 
+// detectNoFstrimSupport reads an os-release file and returns true if the
+// OS is RHEL, which ships a downstream virt-v2v with --no-fstrim support.
+// Upstream builds (CentOS Stream, Fedora) lack this flag.
+func detectNoFstrimSupport(osReleasePath string) bool {
+	f, err := os.Open(osReleasePath)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if key, val, ok := strings.Cut(line, "="); ok {
+			if strings.TrimSpace(key) == "ID" {
+				id := strings.Trim(strings.TrimSpace(val), "\"'")
+				return id == "rhel"
+			}
+		}
+	}
+	return false
+}
+
 func (s *AppConfig) validate() error {
 	if !s.IsInPlace {
 		switch s.Source {
-		case OVA:
+		case OVA, HYPERV:
 			if s.DiskPath == "" {
 				return s.envMissingError(EnvDiskPathName)
 			}
@@ -188,7 +321,7 @@ func (s *AppConfig) validate() error {
 				}
 			}
 		default:
-			return fmt.Errorf("invalid variable '%s', the valid option is 'ova' or 'vSphere'", EnvSourceName)
+			return fmt.Errorf("invalid variable '%s', the valid options are 'ova', 'vSphere', or 'hyperv'", EnvSourceName)
 		}
 	}
 	return nil

@@ -16,6 +16,7 @@ import (
 	"github.com/kubev2v/forklift/pkg/controller/provider/web"
 	model "github.com/kubev2v/forklift/pkg/controller/provider/web/ovirt"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
+	libutil "github.com/kubev2v/forklift/pkg/lib/util"
 	"github.com/kubev2v/forklift/pkg/settings"
 	ovirtsdk "github.com/ovirt/go-ovirt"
 	cdi "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
@@ -229,7 +230,7 @@ func (r *Client) Close() {
 // the snapshot ID hasn't been created yet.
 func (r *Client) getSnapshotCorrelationID(vmRef ref.Ref, snapshot *string) (correlationID string, err error) {
 	var vm *planapi.VMStatus
-	for _, vmstatus := range r.Migration.Status.VMs {
+	for _, vmstatus := range r.Plan.Status.Migration.VMs {
 		if vmstatus.ID == vmRef.ID {
 			vm = vmstatus
 			break
@@ -312,7 +313,7 @@ func (r *Client) getVM(vmRef ref.Ref) (ovirtVm *ovirtsdk.Vm, vmService *ovirtsdk
 // Get the disk snapshot for this disk and this snapshot ID.
 func (r *Client) getDiskSnapshot(diskID, targetSnapshotID string) (diskSnapshotID string, err error) {
 	response, rErr := r.connection.SystemService().DisksService().DiskService(diskID).Get().Query("correlation_id", r.Migration.Name).Send()
-	if err != nil {
+	if rErr != nil {
 		err = liberr.Wrap(rErr)
 		return
 	}
@@ -339,7 +340,7 @@ func (r *Client) getDiskSnapshot(diskID, targetSnapshotID string) (diskSnapshotI
 			return
 		}
 		snapshotsResponse, rErr := sdService.DiskSnapshotsService().List().Send()
-		if err != nil {
+		if rErr != nil {
 			err = liberr.Wrap(rErr, "storageDomain", sdID)
 			return
 		}
@@ -411,7 +412,7 @@ func (r *Client) password() string {
 }
 
 func (r *Client) cacert() []byte {
-	if cacert, found := r.Source.Secret.Data["cacert"]; found {
+	if cacert, found := libutil.GetCACert(r.Source.Secret); found {
 		return cacert
 	}
 	return nil
@@ -424,7 +425,7 @@ func (r Client) Finalize(vms []*planapi.VMStatus, planName string) {
 		}
 	}()
 
-	if !r.Plan.Spec.Warm {
+	if !r.Plan.IsWarm() {
 		r.Log.Info("Skipping precopy removal for cold migration")
 		return
 	}

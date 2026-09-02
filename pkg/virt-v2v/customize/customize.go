@@ -21,7 +21,14 @@ const (
 	WindowsDynamicRegex     = `^([0-9]+_win_firstboot(([\w\-]*).ps1))$`
 	LinuxDynamicRegex       = `^([0-9]+_linux_(run|firstboot)(([\w\-]*).sh))$`
 	ShellSuffix             = ".sh"
+	UploadCmd               = "--upload"
+	RunCmd                  = "--run"
+	FirstbootCmd            = "--firstboot"
 )
+
+const vsphereVmwareCleanupScript = "9100_cleanup_vmware.bat"
+
+const qemuGAInstallScript = "5001_win_firstboot_qemu_ga_install.ps1"
 
 //go:embed scripts
 var scriptFS embed.FS
@@ -46,6 +53,11 @@ type IPEntry struct {
 	Gateway      string
 	PrefixLength string
 	DNS          []string
+}
+
+type ScriptMatch struct {
+	Path   string
+	Groups []string
 }
 
 func formatIPs(ips []IPEntry) string {
@@ -138,7 +150,14 @@ func (c *Customize) customizeWindows() (err error) {
 		}
 	}
 
-	c.addWinFirstbootScripts(cmdBuilder)
+	if c.appConfig.VsphereVmwareDriverRemoval && c.appConfig.IsVsphereMigration() {
+		fmt.Println("Adding vSphere VMware driver removal scripts")
+		c.addVsphereVmwareDriverRemoval(cmdBuilder)
+	}
+
+	if err = c.addWinFirstbootScripts(cmdBuilder); err != nil {
+		return err
+	}
 
 	c.addDisksToCustomize(cmdBuilder)
 
@@ -275,50 +294,69 @@ func (c *Customize) runCmd(builder utils.CommandBuilder) error {
 	return nil
 }
 
+// addVsphereVmwareDriverRemoval uploads the VMware cleanup script to the guest Firstboot scripts directory.
+func (c *Customize) addVsphereVmwareDriverRemoval(cmdBuilder utils.CommandBuilder) {
+	windowsScriptsPath := filepath.Join(c.appConfig.Workdir, "scripts", "windows")
+	src := filepath.Join(windowsScriptsPath, vsphereVmwareCleanupScript)
+	cmdBuilder.AddArg(UploadCmd, c.formatUpload(src, filepath.Join(WinFirstbootScriptsPath, vsphereVmwareCleanupScript)))
+}
+
 // addWinFirstbootScripts appends firstboot script arguments to extraArgs
-func (c *Customize) addWinFirstbootScripts(cmdBuilder utils.CommandBuilder) {
+func (c *Customize) addWinFirstbootScripts(cmdBuilder utils.CommandBuilder) error {
 	windowsScriptsPath := filepath.Join(c.appConfig.Workdir, "scripts", "windows")
 	initPath := filepath.Join(windowsScriptsPath, "9999-run-mtv-ps-scripts.bat")
-	restoreScriptPath := filepath.Join(windowsScriptsPath, "9999-restore_config.ps1")
-	firstbootPath := filepath.Join(windowsScriptsPath, "firstboot.bat")
 
 	// Upload scripts to the windows
 	uploadPreserveIpPath := ""
 	uploadRemoveDuplicatesPath := ""
 	uploadPreserveMultipleIpPath := ""
 	if c.appConfig.VirtIoWinLegacyDrivers != "" {
-		restoreScriptPath = filepath.Join(windowsScriptsPath, "9999-restore_config-legacy.ps1")
-
-		if c.appConfig.StaticIPs != "" {
-			networkConfigtemplate := filepath.Join(windowsScriptsPath, "9999-network-config.ps1.tmpl")
-			networkConfigScript := filepath.Join(windowsScriptsPath, "9999-network-config.ps1")
-
-			err := c.injectStaticIPTemplate(networkConfigtemplate, networkConfigScript)
-			if err != nil {
-				fmt.Printf("Error injecting static IP template: %v", err)
-			}
-			uploadPreserveIpPath = c.formatUpload(networkConfigScript, WinFirstbootScriptsPath)
-		}
+		initPath = filepath.Join(windowsScriptsPath, "9999-run-mtv-ps-scripts-legacy.bat")
 	}
 
 	if c.appConfig.StaticIPs != "" {
-		removeDuplicatesPersistentRoutesPath := filepath.Join(windowsScriptsPath, "9999-remove_duplicate_persistent_routes.ps1")
+		var networkConfigTemplate string
+		var removeDuplicatesPersistentRoutesPath string
+		var preserveIpsTemplate string
+		if c.appConfig.WindowsRegistryNetworkConfig {
+			networkConfigTemplate = filepath.Join(windowsScriptsPath, "9999-network-config-registry.ps1.tmpl")
+			removeDuplicatesPersistentRoutesPath = filepath.Join(windowsScriptsPath, "9999-remove_duplicate_persistent_routes-registry.ps1")
+			preserveIpsTemplate = filepath.Join(windowsScriptsPath, "9999-preserve_complementry_ips_per_nic-registry.ps1.tmpl")
+		} else {
+			networkConfigTemplate = filepath.Join(windowsScriptsPath, "9999-network-config.ps1.tmpl")
+			removeDuplicatesPersistentRoutesPath = filepath.Join(windowsScriptsPath, "9999-remove_duplicate_persistent_routes.ps1")
+			preserveIpsTemplate = filepath.Join(windowsScriptsPath, "9999-preserve_complementry_ips_per_nic.ps1.tmpl")
+		}
+
+		injectNetworkConfig := c.appConfig.VirtIoWinLegacyDrivers != "" || c.appConfig.WindowsRegistryNetworkConfig
+		if injectNetworkConfig {
+			networkConfigScript := filepath.Join(windowsScriptsPath, "9999-network-config.ps1")
+			if err := c.injectStaticIPTemplate(networkConfigTemplate, networkConfigScript); err != nil {
+				return fmt.Errorf("inject static IP template from %q to %q: %w", networkConfigTemplate, networkConfigScript, err)
+			}
+			uploadPreserveIpPath = c.formatUpload(networkConfigScript, WinFirstbootScriptsPath)
+		}
 		uploadRemoveDuplicatesPath = c.formatUpload(removeDuplicatesPersistentRoutesPath, WinFirstbootScriptsPath)
 
 		if c.appConfig.MultipleIpsPerNicName != "" {
-			preserveIpsTemplate := filepath.Join(windowsScriptsPath, "9999-preserve_complementry_ips_per_nic.ps1.tmpl")
 			preserveMultipleNicsPath := filepath.Join(windowsScriptsPath, "9999-preserve_complementry_ips_per_nic.ps1")
-			err := c.injectComplementryStaticIPTemplate(preserveIpsTemplate, preserveMultipleNicsPath)
-			if err != nil {
-				fmt.Printf("Error injecting Complementry StaticIP's template: %v", err)
+			if err := c.injectComplementryStaticIPTemplate(preserveIpsTemplate, preserveMultipleNicsPath); err != nil {
+				return fmt.Errorf("inject complementary static IP template from %q to %q: %w", preserveIpsTemplate, preserveMultipleNicsPath, err)
 			}
 			uploadPreserveMultipleIpPath = c.formatUpload(preserveMultipleNicsPath, WinFirstbootScriptsPath)
 		}
 	}
-	uploadScriptPath := c.formatUpload(restoreScriptPath, WinFirstbootScriptsPath)
+	// TODO: Remove once https://redhat.atlassian.net/browse/RHEL-184971 is resolved.
+	qemuGAPath := filepath.Join(windowsScriptsPath, qemuGAInstallScript)
+	cmdBuilder.AddArg(UploadCmd, c.formatUpload(qemuGAPath, filepath.Join(WinFirstbootScriptsPath, qemuGAInstallScript)))
+
 	uploadInitPath := c.formatUpload(initPath, WinFirstbootScriptsPath)
-	uploadFirstbootPath := c.formatUpload(firstbootPath, WinFirstbootPath)
-	cmdBuilder.AddArgs("--upload", uploadScriptPath, uploadPreserveIpPath, uploadInitPath, uploadRemoveDuplicatesPath, uploadPreserveMultipleIpPath, uploadFirstbootPath)
+	cmdBuilder.AddArgs(UploadCmd, uploadPreserveIpPath, uploadInitPath, uploadRemoveDuplicatesPath, uploadPreserveMultipleIpPath)
+	if c.appConfig.WaitForGuestReboot {
+		signalScript := filepath.Join(windowsScriptsPath, "99999-signal-conversion-done.ps1")
+		cmdBuilder.AddArg(UploadCmd, c.formatUpload(signalScript, filepath.Join(WinFirstbootScriptsPath, "99999-signal-conversion-done.ps1")))
+	}
+	return nil
 }
 
 func (c *Customize) addWinDynamicScripts(cmdBuilder utils.CommandBuilder, dir string) error {
@@ -327,26 +365,34 @@ func (c *Customize) addWinDynamicScripts(cmdBuilder utils.CommandBuilder, dir st
 		return err
 	}
 	for _, script := range dynamicScripts {
-		fmt.Printf("Adding windows dynamic scripts '%s'\n", script)
-		upload := c.formatUpload(script, filepath.Join(WinFirstbootScriptsPath, filepath.Base(script)))
-		cmdBuilder.AddArg("--upload", upload)
+		fmt.Printf("Adding windows dynamic scripts '%s'\n", script.Path)
+		upload := c.formatUpload(script.Path, filepath.Join(WinFirstbootScriptsPath, filepath.Base(script.Path)))
+		cmdBuilder.AddArg(UploadCmd, upload)
 	}
 	return nil
 }
 
-// getScriptsWithRegex retrieves all scripts with suffix from the specified directory
-func (c *Customize) getScriptsWithRegex(directory string, regex string) ([]string, error) {
+// getScriptsWithRegex retrieves all scripts matching the regex from the specified directory
+// and returns both the script paths and their regex match groups
+func (c *Customize) getScriptsWithRegex(directory string, regex string) ([]ScriptMatch, error) {
 	files, err := c.fileSystem.ReadDir(directory)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read scripts directory: %w", err)
 	}
 
 	r := regexp.MustCompile(regex)
-	var scripts []string
+	var scripts []ScriptMatch
 	for _, file := range files {
-		if !file.IsDir() && r.MatchString(file.Name()) {
+		if file.IsDir() {
+			continue
+		}
+		groups := r.FindStringSubmatch(file.Name())
+		if groups != nil {
 			scriptPath := filepath.Join(directory, file.Name())
-			scripts = append(scripts, scriptPath)
+			scripts = append(scripts, ScriptMatch{
+				Path:   scriptPath,
+				Groups: groups,
+			})
 		}
 	}
 	return scripts, nil
@@ -403,7 +449,7 @@ func (c *Customize) handleStaticIPConfiguration(cmdBuilder utils.CommandBuilder)
 		if err := c.fileSystem.WriteFile(macToIPFilePath, []byte(macToIPFileContent), 0755); err != nil {
 			return fmt.Errorf("failed to write MAC to IP mapping file: %w", err)
 		}
-		cmdBuilder.AddArg("--upload", fmt.Sprintf("%s:/tmp/macToIP", macToIPFilePath))
+		cmdBuilder.AddArg(UploadCmd, fmt.Sprintf("%s:/tmp/macToIP", macToIPFilePath))
 	}
 
 	return nil
@@ -423,7 +469,7 @@ func (c *Customize) addRhelFirstbootScripts(cmdBuilder utils.CommandBuilder) err
 		return nil
 	}
 	for _, scripts := range firstBootScripts {
-		cmdBuilder.AddArg("--firstboot", scripts)
+		cmdBuilder.AddArg(FirstbootCmd, scripts)
 	}
 	return nil
 }
@@ -442,13 +488,17 @@ func (c *Customize) addRhelRunScripts(cmdBuilder utils.CommandBuilder) error {
 		return nil
 	}
 	for _, scripts := range runScripts {
-		cmdBuilder.AddArg("--run", scripts)
+		cmdBuilder.AddArg(RunCmd, scripts)
 	}
 	return nil
 }
 
 // addLuksKeysToCustomize appends key arguments to extraArgs
 func (c *Customize) addLuksKeysToCustomize(cmdBuilder utils.CommandBuilder) error {
+	if c.appConfig.NbdeClevis {
+		cmdBuilder.AddArgs("--key", "all:clevis")
+		return nil
+	}
 	if c.appConfig.Luksdir == "" {
 		return nil
 	}
@@ -466,12 +516,19 @@ func (c *Customize) addRhelDynamicScripts(cmdBuilder utils.CommandBuilder, dir s
 		return err
 	}
 	for _, script := range dynamicScripts {
-		fmt.Printf("Adding linux dynamic scripts '%s'\n", script)
-		r := regexp.MustCompile(LinuxDynamicRegex)
-		groups := r.FindStringSubmatch(filepath.Base(script))
+		fmt.Printf("Adding linux dynamic scripts '%s'\n", script.Path)
 		// Option from the second regex group `(run|firstboot)`
-		action := groups[2]
-		cmdBuilder.AddArg(action, script)
+		action := script.Groups[2]
+		var cmd string
+		switch action {
+		case "run":
+			cmd = RunCmd
+		case "firstboot":
+			cmd = FirstbootCmd
+		default:
+			return fmt.Errorf("invalid action '%s' extracted from script filename '%s': expected 'run' or 'firstboot'", action, script.Path)
+		}
+		cmdBuilder.AddArg(cmd, script.Path)
 	}
 	return nil
 }

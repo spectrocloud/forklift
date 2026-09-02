@@ -1,0 +1,278 @@
+package hyperv
+
+import (
+	"fmt"
+
+	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
+	"github.com/kubev2v/forklift/pkg/controller/util"
+	"github.com/kubev2v/forklift/pkg/labeler"
+	"github.com/kubev2v/forklift/pkg/settings"
+	appsv1 "k8s.io/api/apps/v1"
+	core "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
+)
+
+var Settings = &settings.Settings
+
+const (
+	MainContainer      = "main"
+	SMBVolumeMountName = "smb"
+	SMBVolumeMountPath = SMBMountPath
+	QEMUGroup          = 107
+	PVSize             = "1Gi"
+	SMBCSIDriver       = "smb.csi.k8s.io"
+)
+
+// Labels
+const (
+	LabelApp            = "app"
+	LabelSubapp         = "subapp"
+	LabelProvider       = "provider"
+	LabelProviderServer = "hyperv-server"
+	SubappHyperVServer  = "hyperv-server"
+	AppForklift         = "forklift"
+)
+
+type Labeler struct {
+	labeler.Labeler
+}
+
+func (r *Labeler) ProviderLabels(provider *api.Provider) map[string]string {
+	return map[string]string{
+		LabelApp:      AppForklift,
+		LabelSubapp:   SubappHyperVServer,
+		LabelProvider: string(provider.UID),
+	}
+}
+
+func (r *Labeler) ServerLabels(provider *api.Provider, server *api.HyperVProviderServer) map[string]string {
+	return map[string]string{
+		LabelApp:            AppForklift,
+		LabelSubapp:         SubappHyperVServer,
+		LabelProvider:       string(provider.UID),
+		LabelProviderServer: string(server.UID),
+	}
+}
+
+type Builder struct {
+	HyperVProviderServer *api.HyperVProviderServer
+	Labeler              Labeler
+}
+
+func (r *Builder) prefix(provider *api.Provider) string {
+	return fmt.Sprintf("%s-", provider.Name)
+}
+
+func (r *Builder) ProviderServer(provider *api.Provider) (server *api.HyperVProviderServer) {
+	server = &api.HyperVProviderServer{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: r.prefix(provider),
+			Labels:       r.Labeler.ProviderLabels(provider),
+			Namespace:    Settings.Namespace,
+		},
+		Spec: api.HyperVProviderServerSpec{
+			Provider: core.ObjectReference{
+				Namespace: provider.Namespace,
+				Name:      provider.Name,
+			},
+		},
+	}
+	return
+}
+
+// PersistentVolume builds a static PV for SMB CSI driver.
+func (r *Builder) PersistentVolume(provider *api.Provider, secret *core.Secret) (pv *core.PersistentVolume) {
+	if secret == nil {
+		return nil
+	}
+	smbUrlBytes, ok := secret.Data[SecretFieldSMBUrl]
+	if !ok || len(smbUrlBytes) == 0 {
+		return nil
+	}
+	smbUrl := string(smbUrlBytes)
+	smbSource := util.ParseSMBSource(smbUrl)
+	secretName := secret.Name
+	secretNamespace := secret.Namespace
+
+	pv = &core.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: r.prefix(provider),
+			Labels:       r.Labeler.ServerLabels(provider, r.HyperVProviderServer),
+		},
+		Spec: core.PersistentVolumeSpec{
+			Capacity: core.ResourceList{
+				core.ResourceStorage: resource.MustParse(PVSize),
+			},
+			AccessModes: []core.PersistentVolumeAccessMode{
+				core.ReadOnlyMany,
+			},
+			PersistentVolumeSource: core.PersistentVolumeSource{
+				CSI: &core.CSIPersistentVolumeSource{
+					Driver:       SMBCSIDriver,
+					VolumeHandle: string(provider.UID),
+					VolumeAttributes: map[string]string{
+						"source": smbSource,
+					},
+					NodeStageSecretRef: &core.SecretReference{
+						Name:      secretName,
+						Namespace: secretNamespace,
+					},
+				},
+			},
+			PersistentVolumeReclaimPolicy: core.PersistentVolumeReclaimRetain,
+		},
+	}
+	return
+}
+
+// PersistentVolumeClaim builds a PVC that binds to the static PV.
+func (r *Builder) PersistentVolumeClaim(provider *api.Provider, pv *core.PersistentVolume) (pvc *core.PersistentVolumeClaim) {
+	emptyStorageClass := ""
+	pvc = &core.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: r.prefix(provider),
+			Labels:       r.Labeler.ServerLabels(provider, r.HyperVProviderServer),
+			Namespace:    Settings.Namespace,
+		},
+		Spec: core.PersistentVolumeClaimSpec{
+			AccessModes: []core.PersistentVolumeAccessMode{
+				core.ReadOnlyMany,
+			},
+			VolumeName:       pv.Name,
+			StorageClassName: &emptyStorageClass,
+			Resources: core.VolumeResourceRequirements{
+				Requests: core.ResourceList{
+					core.ResourceStorage: resource.MustParse(PVSize),
+				},
+			},
+		},
+	}
+	return
+}
+
+// Deployment builds a deployment for the SMB mount pod.
+// The pod runs a minimal sleep binary that keeps the SMB CSI volume mounted.
+func (r *Builder) Deployment(provider *api.Provider, secret *core.Secret, pvc *core.PersistentVolumeClaim) (deployment *appsv1.Deployment) {
+	deployment = &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: r.prefix(provider),
+			Namespace:    Settings.Namespace,
+			Labels:       r.Labeler.ServerLabels(provider, r.HyperVProviderServer),
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To[int32](1),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: r.Labeler.ServerLabels(provider, r.HyperVProviderServer),
+			},
+			Template: core.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: r.Labeler.ServerLabels(provider, r.HyperVProviderServer),
+				},
+				Spec: r.PodSpec(provider, secret, pvc),
+			},
+		},
+	}
+	return
+}
+
+func (r *Builder) PodSpec(provider *api.Provider, secret *core.Secret, pvc *core.PersistentVolumeClaim) (spec core.PodSpec) {
+	spec = core.PodSpec{
+		Containers: []core.Container{
+			{
+				Name:  MainContainer,
+				Image: r.containerImage(),
+				Ports: []core.ContainerPort{
+					{ContainerPort: 8080, Protocol: core.ProtocolTCP},
+				},
+				Env: []core.EnvVar{
+					{Name: "CATALOG_PATH", Value: SMBVolumeMountPath},
+				},
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse(Settings.Providers.HyperV.Resources.CPU.Request),
+						core.ResourceMemory: resource.MustParse(Settings.Providers.HyperV.Resources.Memory.Request),
+					},
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse(Settings.Providers.HyperV.Resources.CPU.Limit),
+						core.ResourceMemory: resource.MustParse(Settings.Providers.HyperV.Resources.Memory.Limit),
+					},
+				},
+				ReadinessProbe: &core.Probe{
+					ProbeHandler: core.ProbeHandler{
+						HTTPGet: &core.HTTPGetAction{
+							Path: "/healthz",
+							Port: intstr.FromInt32(8080),
+						},
+					},
+					InitialDelaySeconds: 5,
+					PeriodSeconds:       10,
+				},
+				SecurityContext: r.securityContext(),
+				VolumeMounts: []core.VolumeMount{
+					{
+						Name:      SMBVolumeMountName,
+						MountPath: SMBVolumeMountPath,
+						ReadOnly:  true,
+					},
+				},
+			},
+		},
+		Volumes: []core.Volume{
+			{
+				Name: SMBVolumeMountName,
+				VolumeSource: core.VolumeSource{
+					PersistentVolumeClaim: &core.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc.Name,
+						ReadOnly:  true,
+					},
+				},
+			},
+		},
+	}
+	return
+}
+
+func (r *Builder) securityContext() (sc *core.SecurityContext) {
+	sc = &core.SecurityContext{
+		AllowPrivilegeEscalation: ptr.To(false),
+		Capabilities: &core.Capabilities{
+			Drop: []core.Capability{"ALL"},
+		},
+		RunAsGroup:   ptr.To(int64(QEMUGroup)),
+		RunAsNonRoot: ptr.To(true),
+		SeccompProfile: &core.SeccompProfile{
+			Type: core.SeccompProfileTypeRuntimeDefault,
+		},
+	}
+	return
+}
+
+func (r *Builder) Service(provider *api.Provider) (svc *core.Service) {
+	svc = &core.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: r.prefix(provider),
+			Namespace:    Settings.Namespace,
+			Labels:       r.Labeler.ServerLabels(provider, r.HyperVProviderServer),
+		},
+		Spec: core.ServiceSpec{
+			Selector: r.Labeler.ServerLabels(provider, r.HyperVProviderServer),
+			Ports: []core.ServicePort{
+				{
+					Name:       "api-http",
+					Protocol:   core.ProtocolTCP,
+					Port:       8080,
+					TargetPort: intstr.FromInt32(8080),
+				},
+			},
+			Type: core.ServiceTypeClusterIP,
+		},
+	}
+	return
+}
+
+func (r *Builder) containerImage() string {
+	return Settings.Providers.HyperV.ContainerImage
+}

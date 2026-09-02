@@ -5,6 +5,7 @@ import (
 	"path"
 
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
+	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web"
 	ocp "github.com/kubev2v/forklift/pkg/lib/client/openshift"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
@@ -62,18 +63,26 @@ type Context struct {
 	Hooks []*api.Hook
 	// Logger.
 	Log logging.LevelLogger
+	// Labeler.
+	Labeler Labeler
 }
 
 // Build.
 func (r *Context) build() (err error) {
 	r.Map.Network = r.Plan.Referenced.Map.Network
 	if r.Map.Network == nil {
-		err = liberr.Wrap(NotEnoughDataError{})
+		err = liberr.Wrap(NotEnoughDataError{},
+			"Network map not found.",
+			"name", r.Plan.Spec.Map.Network.Name,
+			"namespace", r.Plan.Spec.Map.Network.Namespace)
 		return
 	}
 	r.Map.Storage = r.Plan.Referenced.Map.Storage
-	if r.Map.Storage == nil {
-		err = liberr.Wrap(NotEnoughDataError{})
+	if r.Map.Storage == nil && r.Plan.Spec.Type != api.MigrationOnlyConversion {
+		err = liberr.Wrap(NotEnoughDataError{},
+			"Storage map not found.",
+			"name", r.Plan.Spec.Map.Storage.Name,
+			"namespace", r.Plan.Spec.Map.Storage.Namespace)
 		return
 	}
 	err = r.Source.build(r)
@@ -87,6 +96,7 @@ func (r *Context) build() (err error) {
 		return
 	}
 	r.Hooks = r.Plan.Hooks
+	r.Labeler = Labeler{Context: r}
 
 	return
 }
@@ -103,6 +113,19 @@ func (r *Context) SetMigration(migration *api.Migration) {
 		path.Join(
 			migration.Namespace,
 			migration.Name))
+}
+
+func (r *Context) NestedVirtualizationSetting(vmRef ref.Ref, sourceDefault bool) *bool {
+	if vm, found := r.Plan.Spec.FindVM(vmRef); found && vm.EnableNestedVirtualization != nil {
+		return vm.EnableNestedVirtualization
+	}
+	if r.Plan.Spec.EnableNestedVirtualization != nil {
+		return r.Plan.Spec.EnableNestedVirtualization
+	}
+	if sourceDefault {
+		return &sourceDefault
+	}
+	return nil
 }
 
 // Source.
@@ -122,7 +145,10 @@ type Source struct {
 func (r *Source) build(ctx *Context) (err error) {
 	r.Provider = ctx.Plan.Referenced.Provider.Source
 	if r.Provider == nil {
-		err = liberr.Wrap(NotEnoughDataError{})
+		err = liberr.Wrap(NotEnoughDataError{},
+			"Source provider not found.",
+			"name", ctx.Plan.Spec.Provider.Source.Name,
+			"namespace", ctx.Plan.Spec.Provider.Source.Namespace)
 		return
 	}
 
@@ -168,7 +194,10 @@ type Destination struct {
 func (r *Destination) build(ctx *Context) (err error) {
 	r.Provider = ctx.Plan.Referenced.Provider.Destination
 	if r.Provider == nil {
-		err = liberr.Wrap(NotEnoughDataError{})
+		err = liberr.Wrap(NotEnoughDataError{},
+			"Destination provider not found.",
+			"name", ctx.Plan.Spec.Provider.Destination.Name,
+			"namespace", ctx.Plan.Spec.Provider.Destination.Namespace)
 		return
 	}
 	if !r.Provider.IsHost() {

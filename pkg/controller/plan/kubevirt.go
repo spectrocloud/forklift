@@ -1,57 +1,71 @@
 package plan
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"path"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v2"
+
 	k8snet "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
+	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
+	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
+	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
+	convbuilder "github.com/kubev2v/forklift/pkg/controller/conversion"
+	convctx "github.com/kubev2v/forklift/pkg/controller/conversion/context"
+	hvutil "github.com/kubev2v/forklift/pkg/controller/hyperv"
+	"github.com/kubev2v/forklift/pkg/controller/plan/adapter"
 	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
+	inspectionparser "github.com/kubev2v/forklift/pkg/controller/plan/adapter/vsphere"
+	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
+	migbase "github.com/kubev2v/forklift/pkg/controller/plan/migrator/base"
 	"github.com/kubev2v/forklift/pkg/controller/plan/util"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web"
 	model "github.com/kubev2v/forklift/pkg/controller/provider/web/vsphere"
+	ctrlutil "github.com/kubev2v/forklift/pkg/controller/util"
+	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
+	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	libref "github.com/kubev2v/forklift/pkg/lib/ref"
 	"github.com/kubev2v/forklift/pkg/settings"
 	template "github.com/openshift/api/template/v1"
 	"github.com/openshift/library-go/pkg/template/generator"
 	"github.com/openshift/library-go/pkg/template/templateprocessing"
 	batch "k8s.io/api/batch/v1"
+	core "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/conversion"
+	k8slabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	cnv "kubevirt.io/api/core/v1"
 	instancetypeapi "kubevirt.io/api/instancetype"
 	instancetype "kubevirt.io/api/instancetype/v1beta1"
-	libvirtxml "libvirt.org/libvirt-go-xml"
-
-	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
-	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
-	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
-	"github.com/kubev2v/forklift/pkg/controller/plan/adapter"
-	inspectionparser "github.com/kubev2v/forklift/pkg/controller/plan/adapter/vsphere"
-	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
-	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
-	liberr "github.com/kubev2v/forklift/pkg/lib/error"
-	core "k8s.io/api/core/v1"
-	k8serr "k8s.io/apimachinery/pkg/api/errors"
-	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8slabels "k8s.io/apimachinery/pkg/labels"
 	cdi "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	k8sutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+)
+
+// CSI Drivers
+const (
+	// SMBCSIDriver is the CSI driver name for SMB shares (used by HyperV provider)
+	SMBCSIDriver = "smb.csi.k8s.io"
 )
 
 // Annotations
@@ -65,6 +79,9 @@ const (
 	// Annotation to specify the default route for the transfer network.
 	// To be set on the transfer network NAD by the end user.
 	AnnForkliftNetworkRoute = "forklift.konveyor.io/route"
+	// Special value for AnnForkliftNetworkRoute to explicitly request no gateway.
+	// Use this to enable modern k8s.v1.cni.cncf.io/networks annotation without default-route.
+	AnnForkliftRouteValueNone = "none"
 	// Contains validations for a Kubevirt VM. Needs to be removed when
 	// creating a VM from a template.
 	AnnKubevirtValidations = "vm.kubevirt.io/validations"
@@ -76,11 +93,20 @@ const (
 	AnnOriginalID = "original-ID"
 	// DV deletion on completion
 	AnnDeleteAfterCompletion = "cdi.kubevirt.io/storage.deleteAfterCompletion"
-	// Max Length for vm name
-	NameMaxLength            = 63
-	VddkVolumeName           = "vddk-vol-mount"
+	// VddkVolumeName is the volume name used for the VDDK library scratch space.
+	VddkVolumeName = "vddk-vol-mount"
+	// DynamicScriptsVolumeName is the volume name used to mount first-boot scripts.
 	DynamicScriptsVolumeName = "scripts-volume-mount"
-	DynamicScriptsMountPath  = "/mnt/dynamic_scripts"
+	// DynamicScriptsMountPath is the mount path for first-boot scripts.
+	DynamicScriptsMountPath = "/mnt/dynamic_scripts"
+	// Annotation to specify current number of retries for getting parent backing
+	ParentBackingRetriesAnnotation = "parentBackingRetries"
+	// AnnPopulatorServiceAccount is set on populator PVCs to propagate the
+	// migration ServiceAccount to the populator pod.
+	AnnPopulatorServiceAccount = "forklift.konveyor.io/serviceAccount"
+	// AnnCDIPodServiceAccount is set on DataVolume annotations so CDI uses
+	// the specified ServiceAccount for its data transfer pods.
+	AnnCDIPodServiceAccount = "cdi.kubevirt.io/storage.pod.serviceAccountName"
 )
 
 // Labels
@@ -89,37 +115,72 @@ const (
 	kMigration = "migration"
 	// plan label (value=UID)
 	kPlan = "plan"
+	// plan name label (value=Plan.Name)
+	kPlanName = "plan-name"
+	// plan namespace label (value=Plan.Namespace)
+	kPlanNamespace = "plan-namespace"
 	// VM label (value=vmID)
 	kVM = "vmID"
+	// VM UUID label
+	kVmUuid = "vmUUID"
 	// App label
 	kApp = "forklift.app"
 	// LUKS
 	kLUKS = "isLUKS"
+	// Connection
+	kConnection = "isConnection"
 	// Use
 	kUse = "use"
+	// DV secret
+	kDV = "isDV"
+	// Populator secret
+	kPopulator = "isPopulator"
+	// V2V conversion secret
+	kV2V = "isV2V"
+	// Resource label
+	kResource = "resource"
+)
+
+// Resource labels
+const (
+	ResourceVMConfig      = "vm-config"
+	ResourceVDDKConfig    = "vddk-config"
+	ResourceWaitForReboot = "wait-for-reboot"
 )
 
 // User
 const (
 	// Qemu user
 	qemuUser = int64(107)
-	// Qemu group
-	qemuGroup = int64(107)
 )
 
 // Labels
 const (
-	OvaPVCLabel = "nfs-pvc"
-	OvaPVLabel  = "nfs-pv"
+	OvaPVCLabel    = "nfs-pvc"
+	OvaPVLabel     = "nfs-pv"
+	HyperVPVCLabel = "smb-pvc"
+	HyperVPVLabel  = "smb-pv"
 )
 
 // Vddk v2v conf
 const (
-	ExtraV2vConf = "extra-v2v-conf"
-	VddkConf     = "vddk-conf"
+	ExtraV2vConf         = "extra-v2v-conf"
+	VddkConf             = "vddk-conf"
+	CustomizationScripts = "customization-scripts"
 
 	VddkAioBufSizeDefault  = "16"
 	VddkAioBufCountDefault = "4"
+)
+
+// VirtV2V pod types (aliases for the canonical constants in the conversion/context package).
+const (
+	VirtV2vConversionPod = convctx.VirtV2vConversionPod
+	VirtV2vInspectionPod = convctx.VirtV2vInspectionPod
+)
+
+// PV size
+const (
+	PVSize = "1Gi"
 )
 
 // Map of VirtualMachines keyed by vmID.
@@ -130,6 +191,1092 @@ type KubeVirt struct {
 	*plancontext.Context
 	// Builder
 	Builder adapter.Builder
+	// Ensurer
+	Ensurer adapter.Ensurer
+}
+
+// conversionResources holds all resolved resources needed by both the
+// Conversion CR and the direct pod creation
+type conversionResources struct {
+	podConfig      convctx.PodConfig
+	pvcs           []*core.PersistentVolumeClaim
+	volumes        []core.Volume
+	mounts         []core.VolumeMount
+	devices        []core.VolumeDevice
+	extraVolumes   []core.Volume
+	extraMounts    []core.VolumeMount
+	secret         *core.Secret
+	inPlace        bool
+	vddkImage      string
+	localMigration bool
+	udn            bool
+	// ready is false when inspection environment data is not yet available (e.g. waiting for a snapshot)
+	ready bool
+}
+
+// resolveConversionResources resolves VM volumes, PVCs, pod volume mounts,
+// the v2v secret, provider settings and a PodConfig. For inspection pods
+// it also builds the inspection specific environment. When that data is
+// not yet available res.ready will be false.
+func (r *KubeVirt) resolveConversionResources(vm *plan.VMStatus, podType convctx.V2vPodType, step *plan.Step) (res conversionResources, err error) {
+	res.podConfig = convctx.PodConfigFromPlan(r.Plan)
+	res.podConfig.Affinity = r.getConvertorAffinity()
+
+	res.podConfig.RequestKVM = shouldRequestKVM(r.Plan.Provider.Source)
+
+	var vmVolumes []cnv.Volume
+	if podType == convctx.VirtV2vConversionPod {
+		vmVolumes, err = r.getVMVolumes(vm)
+		if err != nil {
+			return
+		}
+
+		res.pvcs, err = r.getPVCs(vm.Ref)
+		if err != nil {
+			return
+		}
+
+		useV2v, v2vErr := r.Context.Plan.ShouldUseV2vForTransfer(vm.Ref, r.Destination.Client)
+		if v2vErr != nil {
+			err = v2vErr
+			return
+		}
+		res.inPlace = !useV2v || r.IsCopyOffload(res.pvcs)
+	}
+
+	var vddkConfigMap *core.ConfigMap
+	if r.Source.Provider.UseVddkAioOptimization() {
+		vddkConfigMap, err = r.ensureVddkConfigMap()
+		if err != nil {
+			return
+		}
+	}
+
+	res.volumes, res.mounts, res.devices, res.extraVolumes, res.extraMounts, err = r.podVolumeMounts(vmVolumes, vddkConfigMap, res.pvcs, vm)
+	if err != nil {
+		return
+	}
+
+	res.secret, err = r.ensureV2vSecret(vm.Ref)
+	if err != nil {
+		return
+	}
+
+	res.vddkImage = settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
+	res.localMigration = r.Destination.Provider.IsHost()
+	res.udn = r.Plan.DestinationHasUdnNetwork(r.Destination)
+
+	res.podConfig.VDDKImage = res.vddkImage
+	res.podConfig.LocalMigration = res.localMigration
+	res.podConfig.GenerateName = r.getGeneratedName(vm)
+
+	if res.podConfig.TransferNetwork != nil {
+		anns := map[string]string{}
+		if err = r.setTransferNetwork(anns); err != nil {
+			return
+		}
+		res.podConfig.TransferNetworkAnnotations = anns
+	}
+
+	switch podType {
+	case convctx.VirtV2vConversionPod:
+		res.podConfig.PodLabels = r.conversionLabels(vm.Ref, false)
+	case convctx.VirtV2vInspectionPod:
+		res.podConfig.PodLabels = r.inspectionLabels(vm.Ref)
+	}
+
+	providerCfg, err := r.Builder.ConversionPodConfig(vm.Ref)
+	if err != nil {
+		return
+	}
+	maps.Copy(res.podConfig.PodLabels, providerCfg.Labels)
+	maps.Copy(res.podConfig.PodLabels, res.podConfig.ConvertorLabels)
+	res.podConfig.PodAnnotations = providerCfg.Annotations
+	if res.udn {
+		udnAnnotation, udnErr := buildUDNAnnotation()
+		if udnErr != nil {
+			err = udnErr
+			return
+		}
+		if res.podConfig.PodAnnotations == nil {
+			res.podConfig.PodAnnotations = make(map[string]string)
+		}
+		res.podConfig.PodAnnotations[planbase.AnnOpenDefaultPorts] = udnAnnotation
+	}
+	if providerCfg.NodeSelector != nil || res.podConfig.ConvertorNodeSelector != nil {
+		res.podConfig.PodNodeSelector = make(map[string]string)
+		maps.Copy(res.podConfig.PodNodeSelector, providerCfg.NodeSelector)
+		maps.Copy(res.podConfig.PodNodeSelector, res.podConfig.ConvertorNodeSelector)
+	}
+
+	providerEnv, err := r.Builder.PodEnvironment(vm.Ref, r.Source.Secret)
+	if err != nil {
+		return
+	}
+	res.podConfig.Environment = providerEnv
+	if vm.RootDisk != "" {
+		res.podConfig.Environment = append(res.podConfig.Environment, core.EnvVar{Name: "V2V_RootDisk", Value: vm.RootDisk})
+	}
+	if vm.NewName != "" {
+		res.podConfig.Environment = append(res.podConfig.Environment, core.EnvVar{Name: "V2V_NewName", Value: r.getNewVMName(vm)})
+	}
+
+	res.ready = true
+	if podType == convctx.VirtV2vInspectionPod && step != nil {
+		var inspEnv []core.EnvVar
+		var success bool
+		inspEnv, success, err = r.buildInspectionPodEnvironment(res.podConfig.Environment, vm, step)
+		if err != nil {
+			return
+		}
+		if !success {
+			res.ready = false
+			return
+		}
+		res.podConfig.Environment = inspEnv
+	}
+
+	return
+}
+
+// checkProviderReady returns whether the provider storage is ready after pod/CR creation.
+func (r *KubeVirt) checkProviderReady(vmID string) (ready bool, err error) {
+	switch r.Source.Provider.Type() {
+	case api.Ova, api.HyperV:
+		return r.EnsureProviderVirtV2VPVCStatus(vmID)
+	case api.EC2, api.VSphere:
+		return true, nil
+	default:
+		return true, nil
+	}
+}
+
+// ResolveConversionType determines whether the migration for the given VM
+// should use InPlace or Remote conversion based on the plan transfer mode
+// and PVC copy-offload annotations.
+func (r *KubeVirt) ResolveConversionType(vm *plan.VMStatus) (api.ConversionType, error) {
+	useV2v, err := r.Context.Plan.ShouldUseV2vForTransfer(vm.Ref, r.Destination.Client)
+	if err != nil {
+		return "", err
+	}
+	pvcs, err := r.getPVCs(vm.Ref)
+	if err != nil {
+		return "", err
+	}
+	if !useV2v || r.IsCopyOffload(pvcs) {
+		return api.InPlace, nil
+	}
+	return api.Remote, nil
+}
+
+// EnsureConversion resolves all plan data, checks whether a matching
+// Conversion CR already exists and creates one if needed.
+func (r *KubeVirt) EnsureConversion(vm *plan.VMStatus, conversionType api.ConversionType, planName, planNamespace, planID string, migration *api.Migration, step *plan.Step) (ready bool, err error) {
+	var podType convctx.V2vPodType
+	var labels map[string]string
+
+	switch conversionType {
+	case api.Remote, api.InPlace:
+		podType = convctx.VirtV2vConversionPod
+	case api.Inspection, api.DeepInspection:
+		podType = convctx.VirtV2vInspectionPod
+	default:
+		return
+	}
+
+	resources, err := r.resolveConversionResources(vm, podType, step)
+	if err != nil {
+		return
+	}
+	if !resources.ready {
+		return false, nil
+	}
+
+	labels = map[string]string{
+		convctx.LabelPlan:           planID,
+		convctx.LabelVM:             vm.ID,
+		convctx.LabelPlanName:       planName,
+		convctx.LabelPlanNamespace:  planNamespace,
+		convctx.LabelConversionType: string(conversionType),
+	}
+	if migration != nil {
+		labels[convctx.LabelMigration] = string(migration.UID)
+	}
+	// Pod labels are stored on the CR itself so they can be copied
+	// directly to the pod during creation without routing through PodSettings.
+	maps.Copy(labels, resources.podConfig.PodLabels)
+
+	list := &api.ConversionList{}
+	err = r.Client.List(context.TODO(), list,
+		client.InNamespace(r.Plan.Namespace),
+		client.MatchingLabels(labels),
+	)
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+	if len(list.Items) > 0 {
+		r.Log.Info(
+			"Conversion CR already exists.",
+			"conversion", path.Join(list.Items[0].Namespace, list.Items[0].Name),
+			"vm", vm.String())
+		return r.checkProviderReady(vm.ID)
+	}
+
+	extraVolNames := make(map[string]bool, len(resources.extraVolumes))
+	for _, v := range resources.extraVolumes {
+		extraVolNames[v.Name] = true
+	}
+	var diskVolumes []core.Volume
+	for _, v := range resources.volumes {
+		if !extraVolNames[v.Name] {
+			diskVolumes = append(diskVolumes, v)
+		}
+	}
+	diskRefs := convbuilder.DiskRefsFromVolumes(diskVolumes, resources.mounts, resources.devices, resources.pvcs)
+
+	envSettings := make(map[string]string, len(resources.podConfig.Environment))
+	for _, ev := range resources.podConfig.Environment {
+		envSettings[ev.Name] = ev.Value
+	}
+
+	conversion := &api.Conversion{
+		ObjectMeta: meta.ObjectMeta{
+			Namespace:    r.Plan.Namespace,
+			GenerateName: planName + "-" + vm.ID + "-",
+			Labels:       labels,
+			Annotations:  resources.podConfig.PodAnnotations,
+		},
+		Spec: api.ConversionSpec{
+			Type:            conversionType,
+			TargetNamespace: r.Plan.Spec.TargetNamespace,
+			Destination: core.ObjectReference{
+				Namespace: r.Destination.Provider.Namespace,
+				Name:      r.Destination.Provider.Name,
+			},
+			VM:    vm.Ref,
+			Disks: diskRefs,
+			Connection: api.Connection{
+				Secret: core.ObjectReference{
+					Namespace: resources.podConfig.TargetNamespace,
+					Name:      resources.secret.Name,
+				},
+			},
+			Image:            convctx.GetVirtV2vImage(&resources.podConfig),
+			XfsCompatibility: resources.podConfig.XfsCompatibility,
+			Settings:         envSettings,
+			VDDKImage:        resources.vddkImage,
+			LocalMigration:   resources.localMigration,
+			PodSettings: api.PodSettings{
+				ServiceAccount:             resolveServiceAccount(r.Plan),
+				Affinity:                   resources.podConfig.Affinity,
+				GenerateName:               resources.podConfig.GenerateName,
+				TransferNetworkAnnotations: resources.podConfig.TransferNetworkAnnotations,
+				NodeSelector:               resources.podConfig.PodNodeSelector,
+				RequestKVM:                 resources.podConfig.RequestKVM,
+			},
+			ExtraVolumes: resources.extraVolumes,
+			ExtraMounts:  resources.extraMounts,
+		},
+	}
+
+	if vm.NbdeClevis {
+		conversion.Spec.DiskEncryption = &api.DiskEncryption{
+			Type: api.DiskEncryptionTypeClevis,
+		}
+	} else if vm.LUKS.Name != "" {
+		// The pod runs in TargetNamespace on the destination cluster, so the
+		// LUKS secret must exist there. Copy it from the management cluster
+		// (where vm.LUKS lives) to target cluster.
+		sourceNS := vm.LUKS.Namespace
+		if sourceNS == "" {
+			sourceNS = r.Plan.Namespace
+		}
+		source := &core.Secret{}
+		if err = r.Client.Get(context.TODO(),
+			types.NamespacedName{Namespace: sourceNS, Name: vm.LUKS.Name}, source,
+		); err != nil {
+			err = liberr.Wrap(err)
+			return
+		}
+		luksLabels := r.getConversionLabels(conversionType, vm.ID, planID,
+			map[string]string{kLUKS: "true"})
+		luksSecretSpec := r.buildConversionSecret(
+			r.Plan.Spec.TargetNamespace,
+			planName+"-"+vm.ID+"-luks-",
+			luksLabels,
+			source.Data,
+		)
+		var luksSecret *core.Secret
+		luksSecret, err = r.ensureConversionSecret(r.Destination.Client, luksSecretSpec)
+		if err != nil {
+			err = liberr.Wrap(err)
+			return
+		}
+		conversion.Spec.DiskEncryption = &api.DiskEncryption{
+			Type: api.DiskEncryptionTypeLUKS,
+			Secret: core.ObjectReference{
+				Namespace: luksSecret.Namespace,
+				Name:      luksSecret.Name,
+			},
+		}
+	}
+
+	err = r.Client.Create(context.TODO(), conversion)
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+
+	r.Log.Info(
+		"Conversion CR created.",
+		"conversion", path.Join(conversion.Namespace, conversion.Name),
+		"type", string(conversionType),
+		"vm", vm.String())
+	return
+}
+
+// getConversionLabels returns the base label set for a Conversion CR or its
+// associated secrets. convType and vmID are always included; planID is added
+// when non-empty. Entries in extra override / extend the base set.
+func (r *KubeVirt) getConversionLabels(convType api.ConversionType, vmID, planID string, extra map[string]string) map[string]string {
+	labels := map[string]string{
+		convctx.LabelVM:             vmID,
+		convctx.LabelConversionType: string(convType),
+	}
+	if planID != "" {
+		labels[convctx.LabelPlan] = planID
+	}
+	for k, v := range extra {
+		labels[k] = v
+	}
+	return labels
+}
+
+// getConversion looks up a single Conversion CR in Plan.Namespace that matches
+// all supplied labels. Returns nil (no error) when no match is found.
+func (r *KubeVirt) getConversion(labels map[string]string) (*api.Conversion, error) {
+	list := &api.ConversionList{}
+	if err := r.Client.List(context.TODO(), list,
+		client.InNamespace(r.Plan.Namespace),
+		client.MatchingLabels(labels),
+	); err != nil {
+		return nil, liberr.Wrap(err)
+	}
+	if len(list.Items) == 0 {
+		return nil, nil //nolint:nilnil
+	}
+	return &list.Items[0], nil
+}
+
+// buildConversion constructs a Conversion CR in memory from a ready-made Spec.
+func (r *KubeVirt) buildConversion(planName, vmID string, labels map[string]string, spec api.ConversionSpec) *api.Conversion {
+	return &api.Conversion{
+		ObjectMeta: meta.ObjectMeta{
+			Namespace:    r.Plan.Namespace,
+			GenerateName: planName + "-" + vmID + "-",
+			Labels:       labels,
+		},
+		Spec: spec,
+	}
+}
+
+// ensureConversion creates or updates the Conversion CR on the cluster.
+// An existing CR is found by matching all labels (including LabelPlan). When
+// found its Spec is refreshed; otherwise the provided CR is created verbatim.
+func (r *KubeVirt) ensureConversion(cr *api.Conversion) (*api.Conversion, error) {
+	list := &api.ConversionList{}
+	if err := r.Client.List(context.TODO(), list,
+		client.InNamespace(cr.Namespace),
+		client.MatchingLabels(cr.Labels),
+	); err != nil {
+		return nil, liberr.Wrap(err)
+	}
+	if len(list.Items) > 0 {
+		existing := &list.Items[0]
+		existing.Spec = cr.Spec
+		if err := r.Client.Update(context.TODO(), existing); err != nil {
+			return nil, liberr.Wrap(err)
+		}
+		r.Log.Info("Conversion CR updated.",
+			"conversion", path.Join(existing.Namespace, existing.Name),
+			"type", string(existing.Spec.Type))
+		return existing, nil
+	}
+	if err := r.Client.Create(context.TODO(), cr); err != nil {
+		return nil, liberr.Wrap(err)
+	}
+	r.Log.Info("Conversion CR created.",
+		"conversion", path.Join(cr.Namespace, cr.Name),
+		"type", string(cr.Spec.Type))
+	return cr, nil
+}
+
+// buildConversionSecret constructs a Secret spec in memory for a Conversion pod.
+func (r *KubeVirt) buildConversionSecret(namespace, generateName string, labels map[string]string, data map[string][]byte) *core.Secret {
+	return &core.Secret{
+		ObjectMeta: meta.ObjectMeta{
+			Namespace:    namespace,
+			GenerateName: generateName,
+			Labels:       labels,
+		},
+		Data: data,
+	}
+}
+
+// ensureConversionSecret creates or updates a Secret using the supplied client.
+// Existing secrets are found by label-match, excluding LabelPlan (it changes).
+func (r *KubeVirt) ensureConversionSecret(cl client.Client, secret *core.Secret) (*core.Secret, error) {
+	lookupLabels := make(map[string]string, len(secret.Labels))
+	for k, v := range secret.Labels {
+		if k != convctx.LabelPlan {
+			lookupLabels[k] = v
+		}
+	}
+	list := &core.SecretList{}
+	if err := cl.List(context.TODO(), list,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(lookupLabels),
+			Namespace:     secret.Namespace,
+		},
+	); err != nil {
+		return nil, liberr.Wrap(err)
+	}
+	if len(list.Items) > 0 {
+		existing := &list.Items[0]
+		existing.Data = secret.Data
+		if err := cl.Update(context.TODO(), existing); err != nil {
+			return nil, liberr.Wrap(err)
+		}
+		r.Log.V(1).Info("Conversion secret updated.",
+			"secret", path.Join(existing.Namespace, existing.Name))
+		return existing, nil
+	}
+	if err := cl.Create(context.TODO(), secret); err != nil {
+		return nil, liberr.Wrap(err)
+	}
+	r.Log.V(1).Info("Conversion secret created.",
+		"secret", path.Join(secret.Namespace, secret.Name))
+	return secret, nil
+}
+
+// GetGuestConversion returns the guest-conversion (Remote or InPlace) Conversion CR
+// for the given VM on this plan, or nil when none exists.
+func (r *KubeVirt) GetGuestConversion(vm *plan.VMStatus) (*api.Conversion, error) {
+	typeReq, err := k8slabels.NewRequirement(
+		convctx.LabelConversionType,
+		selection.In,
+		[]string{string(api.Remote), string(api.InPlace)},
+	)
+	if err != nil {
+		return nil, liberr.Wrap(err)
+	}
+	selector := k8slabels.SelectorFromSet(map[string]string{
+		convctx.LabelPlan: string(r.Plan.UID),
+		convctx.LabelVM:   vm.ID,
+	}).Add(*typeReq)
+
+	list := &api.ConversionList{}
+	if err := r.List(context.TODO(), list,
+		client.InNamespace(r.Plan.Namespace),
+		client.MatchingLabelsSelector{Selector: selector},
+	); err != nil {
+		return nil, liberr.Wrap(err)
+	}
+	if len(list.Items) > 0 {
+		return &list.Items[0], nil
+	}
+	return nil, nil //nolint:nilnil
+}
+
+// GetDeepInspectionConversion returns the DeepInspection Conversion CR for the
+// given VM on this plan, or nil when none exists.
+func (r *KubeVirt) GetDeepInspectionConversion(vm *plan.VMStatus) (*api.Conversion, error) {
+	labels := r.getConversionLabels(api.DeepInspection, vm.ID, string(r.Plan.UID), nil)
+	return r.getConversion(labels)
+}
+
+// CreateDeepInspectionConversion creates a new DeepInspection Conversion CR and
+// returns it.
+func (r *KubeVirt) CreateDeepInspectionConversion(
+	vm *plan.VMStatus, snapshotMoref, planName, planID string,
+) (*api.Conversion, error) {
+	// Connection secret goes to Plan.Namespace on the management cluster
+	// (DeepInspection pods run there, not on the destination cluster).
+	connSecretData := r.buildDeepInspectionConnectionSecretData()
+	connLabels := r.getConversionLabels(api.DeepInspection, vm.Ref.ID, planID,
+		map[string]string{kConnection: "true"})
+	connSecretSpec := r.buildConversionSecret(
+		r.Plan.Namespace,
+		planName+"-"+vm.Ref.ID+"-di-",
+		connLabels,
+		connSecretData,
+	)
+	connSecret, err := r.ensureConversionSecret(r.Client, connSecretSpec)
+	if err != nil {
+		return nil, liberr.Wrap(err)
+	}
+
+	// Build and ensure the disk-encryption secret(s) when needed.
+	var diskEncryption *api.DiskEncryption
+	switch {
+	case vm.NbdeClevis:
+		diskEncryption = &api.DiskEncryption{Type: api.DiskEncryptionTypeClevis}
+	case vm.LUKS.Name != "":
+		sourceNS := vm.LUKS.Namespace
+		if sourceNS == "" {
+			sourceNS = r.Plan.Namespace
+		}
+		source := &core.Secret{}
+		if err = r.Client.Get(context.TODO(),
+			types.NamespacedName{Namespace: sourceNS, Name: vm.LUKS.Name}, source,
+		); err != nil {
+			return nil, liberr.Wrap(err)
+		}
+		luksLabels := r.getConversionLabels(api.DeepInspection, vm.Ref.ID, planID,
+			map[string]string{kLUKS: "true"})
+		luksSecretSpec := r.buildConversionSecret(
+			r.Plan.Namespace,
+			planName+"-"+vm.Ref.ID+"-di-luks-",
+			luksLabels,
+			source.Data,
+		)
+		luksSecret, luksErr := r.ensureConversionSecret(r.Client, luksSecretSpec)
+		if luksErr != nil {
+			return nil, liberr.Wrap(luksErr)
+		}
+		diskEncryption = &api.DiskEncryption{
+			Type: api.DiskEncryptionTypeLUKS,
+			Secret: core.ObjectReference{
+				Namespace: luksSecret.Namespace,
+				Name:      luksSecret.Name,
+			},
+		}
+	}
+
+	// Empty Destination → resolveDestinationClient returns localClient →
+	// pod is created on the management cluster in Plan.Namespace.
+	crLabels := r.getConversionLabels(api.DeepInspection, vm.ID, planID, nil)
+	spec := api.ConversionSpec{
+		Type:            api.DeepInspection,
+		TargetNamespace: r.Plan.Namespace,
+		VM:              vm.Ref,
+		Connection: api.Connection{
+			Secret: core.ObjectReference{
+				Namespace: connSecret.Namespace,
+				Name:      connSecret.Name,
+			},
+		},
+		Settings: map[string]string{
+			api.SpecSettingsSnapshotMorefKey: snapshotMoref,
+		},
+		XfsCompatibility: r.Plan.Spec.XfsCompatibility,
+		VDDKImage:        settings.GetVDDKImage(r.Source.Provider.Spec.Settings),
+		DiskEncryption:   diskEncryption,
+		PodSettings: api.PodSettings{
+			ServiceAccount: resolveServiceAccount(r.Plan),
+		},
+	}
+	cr := r.buildConversion(planName, vm.ID, crLabels, spec)
+	return r.ensureConversion(cr)
+}
+
+// DeleteConversion tears down a Conversion CR: pod → snapshot → secrets → CR.
+func (r *KubeVirt) DeleteConversion(cr *api.Conversion) error {
+	if err := r.deleteConversionPod(cr); err != nil {
+		return err
+	}
+	if err := r.removeOwnedSnapshotForCR(cr); err != nil {
+		r.Log.Error(err, "Failed to remove owned snapshot during Conversion deletion; continuing.",
+			"conversion", path.Join(cr.Namespace, cr.Name))
+	}
+	if cr.Spec.TargetNamespace != "" {
+		if err := r.deleteConversionSecrets(cr); err != nil {
+			return err
+		}
+	}
+	if err := r.Client.Delete(context.TODO(), cr); err != nil && !k8serr.IsNotFound(err) {
+		return liberr.Wrap(err)
+	}
+	r.Log.Info("Conversion CR deleted.",
+		"conversion", path.Join(cr.Namespace, cr.Name),
+		"type", string(cr.Spec.Type))
+	return nil
+}
+
+// DeleteAllConversions deletes every Conversion CR that was created for the
+// given VM on this plan, together with their pods and secrets.
+func (r *KubeVirt) DeleteAllConversions(vm *plan.VMStatus) error {
+	labels := map[string]string{
+		convctx.LabelPlan: string(r.Plan.UID),
+		convctx.LabelVM:   vm.Ref.ID,
+	}
+	list := &api.ConversionList{}
+	if err := r.Client.List(context.TODO(), list,
+		client.InNamespace(r.Plan.Namespace),
+		client.MatchingLabels(labels),
+	); err != nil {
+		return liberr.Wrap(err)
+	}
+	for i := range list.Items {
+		if err := r.DeleteConversion(&list.Items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deleteConversionPod finds the pod that was created for the given Conversion
+// CR and deletes it. For DeepInspection the pod lives on the management cluster
+// for all other types it lives on the destination cluster.
+func (r *KubeVirt) deleteConversionPod(cr *api.Conversion) error {
+	cl := r.Destination.Client
+	if cr.Spec.Type == api.DeepInspection {
+		cl = r.Client
+	}
+	matchLabels := map[string]string{
+		convctx.LabelVM:             cr.Labels[convctx.LabelVM],
+		convctx.LabelConversionType: string(cr.Spec.Type),
+	}
+	if matchLabels[convctx.LabelVM] == "" {
+		return nil
+	}
+	list := &core.PodList{}
+	if err := cl.List(context.TODO(), list,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(matchLabels),
+			Namespace:     cr.Spec.TargetNamespace,
+		},
+	); err != nil {
+		return liberr.Wrap(err)
+	}
+	for i := range list.Items {
+		pod := &list.Items[i]
+		if err := cl.Delete(context.TODO(), pod); err != nil && !k8serr.IsNotFound(err) {
+			return liberr.Wrap(err)
+		}
+		r.Log.V(1).Info("Conversion pod deleted.",
+			"pod", path.Join(pod.Namespace, pod.Name))
+	}
+	return nil
+}
+
+// removeOwnedSnapshotForCR triggers vSphere snapshot removal (fire-and-forget).
+// only done for ddep inspection type.
+func (r *KubeVirt) removeOwnedSnapshotForCR(cr *api.Conversion) error {
+	ensurer, err := convbuilder.NewEnsurer(r.Client, r.Log, cr.Spec)
+	if err != nil {
+		return err
+	}
+	_, err = ensurer.RemoveOwnedSnapshot(context.TODO(), cr)
+	return err
+}
+
+// deleteConversionSecrets deletes all secrets owned by a Conversion CR.
+func (r *KubeVirt) deleteConversionSecrets(cr *api.Conversion) error {
+	vmID, ok := cr.Labels[convctx.LabelVM]
+	if !ok || vmID == "" {
+		return nil
+	}
+
+	// DeepInspection secrets live on the management cluster.
+	cl := r.Destination.Client
+	if cr.Spec.Type == api.DeepInspection {
+		cl = r.Client
+	}
+	matchLabels := map[string]string{
+		convctx.LabelVM:             vmID,
+		convctx.LabelConversionType: string(cr.Spec.Type),
+	}
+	list := &core.SecretList{}
+	if err := cl.List(context.TODO(), list,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(matchLabels),
+			Namespace:     cr.Spec.TargetNamespace,
+		},
+	); err != nil {
+		return liberr.Wrap(err)
+	}
+	for i := range list.Items {
+		s := &list.Items[i]
+		if err := cl.Delete(context.TODO(), s); err != nil && !k8serr.IsNotFound(err) {
+			return liberr.Wrap(err)
+		}
+		r.Log.V(1).Info("Conversion secret deleted.",
+			"secret", path.Join(s.Namespace, s.Name))
+	}
+
+	// v2v credentials secret (not labelled with conversion-type).
+	if cr.Spec.Type == api.DeepInspection {
+		return nil
+	}
+	v2vList := &core.SecretList{}
+	if err := r.Destination.Client.List(context.TODO(), v2vList,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(map[string]string{
+				convctx.LabelVM: vmID,
+				kV2V:            "true",
+			}),
+			Namespace: cr.Spec.TargetNamespace,
+		},
+	); err != nil {
+		return liberr.Wrap(err)
+	}
+	for i := range v2vList.Items {
+		s := &v2vList.Items[i]
+		if err := r.Destination.Client.Delete(context.TODO(), s); err != nil && !k8serr.IsNotFound(err) {
+			return liberr.Wrap(err)
+		}
+		r.Log.V(1).Info("Conversion v2v secret deleted.",
+			"secret", path.Join(s.Namespace, s.Name))
+	}
+	return nil
+}
+
+// buildDeepInspectionConnectionSecretData assembles the secret payload for the
+// deep-inspection pod's connection secret. It copies the source provider
+// credentials and injects the provider URL and fingerprint so the pod can read
+// them from /etc/secret/ without needing the Provider CR.
+func (r *KubeVirt) buildDeepInspectionConnectionSecretData() map[string][]byte {
+	data := make(map[string][]byte, len(r.Source.Secret.Data)+2)
+	for k, v := range r.Source.Secret.Data {
+		data[k] = v
+	}
+	if r.Source.Provider.Spec.URL != "" {
+		data["url"] = []byte(r.Source.Provider.Spec.URL)
+	}
+	if r.Source.Provider.Status.Fingerprint != "" {
+		data["fingerprint"] = []byte(r.Source.Provider.Status.Fingerprint)
+	}
+	return data
+}
+
+// CancelConversion finds the Conversion CR for the given VM and marks it as Canceled.
+func (r *KubeVirt) CancelConversion(vm *plan.VMStatus) error {
+	labels := map[string]string{
+		convctx.LabelPlan: string(r.Plan.UID),
+		convctx.LabelVM:   vm.Ref.ID,
+	}
+	list := &api.ConversionList{}
+	err := r.Client.List(context.TODO(), list,
+		client.InNamespace(r.Plan.Namespace),
+		client.MatchingLabels(labels),
+	)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+	for i := range list.Items {
+		conv := &list.Items[i]
+		if conv.Status.Phase == api.PhaseSucceeded || conv.Status.Phase == api.PhaseFailed || conv.Status.Phase == api.PhaseCanceled {
+			continue
+		}
+		conv.Status.Phase = api.PhaseCanceled
+		conv.Status.Stage = api.StageFinished
+		if err = r.Client.Status().Update(context.TODO(), conv); err != nil {
+			return liberr.Wrap(err)
+		}
+		r.Log.Info("Conversion CR canceled.", "conversion", path.Join(conv.Namespace, conv.Name), "vm", vm.String())
+	}
+	return nil
+}
+
+// EnsureGuestConversionPod resolves all data and creates the conversion pod
+// via conversion.EnsureVirtV2vPod.
+func (r *KubeVirt) EnsureGuestConversionPod(vm *plan.VMStatus, step *plan.Step) (ready bool, err error) {
+	res, err := r.resolveConversionResources(vm, convctx.VirtV2vConversionPod, nil)
+	if err != nil {
+		return
+	}
+	if !res.ready {
+		return false, nil
+	}
+
+	if util.AnyNetAppShiftPersistentVolumeClaim(res.pvcs) {
+		res.podConfig.ExtraInitContainers = append(res.podConfig.ExtraInitContainers,
+			netAppShiftDiskPermsInitContainer(res.mounts, getVirtV2vImage(r.Plan)))
+	}
+
+	err = convbuilder.EnsureVirtV2vPod(r.Destination.Client, r.Log, vm, res.volumes, res.mounts, res.devices, res.secret, convctx.VirtV2vConversionPod, res.inPlace, res.podConfig)
+	if err != nil {
+		return
+	}
+
+	return r.checkProviderReady(vm.ID)
+}
+
+// EnsureWaitForRebootPod creates a pod that runs the forklift-wait-for-reboot binary to monitor the target VMI serial console (idempotent).
+func (r *KubeVirt) EnsureWaitForRebootPod(vm *plan.VMStatus) (err error) {
+	nonRoot := true
+	allowPrivilegeEscalation := false
+	user := qemuUser
+
+	img := getVirtV2vImage(r.Plan)
+	if img == "" {
+		err = liberr.New("virt-v2v image is not set; cannot create Windows wait-for-reboot pod")
+		return
+	}
+
+	existing, gErr := r.GetWaitForRebootPod(vm)
+	if gErr != nil {
+		err = liberr.Wrap(gErr)
+		return
+	}
+	if existing != nil {
+		return nil
+	}
+
+	if err = r.ensureWaitForRebootRBAC(r.Plan.Spec.TargetNamespace); err != nil {
+		return
+	}
+
+	activeDeadline := int64(settings.Settings.WindowsRebootTimeout + 600)
+	automount := true
+
+	pod := &core.Pod{
+		ObjectMeta: meta.ObjectMeta{
+			GenerateName: "forklift-wait-reboot-",
+			Namespace:    r.Plan.Spec.TargetNamespace,
+			Labels:       r.waitForRebootLabels(vm.Ref),
+		},
+		Spec: core.PodSpec{
+			SecurityContext: &core.PodSecurityContext{
+				RunAsNonRoot:   &nonRoot,
+				SeccompProfile: &core.SeccompProfile{Type: core.SeccompProfileTypeRuntimeDefault},
+			},
+			RestartPolicy:                core.RestartPolicyNever,
+			ServiceAccountName:           waitForRebootSAName,
+			AutomountServiceAccountToken: &automount,
+			ActiveDeadlineSeconds:        &activeDeadline,
+			Containers: []core.Container{
+				{
+					Name:    "forklift-wait-for-reboot",
+					Image:   img,
+					Command: []string{"/usr/local/bin/forklift-wait-for-reboot"},
+					Env: []core.EnvVar{
+						{Name: "VMI_NAME", Value: r.getNewVMName(vm)},
+						{Name: "VMI_NAMESPACE", Value: r.Plan.Spec.TargetNamespace},
+						{Name: "SIGNAL", Value: "CONVERSION_DONE"},
+						{Name: "TIMEOUT", Value: strconv.Itoa(settings.Settings.WindowsRebootTimeout)},
+					},
+					SecurityContext: &core.SecurityContext{
+						AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+						RunAsUser:                &user,
+						Capabilities:             &core.Capabilities{Drop: []core.Capability{"ALL"}},
+					},
+				},
+			},
+		},
+	}
+	err = r.Destination.Create(context.TODO(), pod)
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+	r.Log.Info("Created Windows wait-for-reboot pod.", "podNamespace", pod.Namespace, "podName", pod.Name, "vm", vm.String())
+	return nil
+}
+
+const waitForRebootSAName = "forklift-wait-reboot"
+
+// ensureWaitForRebootRBAC creates a dedicated ServiceAccount, Role, and RoleBinding
+// in the target namespace granting only VMI serial console access.
+func (r *KubeVirt) ensureWaitForRebootRBAC(namespace string) error {
+	sa := &core.ServiceAccount{
+		ObjectMeta: meta.ObjectMeta{
+			Name:      waitForRebootSAName,
+			Namespace: namespace,
+		},
+	}
+	if err := r.Destination.Create(context.TODO(), sa); err != nil && !k8serr.IsAlreadyExists(err) {
+		return liberr.Wrap(err)
+	}
+
+	// rules for the wait-for-reboot pod
+	desiredRules := []rbacv1.PolicyRule{
+		{
+			APIGroups: []string{"subresources.kubevirt.io"},
+			Resources: []string{"virtualmachineinstances/console"},
+			Verbs:     []string{"get"},
+		},
+		{
+			APIGroups: []string{"kubevirt.io"},
+			Resources: []string{"virtualmachineinstances"},
+			Verbs:     []string{"get"},
+		},
+	}
+
+	role := &rbacv1.Role{
+		ObjectMeta: meta.ObjectMeta{
+			Name:      waitForRebootSAName,
+			Namespace: namespace,
+		},
+		Rules: desiredRules,
+	}
+	if err := r.Destination.Create(context.TODO(), role); err != nil {
+		if !k8serr.IsAlreadyExists(err) {
+			return liberr.Wrap(err)
+		}
+		existing := &rbacv1.Role{}
+		if err = r.Destination.Get(context.TODO(), client.ObjectKey{Namespace: namespace, Name: waitForRebootSAName}, existing); err != nil {
+			return liberr.Wrap(err)
+		}
+		if !reflect.DeepEqual(existing.Rules, desiredRules) {
+			existing.Rules = desiredRules
+			if err = r.Destination.Update(context.TODO(), existing); err != nil {
+				return liberr.Wrap(err)
+			}
+		}
+	}
+
+	desiredSubjects := []rbacv1.Subject{
+		{
+			Kind:      "ServiceAccount",
+			Name:      waitForRebootSAName,
+			Namespace: namespace,
+		},
+	}
+	binding := &rbacv1.RoleBinding{
+		ObjectMeta: meta.ObjectMeta{
+			Name:      waitForRebootSAName + "-binding",
+			Namespace: namespace,
+		},
+		Subjects: desiredSubjects,
+		RoleRef: rbacv1.RoleRef{
+			Kind:     "Role",
+			Name:     waitForRebootSAName,
+			APIGroup: "rbac.authorization.k8s.io",
+		},
+	}
+	if err := r.Destination.Create(context.TODO(), binding); err != nil {
+		if !k8serr.IsAlreadyExists(err) {
+			return liberr.Wrap(err)
+		}
+		existing := &rbacv1.RoleBinding{}
+		if err = r.Destination.Get(context.TODO(), client.ObjectKey{Namespace: namespace, Name: waitForRebootSAName + "-binding"}, existing); err != nil {
+			return liberr.Wrap(err)
+		}
+		// roleRef is immutable, the binding must be replaced entirely if it's different
+		// subjects diff can be fixed with a plain update
+		if !reflect.DeepEqual(existing.RoleRef, binding.RoleRef) {
+			if err = r.Destination.Delete(context.TODO(), existing); err != nil {
+				return liberr.Wrap(err)
+			}
+			if err = r.Destination.Create(context.TODO(), binding); err != nil {
+				return liberr.Wrap(err)
+			}
+		} else if !reflect.DeepEqual(existing.Subjects, desiredSubjects) {
+			existing.Subjects = desiredSubjects
+			if err = r.Destination.Update(context.TODO(), existing); err != nil {
+				return liberr.Wrap(err)
+			}
+		}
+	}
+	return nil
+}
+
+// GetWaitForRebootPod finds the GetWaitForRebootPod-wait-for-reboot pod for the VM migration, if present.
+func (r *KubeVirt) GetWaitForRebootPod(vm *plan.VMStatus) (*core.Pod, error) {
+	list, err := r.GetPodsWithLabels(r.waitForRebootLabels(vm.Ref))
+	if err != nil {
+		return nil, liberr.Wrap(err)
+	}
+	if len(list.Items) == 0 {
+		return nil, nil //nolint:nilnil
+	}
+	return &list.Items[0], nil
+}
+
+// DeleteWaitForRebootPod removes the forklift-wait-for-reboot pod for the VM migration.
+func (r *KubeVirt) DeleteWaitForRebootPod(vm *plan.VMStatus) error {
+	pod, err := r.GetWaitForRebootPod(vm)
+	if err != nil || pod == nil {
+		return err
+	}
+	err = r.Destination.Delete(context.TODO(), pod)
+	if err != nil && !k8serr.IsNotFound(err) {
+		return liberr.Wrap(err)
+	}
+	return nil
+}
+
+// EnsureGuestInspectionPod resolves all data and creates the inspection pod
+// via conversion.EnsureVirtV2vPod.
+func (r *KubeVirt) EnsureGuestInspectionPod(vm *plan.VMStatus, step *plan.Step) (ready bool, err error) {
+	res, err := r.resolveConversionResources(vm, convctx.VirtV2vInspectionPod, step)
+	if err != nil {
+		return
+	}
+	if !res.ready {
+		return false, nil
+	}
+
+	err = convbuilder.EnsureVirtV2vPod(
+		r.Destination.Client, r.Log, vm,
+		res.volumes, res.mounts, res.devices,
+		res.secret, convctx.VirtV2vInspectionPod, false, res.podConfig)
+	if err != nil {
+		return
+	}
+
+	return r.checkProviderReady(vm.ID)
+}
+
+// GetConversionPod returns the managed pod for the given VM ref and pod type.
+func (r *KubeVirt) GetConversionPod(vmRef ref.Ref, podType convctx.V2vPodType) (*core.Pod, error) {
+	var labels map[string]string
+	switch podType {
+	case convctx.VirtV2vConversionPod:
+		labels = r.conversionLabels(vmRef, true)
+	case convctx.VirtV2vInspectionPod:
+		labels = r.inspectionLabels(vmRef)
+	}
+	list, err := r.GetPodsWithLabels(labels)
+	if err != nil {
+		return nil, err
+	}
+	if len(list.Items) > 0 {
+		return &list.Items[0], nil
+	}
+	return nil, nil //nolint:nilnil
+}
+
+// ensureV2vSecret ensures the v2v secret exists for the given VM.
+func (r *KubeVirt) ensureV2vSecret(vmRef ref.Ref) (*core.Secret, error) {
+	labels := r.vmLabels(vmRef)
+	labels[kV2V] = "true"
+	return r.ensureSecret(vmRef, r.secretDataSetterForCDI(vmRef), labels)
+}
+
+// getVMVolumes returns the volumes from the KubeVirt VM spec.
+func (r *KubeVirt) getVMVolumes(vm *plan.VMStatus) ([]cnv.Volume, error) {
+	vmCr, err := r.virtualMachine(vm, true)
+	if err != nil {
+		return nil, err
+	}
+	return vmCr.Spec.Template.Spec.Volumes, nil
+}
+
+// resolveServiceAccount resolves the ServiceAccount for migration pods.
+// Priority: Plan.Spec.ServiceAccount > Settings.Migration.ServiceAccount > "" (namespace default).
+func resolveServiceAccount(plan *api.Plan) string {
+	return cmp.Or(plan.Spec.ServiceAccount, Settings.Migration.ServiceAccount)
+}
+
+// CNINetworkConfig represents a CNI network configuration parsed from a NetworkAttachmentDefinition.
+// This includes the IPAM configuration with routes for determining default gateway.
+type CNINetworkConfig struct {
+	IPAM CNIIPAMConfig `json:"ipam"`
+}
+
+// CNIIPAMConfig represents the IPAM section of a CNI network configuration.
+type CNIIPAMConfig struct {
+	Routes []CNIRoute `json:"routes"`
+}
+
+// CNIRoute represents a single route entry in the CNI IPAM configuration.
+type CNIRoute struct {
+	Dst string `json:"dst"` // Destination network in CIDR notation (e.g., "0.0.0.0/0" for default route)
+	GW  string `json:"gw"`  // Gateway IP address
 }
 
 // Build a VirtualMachineMap.
@@ -255,6 +1402,93 @@ func genVddkConfConfigMapName(plan *api.Plan) string {
 	return fmt.Sprintf("%s-%s-", plan.Name, VddkConf)
 }
 
+func genCustomizationScriptsConfigMapName(plan *api.Plan) string {
+	return fmt.Sprintf("%s-%s", plan.Name, CustomizationScripts)
+}
+
+// Ensure the ConfigMap referenced by CustomizationScripts exists in TargetNamespace.
+// If the ConfigMap lives in a different namespace, it is copied to the target.
+func (r *KubeVirt) EnsureCustomizationScriptsConfigMap() error {
+	if r.Plan.Spec.CustomizationScripts == nil {
+		return nil
+	}
+
+	configMapNamespace := r.Plan.Spec.CustomizationScripts.Namespace
+	if configMapNamespace == "" {
+		configMapNamespace = r.Plan.Namespace
+	}
+	if configMapNamespace == r.Plan.Spec.TargetNamespace {
+		return nil
+	}
+
+	configMap := &core.ConfigMap{}
+	err := r.Get(
+		context.TODO(),
+		client.ObjectKey{
+			Name:      r.Plan.Spec.CustomizationScripts.Name,
+			Namespace: configMapNamespace,
+		},
+		configMap,
+	)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+
+	err = ensureConfigMap(configMap, genCustomizationScriptsConfigMapName, r.Plan, r.Destination.Client)
+	if err == nil {
+		r.Log.V(4).Info(
+			"Ensured ConfigMap for customization scripts in target namespace.",
+			"configMap namespace", configMapNamespace,
+			"target namespace", r.Plan.Spec.TargetNamespace)
+	}
+	return err
+}
+
+// CleanupCopiedConfigMaps deletes the extra-v2v-conf, customization-scripts,
+// and vddk-conf ConfigMaps that were copied to the plan's TargetNamespace at
+// migration start. Safe to call regardless of migration outcome.
+func (r *KubeVirt) CleanupCopiedConfigMaps() {
+	ns := r.Plan.Spec.TargetNamespace
+	cl := r.Destination.Client
+
+	// extra-v2v-conf and customization-scripts use deterministic names (delete by name).
+	for _, name := range []string{
+		genExtraV2vConfConfigMapName(r.Plan),
+		genCustomizationScriptsConfigMapName(r.Plan),
+	} {
+		cm := &core.ConfigMap{}
+		cm.Name = name
+		cm.Namespace = ns
+		if err := cl.Delete(context.TODO(), cm); err != nil && !k8serr.IsNotFound(err) {
+			r.Log.Error(err, "Failed to delete copied ConfigMap.", "name", name, "namespace", ns)
+		} else if err == nil {
+			r.Log.Info("Deleted copied ConfigMap.", "name", name, "namespace", ns)
+		}
+	}
+
+	// vddk-conf uses GenerateName so must be found by label selector.
+	list := &core.ConfigMapList{}
+	err := cl.List(
+		context.TODO(),
+		list,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(r.vddkLabels()),
+			Namespace:     ns,
+		},
+	)
+	if err != nil {
+		r.Log.Error(err, "Failed to list vddk-conf ConfigMaps for cleanup.", "namespace", ns)
+		return
+	}
+	for i := range list.Items {
+		if err := cl.Delete(context.TODO(), &list.Items[i]); err != nil && !k8serr.IsNotFound(err) {
+			r.Log.Error(err, "Failed to delete vddk-conf ConfigMap.", "name", list.Items[i].Name, "namespace", ns)
+		} else if err == nil {
+			r.Log.Info("Deleted vddk-conf ConfigMap.", "name", list.Items[i].Name, "namespace", ns)
+		}
+	}
+}
+
 // Get the importer pod for a PersistentVolumeClaim.
 func (r *KubeVirt) GetImporterPod(pvc core.PersistentVolumeClaim) (pod *core.Pod, found bool, err error) {
 	pod = &core.Pod{}
@@ -319,6 +1553,12 @@ func (r *KubeVirt) DeleteDataVolumes(vm *plan.VMStatus) (err error) {
 		return
 	}
 	for _, dv := range dvs {
+		r.Log.Info(
+			"Deleting DataVolume.",
+			"dv",
+			path.Join(dv.Namespace, dv.Name),
+			"vm",
+			vm.String())
 		err = r.Destination.Client.Delete(context.TODO(), dv.DataVolume)
 		if err != nil {
 			return
@@ -375,6 +1615,7 @@ func (r *KubeVirt) DeleteJobs(vm *plan.VMStatus) (err error) {
 		err = liberr.Wrap(err)
 		return
 	}
+	r.Log.Info("Found jobs to delete.", "count", len(list.Items), "vm", vm.String())
 
 	jobNames := []string{}
 	for _, job := range list.Items {
@@ -512,6 +1753,7 @@ func (r *KubeVirt) DeleteSecret(vm *plan.VMStatus) (err error) {
 		err = liberr.Wrap(err)
 		return
 	}
+	r.Log.Info("Found secrets to delete.", "count", len(list.Items), "vm", vm.String())
 	for _, object := range list.Items {
 		err = r.DeleteObject(&object, vm, "Deleted secret.", "secret")
 		if err != nil {
@@ -537,6 +1779,7 @@ func (r *KubeVirt) DeleteConfigMap(vm *plan.VMStatus) (err error) {
 		err = liberr.Wrap(err)
 		return
 	}
+	r.Log.Info("Found config maps to delete.", "count", len(list.Items), "vm", vm.String())
 	for _, object := range list.Items {
 		err = r.DeleteObject(&object, vm, "Deleted configMap.", "configMap")
 		if err != nil {
@@ -562,6 +1805,7 @@ func (r *KubeVirt) DeleteVM(vm *plan.VMStatus) (err error) {
 		err = liberr.Wrap(err)
 		return
 	}
+	r.Log.Info("Found VMs to delete.", "count", len(list.Items), "vm", vm.String())
 	for _, object := range list.Items {
 		foreground := meta.DeletePropagationForeground
 		opts := &client.DeleteOptions{PropagationPolicy: &foreground}
@@ -588,6 +1832,7 @@ func (r *KubeVirt) DeleteVM(vm *plan.VMStatus) (err error) {
 
 func (r *KubeVirt) DataVolumes(vm *plan.VMStatus) (dataVolumes []cdi.DataVolume, err error) {
 	labels := r.vmLabels(vm.Ref)
+	labels[kDV] = "true"
 	secret, err := r.ensureSecret(vm.Ref, r.secretDataSetterForCDI(vm.Ref), labels)
 	if err != nil {
 		return
@@ -613,12 +1858,16 @@ func (r *KubeVirt) DataVolumes(vm *plan.VMStatus) (dataVolumes []cdi.DataVolume,
 
 func (r *KubeVirt) PopulatorVolumes(vmRef ref.Ref) (pvcs []*core.PersistentVolumeClaim, err error) {
 	labels := r.vmLabels(vmRef)
+	labels[kPopulator] = "true"
 	secret, err := r.ensureSecret(vmRef, r.copyDataFromProviderSecret, labels)
 	if err != nil {
 		err = liberr.Wrap(err)
 		return
 	}
-	annotations := r.vmLabels(vmRef)
+	annotations := make(map[string]string)
+	if sa := resolveServiceAccount(r.Plan); sa != "" {
+		annotations[AnnPopulatorServiceAccount] = sa
+	}
 	err = r.createLunDisks(vmRef)
 	if err != nil {
 		err = liberr.Wrap(err)
@@ -661,6 +1910,12 @@ func (r *KubeVirt) EnsureDataVolumes(vm *plan.VMStatus, dataVolumes []cdi.DataVo
 	return
 }
 
+// NetAppShiftPVCs builds PVCs for disks mapped to NetApp Shift StorageClasses.
+func (r *KubeVirt) NetAppShiftPVCs(vm *plan.VMStatus) ([]core.PersistentVolumeClaim, error) {
+	labels := r.vmLabels(vm.Ref)
+	return r.Builder.NetAppShiftPVCs(vm.Ref, labels)
+}
+
 func (r *KubeVirt) vddkConfigMap(labels map[string]string) (*core.ConfigMap, error) {
 	data := make(map[string]string)
 	if r.Source.Provider.UseVddkAioOptimization() {
@@ -668,9 +1923,8 @@ func (r *KubeVirt) vddkConfigMap(labels map[string]string) (*core.ConfigMap, err
 		if vddkConfig != "" {
 			data["vddk-config-file"] = vddkConfig
 		} else {
-			data["vddk-config-file"] =
-				"VixDiskLib.nfcAio.Session.BufSizeIn64KB=16\n" +
-					"VixDiskLib.nfcAio.Session.BufCount=4"
+			data["vddk-config-file"] = "VixDiskLib.nfcAio.Session.BufSizeIn64KB=16\n" +
+				"VixDiskLib.nfcAio.Session.BufCount=4"
 		}
 	}
 	configMap := core.ConfigMap{
@@ -768,7 +2022,6 @@ func (r *KubeVirt) getDVs(vm *plan.VMStatus) (edvs []ExtendedDataVolume, err err
 			LabelSelector: k8slabels.SelectorFromSet(r.vmAllButMigrationLabels(vm.Ref)),
 			Namespace:     r.Plan.Spec.TargetNamespace,
 		})
-
 	if err != nil {
 		err = liberr.Wrap(err)
 		return
@@ -797,27 +2050,44 @@ func getDiskIndex(pvc *core.PersistentVolumeClaim) int {
 // Return PersistentVolumeClaims associated with a VM.
 func (r *KubeVirt) getPVCs(vmRef ref.Ref) (pvcs []*core.PersistentVolumeClaim, err error) {
 	pvcsList := &core.PersistentVolumeClaimList{}
+	// Add VM uuid
+	labelSelector := map[string]string{
+		kVM: vmRef.ID,
+	}
+	// We need to have this in getPVCs so we create VM with corect disks, this will also help us with the guest generation
+	if r.Plan.Spec.Type == api.MigrationOnlyConversion {
+		v, err := r.Source.Inventory.VM(&vmRef)
+		if err != nil {
+			err = liberr.Wrap(err)
+			return nil, err
+		}
+		if vm, ok := v.(*model.VM); ok {
+			labelSelector[kVmUuid] = vm.UUID
+		} else {
+			return nil, fmt.Errorf("failed to parse the VM for only conversion mode, we need to UUID to prevent accidental overwrites, stopping migration")
+		}
+	} else {
+		labelSelector[kMigration] = string(r.Migration.UID)
+	}
 	err = r.Destination.Client.List(
 		context.TODO(),
 		pvcsList,
 		&client.ListOptions{
-			LabelSelector: k8slabels.SelectorFromSet(map[string]string{
-				"migration": string(r.Migration.UID),
-				kVM:         vmRef.ID,
-			}),
+			LabelSelector: k8slabels.SelectorFromSet(labelSelector),
+			Namespace:     r.Plan.Spec.TargetNamespace,
 		},
 	)
-
 	if err != nil {
 		err = liberr.Wrap(err)
 		return
 	}
 
-	pvcs = make([]*core.PersistentVolumeClaim, len(pvcsList.Items))
-	for i, pvc := range pvcsList.Items {
-		// loopvar
-		pvc := pvc
-		pvcs[i] = &pvc
+	for i := range pvcsList.Items {
+		pvc := &pvcsList.Items[i]
+		if strings.HasPrefix(pvc.Name, "prime-") || !hasDiskIdentity(pvc) {
+			continue
+		}
+		pvcs = append(pvcs, pvc)
 	}
 
 	// Sort the pvcs slice by disk index
@@ -828,6 +2098,16 @@ func (r *KubeVirt) getPVCs(vmRef ref.Ref) (pvcs []*core.PersistentVolumeClaim, e
 	})
 
 	return
+}
+
+// hasDiskIdentity reports whether the PVC carries the AnnDiskSource annotation
+// that every adapter sets on real disk PVCs.
+func hasDiskIdentity(pvc *core.PersistentVolumeClaim) bool {
+	if pvc.Annotations == nil {
+		return false
+	}
+	source, ok := pvc.Annotations[planbase.AnnDiskSource]
+	return ok && strings.TrimSpace(source) != ""
 }
 
 // Creates the PVs and PVCs for LUN disks.
@@ -883,8 +2163,8 @@ func (r *KubeVirt) createPodToBindPVCs(vm *plan.VMStatus, pvcNames []string) (er
 					Name: "main",
 					// For v2v the consumer pod is used only when we execute cold migration with el9.
 					// In that case, we could benefit from pulling the image of the conversion pod, so it will be present on the node.
-					Image:   Settings.Migration.VirtV2vImage,
-					Command: []string{"/bin/sh"},
+					Image:   getVirtV2vImage(r.Plan),
+					Command: []string{"/bin/sh", "-c", "exit 0"},
 					Resources: core.ResourceRequirements{
 						Requests: core.ResourceList{
 							core.ResourceCPU:    resource.MustParse(Settings.Migration.VirtV2vContainerRequestsCpu),
@@ -913,8 +2193,10 @@ func (r *KubeVirt) createPodToBindPVCs(vm *plan.VMStatus, pvcNames []string) (er
 			},
 		},
 	}
-	// Align with the conversion pod request, to prevent breakage
-	r.setKvmOnPodSpec(&pod.Spec)
+	if sa := resolveServiceAccount(r.Plan); sa != "" {
+		pod.Spec.ServiceAccountName = sa
+	}
+	convbuilder.SetKvmOnPodSpec(&pod.Spec, shouldRequestKVM(r.Plan.Provider.Source))
 
 	err = r.Client.Create(context.TODO(), pod, &client.CreateOptions{})
 	if err != nil {
@@ -924,98 +2206,48 @@ func (r *KubeVirt) createPodToBindPVCs(vm *plan.VMStatus, pvcNames []string) (er
 	return nil
 }
 
-// Sets KVM requirement to the pod and container.
-func (r *KubeVirt) setKvmOnPodSpec(podSpec *core.PodSpec) {
-	if Settings.VirtV2vDontRequestKVM {
-		return
-	}
-	switch *r.Plan.Provider.Source.Spec.Type {
-	case api.VSphere, api.Ova:
-		if podSpec.NodeSelector == nil {
-			podSpec.NodeSelector = make(map[string]string)
-		}
-		podSpec.NodeSelector["kubevirt.io/schedulable"] = "true"
-		container := &podSpec.Containers[0]
-		if container.Resources.Limits == nil {
-			container.Resources.Limits = make(map[core.ResourceName]resource.Quantity)
-		}
-		container.Resources.Limits["devices.kubevirt.io/kvm"] = resource.MustParse("1")
-		container.Resources.Limits["cpu"] = resource.MustParse("2")
-		container.Resources.Limits["memory"] = resource.MustParse("5Gi")
-		if container.Resources.Requests == nil {
-			container.Resources.Requests = make(map[core.ResourceName]resource.Quantity)
-		}
-		// Ensure that the pod is deployed on a node where /dev/kvm is present.
-		container.Resources.Requests["devices.kubevirt.io/kvm"] = resource.MustParse("1")
-		container.Resources.Requests["cpu"] = resource.MustParse("500m")
-		container.Resources.Requests["memory"] = resource.MustParse("1Gi")
-	}
-}
-
 func (r *KubeVirt) getListOptionsNamespaced() (listOptions *client.ListOptions) {
 	return &client.ListOptions{
 		Namespace: r.Plan.Spec.TargetNamespace,
 	}
 }
 
-// Ensure the guest conversion (virt-v2v) pod exists on the destination.
-func (r *KubeVirt) EnsureGuestConversionPod(vm *plan.VMStatus, vmCr *VirtualMachine, pvcs []*core.PersistentVolumeClaim) (err error) {
-	// labels := r.vmLabels(vm.Ref)
-	// v2vSecret, err := r.ensureSecret(vm.Ref, r.secretDataSetterForCDI(vm.Ref), labels)
-	// if err != nil {
-	// 	return
-	// }
-
-	libvirtConfigMap, err := r.ensureLibvirtConfigMap(vm.Ref, vmCr, pvcs)
-	if err != nil {
-		return
+// shouldRequestKVM returns true for provider types that need KVM passthrough.
+func shouldRequestKVM(provider *api.Provider) bool {
+	if Settings.VirtV2vDontRequestKVM {
+		return false
 	}
-
-	var vddkConfigMap *core.ConfigMap
-	if r.Source.Provider.UseVddkAioOptimization() {
-		vddkConfigMap, err = r.ensureVddkConfigMap()
-		if err != nil {
-			return err
-		}
+	switch provider.Type() {
+	case api.VSphere, api.Ova, api.HyperV:
+		return true
+	default:
+		return false
 	}
-
-	newPod, err := r.guestConversionPod(vm, vmCr.Spec.Template.Spec.Volumes, libvirtConfigMap, vddkConfigMap, pvcs)
-	if err != nil {
-		return
-	}
-
-	list, err := r.GetPodsWithLabels(r.conversionLabels(vm.Ref, true))
-	if err != nil {
-		return
-	}
-
-	pod := &core.Pod{}
-	if len(list.Items) == 0 {
-		pod = newPod
-		err = r.Destination.Client.Create(context.TODO(), pod)
-		if err != nil {
-			err = liberr.Wrap(err)
-			return
-		}
-		r.Log.Info(
-			"Created virt-v2v pod.",
-			"pod",
-			path.Join(
-				pod.Namespace,
-				pod.Name),
-			"vm",
-			vm.String())
-	}
-
-	return
 }
 
-func (r *KubeVirt) EnsureOVAVirtV2VPVCStatus(vmID string) (ready bool, err error) {
+// EnsureProviderVirtV2VPVCStatus checks if the provider storage PVC is ready.
+// Works for both OVA (NFS) and HyperV (SMB) PVCs.
+func (r *KubeVirt) EnsureProviderVirtV2VPVCStatus(vmID string) (ready bool, err error) {
 	pvcs := &core.PersistentVolumeClaimList{}
-	pvcLabels := map[string]string{
-		"migration": string(r.Migration.UID),
-		"ova":       OvaPVCLabel,
-		kVM:         vmID,
+
+	// Build labels based on provider type
+	var pvcLabels map[string]string
+	switch r.Source.Provider.Type() {
+	case api.Ova:
+		pvcLabels = map[string]string{
+			"migration": string(r.Migration.UID),
+			"ova":       OvaPVCLabel,
+			kVM:         vmID,
+		}
+	case api.HyperV:
+		pvcLabels = map[string]string{
+			"migration": string(r.Migration.UID),
+			"hyperv":    HyperVPVCLabel,
+			kVM:         vmID,
+		}
+	default:
+		// Should not happen, but handle gracefully
+		return false, nil
 	}
 
 	err = r.Destination.Client.List(
@@ -1034,9 +2266,10 @@ func (r *KubeVirt) EnsureOVAVirtV2VPVCStatus(vmID string) (ready bool, err error
 	// In case we have leftovers for the PVCs from previous runs, and we get more than one PVC in the list,
 	// we will filter by the creation timestamp.
 	if len(pvcs.Items) > 1 {
-		for _, pvcVirtV2v := range pvcs.Items {
+		for i := range pvcs.Items {
+			pvcVirtV2v := &pvcs.Items[i]
 			if pvcVirtV2v.CreationTimestamp.Time.After(r.Migration.CreationTimestamp.Time) {
-				pvc = &pvcVirtV2v
+				pvc = pvcVirtV2v
 			}
 		}
 		if pvc == nil {
@@ -1100,7 +2333,7 @@ func (r *KubeVirt) getInspectionXml(pod *core.Pod) (string, error) {
 
 func (r *KubeVirt) UpdateVmByConvertedConfig(vm *plan.VMStatus, pod *core.Pod, step *plan.Step) error {
 	if pod == nil || pod.Status.PodIP == "" {
-		//we need the IP for fetching the configuration of the convered VM.
+		// we need the IP for fetching the configuration of the convered VM.
 		return nil
 	}
 
@@ -1122,12 +2355,13 @@ func (r *KubeVirt) UpdateVmByConvertedConfig(vm *plan.VMStatus, pod *core.Pod, s
 	}
 	defer resp.Body.Close()
 
+	vmConf, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+
 	switch r.Source.Provider.Type() {
-	case api.Ova:
-		vmConf, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return liberr.Wrap(err)
-		}
+	case api.Ova, api.HyperV:
 		if vm.Firmware, err = util.GetFirmwareFromYaml(vmConf); err != nil {
 			return liberr.Wrap(err)
 		}
@@ -1140,6 +2374,49 @@ func (r *KubeVirt) UpdateVmByConvertedConfig(vm *plan.VMStatus, pod *core.Pod, s
 			return liberr.Wrap(err)
 		}
 		r.Log.Info("Setting the vm OS ", vm.OperatingSystem, "vmId", vm.ID)
+	}
+
+	if bootDiskIndex, bootOrderErr := util.GetDiskBootOrderFromYaml(vmConf); bootOrderErr != nil {
+		r.Log.Error(bootOrderErr, "Failed to extract boot order from virt-v2v output", "vmId", vm.ID)
+	} else if bootDiskIndex >= 0 {
+		vm.DetectedBootDisk = &bootDiskIndex
+		r.Log.Info("Detected boot disk from virt-v2v output", "bootDiskIndex", bootDiskIndex, "vmId", vm.ID)
+	}
+
+	// Fetch warnings before shutting down
+	warningsURL := fmt.Sprintf("http://%s:8080/warnings", pod.Status.PodIP)
+	if resp, err = http.Get(warningsURL); err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			var body []byte
+			if resp.Body != nil {
+				if data, err := io.ReadAll(resp.Body); err == nil {
+					body = data
+				}
+			}
+
+			contentType := resp.Header.Get("Content-Type")
+			if contentType != "application/json" {
+				r.Log.Info("contentType=%s, expect application/json", contentType)
+			}
+
+			var warnings []struct {
+				Reason  string `json:"reason"`
+				Message string `json:"message"`
+			}
+			if err = json.Unmarshal(body, &warnings); err == nil {
+				for _, warning := range warnings {
+					vm.SetCondition(libcnd.Condition{
+						Type:     ConversionHasWarnings,
+						Status:   True,
+						Category: "Warning",
+						Reason:   warning.Reason,
+						Message:  warning.Message,
+					})
+					r.Log.Info("Conversion warning detected", "reason", warning.Reason, "vmId", vm.ID)
+				}
+			}
+		}
 	}
 
 	shutdownURL := fmt.Sprintf("http://%s:8080/shutdown", pod.Status.PodIP)
@@ -1163,6 +2440,7 @@ func (r *KubeVirt) DeletePVCConsumerPod(vm *plan.VMStatus) (err error) {
 	if err != nil {
 		return err
 	}
+	r.Log.Info("Found PVC consumer pods to delete.", "count", len(list.Items), "vm", vm.String())
 	for _, object := range list.Items {
 		err = r.DeleteObject(&object, vm, "Deleted PVC consumer pod.", "pod")
 		if err != nil {
@@ -1172,12 +2450,55 @@ func (r *KubeVirt) DeletePVCConsumerPod(vm *plan.VMStatus) (err error) {
 	return
 }
 
+// Delete the inspection pod.
+func (r *KubeVirt) DeletePreflightInspectionPod(vm *plan.VMStatus) (err error) {
+	list, err := r.GetPodsWithLabels(r.inspectionLabels(vm.Ref))
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+	r.Log.Info("Found preflight inspection pods to delete.", "count", len(list.Items), "vm", vm.String())
+	for _, object := range list.Items {
+		err := r.DeleteObject(&object, vm, "Deleted preflight inspection pod.", "pod")
+		if err != nil {
+			return err
+		}
+	}
+	return
+}
+
+// DeleteDeepInspectionPods deletes any deep inspection pods for the given VM
+// that live on the management cluster.
+func (r *KubeVirt) DeleteDeepInspectionPods(vm *plan.VMStatus) error {
+	matchLabels := map[string]string{
+		convctx.LabelPlan:           string(r.Plan.UID),
+		convctx.LabelVM:             vm.ID,
+		convctx.LabelConversionType: string(api.DeepInspection),
+	}
+	list := &core.PodList{}
+	if err := r.List(context.TODO(), list,
+		client.InNamespace(r.Plan.Namespace),
+		client.MatchingLabels(matchLabels),
+	); err != nil {
+		return liberr.Wrap(err)
+	}
+	r.Log.Info("Found deep inspection pods to delete.", "count", len(list.Items), "vm", vm.String())
+	for i := range list.Items {
+		pod := &list.Items[i]
+		if err := r.Delete(context.TODO(), pod); err != nil && !k8serr.IsNotFound(err) {
+			return liberr.Wrap(err)
+		}
+		r.Log.Info("Deleted deep inspection pod.", "pod", pod.Name, "vm", vm.String())
+	}
+	return nil
+}
+
 // Delete the guest conversion pod on the destination cluster.
 func (r *KubeVirt) DeleteGuestConversionPod(vm *plan.VMStatus) (err error) {
 	list, err := r.GetPodsWithLabels(r.conversionLabels(vm.Ref, true))
 	if err != nil {
 		return liberr.Wrap(err)
 	}
+	r.Log.Info("Found guest conversion pods to delete.", "count", len(list.Items), "vm", vm.String())
 	for _, object := range list.Items {
 		err := r.DeleteObject(&object, vm, "Deleted guest conversion pod.", "pod")
 		if err != nil {
@@ -1212,7 +2533,7 @@ func (r *KubeVirt) GetPodsWithLabels(podLabels map[string]string) (pods *core.Po
 
 // Deletes an object from destination cluster associated with the VM.
 func (r *KubeVirt) DeleteObject(object client.Object, vm *plan.VMStatus, message, objType string, options ...client.DeleteOption) (err error) {
-	err = r.Destination.Client.Delete(context.TODO(), object)
+	err = r.Destination.Client.Delete(context.TODO(), object, options...)
 	if err != nil {
 		if k8serr.IsNotFound(err) {
 			err = nil
@@ -1234,55 +2555,32 @@ func (r *KubeVirt) DeleteObject(object client.Object, vm *plan.VMStatus, message
 
 // Delete any hook jobs that belong to a VM migration.
 func (r *KubeVirt) DeleteHookJobs(vm *plan.VMStatus) (err error) {
-	vmLabels := r.vmAllButMigrationLabels(vm.Ref)
+	// Build labels that match hook jobs (plan + vmID + resource:hook-config)
+	labels := map[string]string{
+		kPlan:     string(r.Plan.UID),
+		kVM:       vm.Ref.ID,
+		kResource: ResourceHookConfig,
+	}
+
 	list := &batch.JobList{}
 	err = r.Destination.Client.List(
 		context.TODO(),
 		list,
 		&client.ListOptions{
-			LabelSelector: k8slabels.SelectorFromSet(vmLabels),
-			Namespace:     r.Plan.Spec.TargetNamespace,
+			LabelSelector: k8slabels.SelectorFromSet(labels),
+			Namespace:     r.Plan.Namespace,
 		},
 	)
 	if err != nil {
 		err = liberr.Wrap(err)
 		return
 	}
+	r.Log.Info("Found hook jobs to delete.", "count", len(list.Items), "vm", vm.String())
 	for _, object := range list.Items {
-		err = r.DeleteObject(&object, vm, "Deleted hook job.", "job")
+		err = r.DeleteObject(&object, vm, "Deleted hook job.", "job",
+			client.PropagationPolicy(meta.DeletePropagationForeground))
 		if err != nil {
 			return err
-		}
-	}
-	return
-}
-
-// Set the Populator Pod Ownership.
-func (r *KubeVirt) SetPopulatorPodOwnership(vm *plan.VMStatus) (err error) {
-	pvcs, err := r.getPVCs(vm.Ref)
-	if err != nil {
-		return
-	}
-	pods, err := r.getPopulatorPods()
-	if err != nil {
-		return
-	}
-	for _, pod := range pods {
-		pvcId := pod.Name[len(PopulatorPodPrefix):]
-		for _, pvc := range pvcs {
-			if string(pvc.UID) != pvcId {
-				continue
-			}
-			podCopy := pod.DeepCopy()
-			err = k8sutil.SetOwnerReference(pvc, &pod, r.Scheme())
-			if err != nil {
-				continue
-			}
-			patch := client.MergeFrom(podCopy)
-			err = r.Destination.Client.Patch(context.TODO(), &pod, patch)
-			if err != nil {
-				break
-			}
 		}
 	}
 	return
@@ -1294,6 +2592,7 @@ func (r *KubeVirt) DeletePopulatedPVCs(vm *plan.VMStatus) error {
 	if err != nil {
 		return err
 	}
+	r.Log.Info("Found populated PVCs to delete.", "count", len(pvcs), "vm", vm.String())
 	for _, pvc := range pvcs {
 		if err = r.deleteCorrespondingPrimePVC(pvc, vm); err != nil {
 			return err
@@ -1338,16 +2637,34 @@ func (r *KubeVirt) deletePopulatedPVC(pvc *core.PersistentVolumeClaim, vm *plan.
 
 // Delete any populator pods that belong to a VM's migration.
 func (r *KubeVirt) DeletePopulatorPods(vm *plan.VMStatus) (err error) {
-	list, err := r.getPopulatorPods()
+	if Settings.RetainPopulatorPods {
+		if r.Plan.Spec.DeleteVmOnFailMigration || vm.DeleteVmOnFailMigration {
+			r.Log.Info(
+				"WARNING: FEATURE_RETAIN_POPULATOR_PODS is enabled but DeleteVmOnFailMigration is also set;"+
+					" on failure the PVCs will be deleted and Kubernetes GC will remove the populator pods via OwnerReference.",
+				"vm", vm.String())
+		}
+		r.Log.Info("Retaining populator pods (feature flag enabled).", "vm", vm.String())
+		return
+	}
+	list, err := r.getPopulatorPods(vm.ID)
+	if err != nil {
+		return
+	}
+	r.Log.Info("Found populator pods to delete.", "count", len(list), "vm", vm.String())
 	for _, object := range list {
 		err = r.DeleteObject(&object, vm, "Deleted populator pod.", "pod")
 	}
 	return
 }
 
-// Get populator pods that belong to a VM's migration.
-func (r *KubeVirt) getPopulatorPods() (pods []core.Pod, err error) {
-	migrationPods, err := r.GetPodsWithLabels(map[string]string{kMigration: string(r.Plan.Status.Migration.ActiveSnapshot().Migration.UID)})
+// Get populator pods that belong to a specific VM in a migration.
+func (r *KubeVirt) getPopulatorPods(vmID string) (pods []core.Pod, err error) {
+	labelSelector := map[string]string{kMigration: string(r.Plan.Status.Migration.ActiveSnapshot().Migration.UID)}
+	if vmID != "" {
+		labelSelector[kVM] = vmID
+	}
+	migrationPods, err := r.GetPodsWithLabels(labelSelector)
 	if err != nil {
 		return nil, liberr.Wrap(err)
 	}
@@ -1377,21 +2694,43 @@ func (r *KubeVirt) dataVolumes(vm *plan.VMStatus, secret *core.Secret, configMap
 		}
 	}
 
-	// if r.Plan.Spec.Warm || !r.Destination.Provider.IsHost() || r.Plan.IsSourceProviderOCP() {
-	// Set annotation for WFFC storage classes. Note that we create data volumes while
-	// running a cold migration to the local cluster only when the source is either OpenShift
-	// or vSphere, and in the latter case the conversion pod acts as the first-consumer
-	annotations[planbase.AnnBindImmediate] = "true"
-	// }
+	if r.Plan.IsWarm() {
+		if r.Builder.SupportsVolumePopulators() {
+			// For storage offload, tie DataVolume to pre-imported PVC
+			annotations[planbase.AnnAllowClaimAdoption] = "true"
+			annotations[planbase.AnnPrePopulated] = "true"
+		} else {
+			// For warm migrations that use traditional  (ImageIO, VDDK) import sources (not populators),
+			// explicitly disable CDI's populator auto-detection to avoid webhook validation errors
+			annotations[planbase.AnnUsePopulator] = "false"
+		}
+	}
+
+	if r.Plan.IsWarm() || !r.Destination.Provider.IsHost() || r.Plan.IsSourceProviderOCP() {
+		// Set annotation for WFFC storage classes. Note that we create data volumes while
+		// running a cold migration to the local cluster only when the source is either OpenShift
+		// or vSphere, and in the latter case the conversion pod acts as the first-consumer
+		annotations[planbase.AnnBindImmediate] = "true"
+	}
+
+	if sa := resolveServiceAccount(r.Plan); sa != "" {
+		annotations[AnnCDIPodServiceAccount] = sa
+	}
+
 	// Do not delete the DV when the import completes as we check the DV to get the current
 	// disk transfer status.
 	annotations[AnnDeleteAfterCompletion] = "false"
 	dvTemplate := cdi.DataVolume{
 		ObjectMeta: meta.ObjectMeta{
-			Namespace:    r.Plan.Spec.TargetNamespace,
-			Annotations:  annotations,
-			GenerateName: r.getGeneratedName(vm),
+			Namespace:   r.Plan.Spec.TargetNamespace,
+			Annotations: annotations,
 		},
+	}
+	if !(r.Builder.SupportsVolumePopulators() && r.Plan.IsWarm()) {
+		// For storage offload warm migrations, the template should have already
+		// been applied to the PVC that will be adopted by this DataVolume, so
+		// only add generateName for other migration types.
+		dvTemplate.ObjectMeta.GenerateName = r.getGeneratedName(vm)
 	}
 	dvTemplate.Labels = r.vmLabels(vm.Ref)
 
@@ -1410,7 +2749,8 @@ func (r *KubeVirt) getGeneratedName(vm *plan.VMStatus) string {
 	return strings.Join(
 		[]string{
 			r.Plan.Name,
-			vm.ID},
+			vm.ID,
+		},
 		"-") + "-"
 }
 
@@ -1460,6 +2800,26 @@ func (r *KubeVirt) virtualMachine(vm *plan.VMStatus, sortVolumesByLibvirt bool) 
 	if object.Spec.Template.ObjectMeta.Labels == nil {
 		object.Spec.Template.ObjectMeta.Labels = map[string]string{}
 	}
+
+	// Set the custom labels for the VM if specified in the plan
+	if len(r.Plan.Spec.TargetLabels) > 0 {
+		maps.Copy(object.Spec.Template.ObjectMeta.Labels, r.Plan.Spec.TargetLabels)
+	}
+
+	// Set the target node name if specified in the plan
+	if len(r.Plan.Spec.TargetNodeSelector) > 0 {
+		// If the node selector is not set, set it to an empty map
+		if object.Spec.Template.Spec.NodeSelector == nil {
+			object.Spec.Template.Spec.NodeSelector = make(map[string]string)
+		}
+		maps.Copy(object.Spec.Template.Spec.NodeSelector, r.Plan.Spec.TargetNodeSelector)
+	}
+
+	// Set the target affinity if specified in the plan
+	if r.Plan.Spec.TargetAffinity != nil {
+		object.Spec.Template.Spec.Affinity = r.Plan.Spec.TargetAffinity
+	}
+
 	// Set the 'app' label for identification of the virtual machine instance(s)
 	object.Spec.Template.ObjectMeta.Labels["app"] = r.getNewVMName(vm)
 
@@ -1468,25 +2828,79 @@ func (r *KubeVirt) virtualMachine(vm *plan.VMStatus, sortVolumesByLibvirt bool) 
 		return
 	}
 
-	//Add the original name and ID info to the VM annotations
+	// Add the original name and ID info to the VM annotations
 	if len(vm.NewName) > 0 {
-		annotations := make(map[string]string)
-		annotations[AnnDisplayName] = vm.Name
-		annotations[AnnOriginalID] = vm.ID
-		object.ObjectMeta.Annotations = annotations
+		if object.ObjectMeta.Annotations == nil {
+			object.ObjectMeta.Annotations = make(map[string]string)
+		}
+		object.ObjectMeta.Annotations[AnnDisplayName] = vm.Name
+		object.ObjectMeta.Annotations[AnnOriginalID] = vm.ID
 	}
 
-	// Set the default run strategy to Halted
-	runStrategy := cnv.RunStrategyHalted
-
-	// If the source VM is powered on, set the destination VM to always run
-	if vm.RestorePowerState == plan.VMPowerStateOn {
-		runStrategy = cnv.RunStrategyAlways
+	sourceLabels, sourceAnnotations, sanitizationReport, tagErr := r.Builder.SourceVMLabelsAndAnnotations(vm.Ref, r.Plan.Spec.TagMapping)
+	if tagErr != nil {
+		r.Log.Error(tagErr, "Failed to get source VM labels/annotations", "vm", vm.String())
+	} else {
+		if object.ObjectMeta.Labels == nil {
+			object.ObjectMeta.Labels = make(map[string]string)
+		}
+		maps.Copy(object.ObjectMeta.Labels, sourceLabels)
+		if object.ObjectMeta.Annotations == nil {
+			object.ObjectMeta.Annotations = make(map[string]string)
+		}
+		maps.Copy(object.ObjectMeta.Annotations, sourceAnnotations)
+		if len(sanitizationReport) > 0 {
+			reportJSON, jsonErr := json.Marshal(sanitizationReport)
+			if jsonErr != nil {
+				r.Log.Error(jsonErr, "Failed to marshal sanitization report",
+					"vm", object.Name,
+					"namespace", object.Namespace,
+					"annotation", planbase.AnnSanitizedMetadata)
+			} else {
+				object.ObjectMeta.Annotations[planbase.AnnSanitizedMetadata] = string(reportJSON)
+			}
+		}
 	}
 
 	// Assign the determined run strategy to the object
+	runStrategy := r.determineRunStrategy(vm)
 	object.Spec.RunStrategy = &runStrategy
 	object.Spec.Running = nil // Ensure running is not set
+
+	// Add kubevirt template annotations if they are missing
+	kubevirtWorkloadAnn := []string{
+		"vm.kubevirt.io/flavor",
+		"vm.kubevirt.io/os",
+		"vm.kubevirt.io/workload",
+	}
+	if object.Spec.Template.ObjectMeta.Annotations == nil {
+		object.Spec.Template.ObjectMeta.Annotations = make(map[string]string)
+	}
+	for _, ann := range kubevirtWorkloadAnn {
+		if _, ok := object.Spec.Template.ObjectMeta.Annotations[ann]; !ok {
+			object.Spec.Template.ObjectMeta.Annotations[ann] = ""
+		}
+	}
+
+	var configmaps []core.ConfigMap
+	configmaps, err = r.Builder.ConfigMaps(vm.Ref)
+	if err != nil {
+		return
+	}
+	err = r.Ensurer.SharedConfigMaps(vm, configmaps)
+	if err != nil {
+		return
+	}
+
+	var secrets []core.Secret
+	secrets, err = r.Builder.Secrets(vm.Ref)
+	if err != nil {
+		return
+	}
+	err = r.Ensurer.SharedSecrets(vm, secrets)
+	if err != nil {
+		return
+	}
 
 	err = r.Builder.VirtualMachine(vm.Ref, &object.Spec, pvcs, vm.InstanceType != "", sortVolumesByLibvirt)
 	if err != nil {
@@ -1534,14 +2948,12 @@ func (r *KubeVirt) setInstanceType(vm *plan.VMStatus, object *cnv.VirtualMachine
 }
 
 func (r *KubeVirt) setVmLabels(object *cnv.VirtualMachine) (err error) {
-	labels := object.ObjectMeta.Labels
-	if labels == nil {
-		object.ObjectMeta.Labels = map[string]string{}
+	if object.ObjectMeta.Labels == nil {
+		object.ObjectMeta.Labels = make(map[string]string)
 	}
 	if r.Plan.Provider.Source.RequiresConversion() {
-		labels["guestConverted"] = strconv.FormatBool(!r.Plan.Spec.SkipGuestConversion)
+		object.ObjectMeta.Labels["guestConverted"] = strconv.FormatBool(!r.Plan.Spec.SkipGuestConversion)
 	}
-	object.ObjectMeta.Labels = labels
 	return
 }
 
@@ -1731,7 +3143,7 @@ func (r *KubeVirt) emptyVm(vm *plan.VMStatus) (virtualMachine *cnv.VirtualMachin
 	virtualMachine = &cnv.VirtualMachine{
 		TypeMeta: meta.TypeMeta{
 			APIVersion: "v1",
-			Kind:       "VirtualMachine",
+			Kind:       util.VirtualMachineKind,
 		},
 		ObjectMeta: meta.ObjectMeta{
 			Namespace: r.Plan.Spec.TargetNamespace,
@@ -1838,266 +3250,109 @@ func (r *KubeVirt) findTemplate(vm *plan.VMStatus) (tmpl *template.Template, err
 	return
 }
 
-func (r *KubeVirt) guestConversionPod(vm *plan.VMStatus, vmVolumes []cnv.Volume, libvirtConfigMap *core.ConfigMap, vddkConfigmap *core.ConfigMap, pvcs []*core.PersistentVolumeClaim) (pod *core.Pod, err error) {
-	volumes, volumeMounts, volumeDevices, err := r.podVolumeMounts(vmVolumes, libvirtConfigMap, vddkConfigmap, pvcs, vm)
-	if err != nil {
-		return
+// getConvertorAffinity returns the affinity configuration for virt-v2v convertor pods.
+// If ConvertorAffinity is specified in the plan, it uses that; otherwise, spread virt-v2v pods across nodes.
+func (r *KubeVirt) getConvertorAffinity() *core.Affinity {
+	// If custom convertor affinity is specified, use it
+	if r.Plan.Spec.ConvertorAffinity != nil {
+		return r.Plan.Spec.ConvertorAffinity.DeepCopy()
 	}
 
-	// pod environment
-	environment, err := r.Builder.PodEnvironment(vm.Ref, r.Source.Secret)
-	if err != nil {
-		return
-	}
-
-	// qemu group
-	fsGroup := qemuGroup
-	user := qemuUser
-	nonRoot := true
-	allowPrivilageEscalation := false
-	// // virt-v2v image
-	// coldLocal, vErr := r.Context.Plan.VSphereColdLocal()
-	// if vErr != nil {
-	// 	err = vErr
-	// 	return
-	// }
-	// if coldLocal {
-	// 	// mount the secret for the password and CA certificate
-	// 	volumes = append(volumes, core.Volume{
-	// 		Name: "secret-volume",
-	// 		VolumeSource: core.VolumeSource{
-	// 			Secret: &core.SecretVolumeSource{
-	// 				SecretName: v2vSecret.Name,
-	// 			},
-	// 		},
-	// 	})
-	// 	volumeMounts = append(volumeMounts, core.VolumeMount{
-	// 		Name:      "secret-volume",
-	// 		ReadOnly:  true,
-	// 		MountPath: "/etc/secret",
-	// 	})
-	// } else {
-	// 	environment = append(environment,
-	// 		core.EnvVar{
-	// 			Name:  "V2V_inPlace",
-	// 			Value: "1",
-	// 		})
-	// }
-	// virt-v2v image
-	// useV2vForTransfer, vErr := r.Context.Plan.ShouldUseV2vForTransfer()
-	// if vErr != nil {
-	// 	err = vErr
-	// 	return
-	// }
-	// if useV2vForTransfer && !r.IsCopyOffload(pvcs) {
-	// 	// mount the secret for the password and CA certificate
-	// 	// volumes = append(volumes, core.Volume{
-	// 	// 	Name: "secret-volume",
-	// 	// 	VolumeSource: core.VolumeSource{
-	// 	// 		Secret: &core.SecretVolumeSource{
-	// 	// 			SecretName: v2vSecret.Name,
-	// 	// 		},
-	// 	// 	},
-	// 	// })
-	// 	// volumeMounts = append(volumeMounts, core.VolumeMount{
-	// 	// 	Name:      "secret-volume",
-	// 	// 	ReadOnly:  true,
-	// 	// 	MountPath: "/etc/secret",
-	// 	// })
-	// } else {
-	environment = append(environment,
-		core.EnvVar{
-			Name:  "V2V_inPlace",
-			Value: "1",
-		})
-	//}
-	// VDDK image
-	var initContainers []core.Container
-
-	vddkImage := settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
-	if vddkImage != "" {
-		initContainers = append(initContainers, core.Container{
-			Name:            "vddk-side-car",
-			Image:           vddkImage,
-			ImagePullPolicy: core.PullIfNotPresent,
-			VolumeMounts: []core.VolumeMount{
+	// Default pod anti-affinity behavior to spread virt-v2v pods across nodes
+	return &core.Affinity{
+		PodAntiAffinity: &core.PodAntiAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []core.WeightedPodAffinityTerm{
 				{
-					Name:      VddkVolumeName,
-					MountPath: "/opt",
-				},
-			},
-			Resources: core.ResourceRequirements{
-				Requests: core.ResourceList{
-					core.ResourceCPU:    resource.MustParse("100m"),
-					core.ResourceMemory: resource.MustParse("150Mi"),
-				},
-				Limits: core.ResourceList{
-					core.ResourceCPU:    resource.MustParse("1000m"),
-					core.ResourceMemory: resource.MustParse("500Mi"),
-				},
-			},
-			SecurityContext: &core.SecurityContext{
-				AllowPrivilegeEscalation: &allowPrivilageEscalation,
-				Capabilities: &core.Capabilities{
-					Drop: []core.Capability{"ALL"},
-				},
-			},
-		})
-	}
-	if vm.RootDisk != "" {
-		environment = append(environment,
-			core.EnvVar{
-				Name:  "V2V_RootDisk",
-				Value: vm.RootDisk,
-			})
-	}
-
-	if vm.NewName != "" {
-		environment = append(environment,
-			core.EnvVar{
-				Name:  "V2V_NewName",
-				Value: vm.NewName,
-			})
-	}
-
-	environment = append(environment,
-		core.EnvVar{
-			Name:  "LOCAL_MIGRATION",
-			Value: strconv.FormatBool(r.Destination.Provider.IsHost()),
-		},
-	)
-	// Set LIBGUESTFS_BACKEND to direct to avoid needing user namespaces
-	// This is required for libguestfs to work in restricted security contexts
-	environment = append(environment,
-		core.EnvVar{
-			Name:  "LIBGUESTFS_BACKEND",
-			Value: "direct",
-		},
-	)
-	// pod annotations
-	annotations := map[string]string{}
-	if r.Plan.Spec.TransferNetwork != nil {
-		err = r.setTransferNetwork(annotations)
-		if err != nil {
-			return
-		}
-	}
-	// Disable AppArmor for virt-v2v container to allow mount operations
-	// This is required for libguestfs to remount the root filesystem
-	if !settings.Settings.OpenShift {
-		annotations["container.apparmor.security.beta.kubernetes.io/virt-v2v"] = "unconfined"
-	}
-	var seccompProfile core.SeccompProfile
-	if settings.Settings.OpenShift {
-		unshare := "profiles/unshare.json"
-		seccompProfile = core.SeccompProfile{
-			Type:             core.SeccompProfileTypeLocalhost,
-			LocalhostProfile: &unshare,
-		}
-	} else {
-		seccompProfile = core.SeccompProfile{
-			Type: core.SeccompProfileTypeUnconfined,
-		}
-	}
-	// pod
-	pod = &core.Pod{
-		ObjectMeta: meta.ObjectMeta{
-			Namespace:    r.Plan.Spec.TargetNamespace,
-			Annotations:  annotations,
-			Labels:       r.conversionLabels(vm.Ref, false),
-			GenerateName: r.getGeneratedName(vm),
-		},
-		Spec: core.PodSpec{
-			SecurityContext: &core.PodSecurityContext{
-				FSGroup:        &fsGroup,
-				RunAsUser:      &user,
-				RunAsNonRoot:   &nonRoot,
-				SeccompProfile: &seccompProfile,
-			},
-			Affinity: &core.Affinity{
-				PodAntiAffinity: &core.PodAntiAffinity{
-					PreferredDuringSchedulingIgnoredDuringExecution: []core.WeightedPodAffinityTerm{
-						{
-							Weight: 100,
-							PodAffinityTerm: core.PodAffinityTerm{
-								NamespaceSelector: &meta.LabelSelector{},
-								TopologyKey:       "kubernetes.io/hostname",
-								LabelSelector: &meta.LabelSelector{
-									MatchExpressions: []meta.LabelSelectorRequirement{
-										{
-											Key: kApp,
-											Values: []string{
-												"virt-v2v",
-											},
-											Operator: meta.LabelSelectorOpIn,
-										},
+					Weight: 100,
+					PodAffinityTerm: core.PodAffinityTerm{
+						NamespaceSelector: &meta.LabelSelector{},
+						TopologyKey:       "kubernetes.io/hostname",
+						LabelSelector: &meta.LabelSelector{
+							MatchExpressions: []meta.LabelSelectorRequirement{
+								{
+									Key: kApp,
+									Values: []string{
+										"virt-v2v",
 									},
+									Operator: meta.LabelSelectorOpIn,
 								},
 							},
 						},
 					},
 				},
 			},
-			RestartPolicy:  core.RestartPolicyNever,
-			InitContainers: initContainers,
-			Containers: []core.Container{
-				{
-					Name:            "virt-v2v",
-					Env:             environment,
-					ImagePullPolicy: core.PullAlways,
-					Resources: core.ResourceRequirements{
-						Requests: core.ResourceList{
-							core.ResourceCPU:    resource.MustParse(Settings.Migration.VirtV2vContainerRequestsCpu),
-							core.ResourceMemory: resource.MustParse(Settings.Migration.VirtV2vContainerRequestsMemory),
-						},
-						Limits: core.ResourceList{
-							core.ResourceCPU:    resource.MustParse(Settings.Migration.VirtV2vContainerLimitsCpu),
-							core.ResourceMemory: resource.MustParse(Settings.Migration.VirtV2vContainerLimitsMemory),
-						},
-					},
-					// EnvFrom: []core.EnvFromSource{
-					// 	{
-					// 		Prefix: "V2V_",
-					// 		SecretRef: &core.SecretEnvSource{
-					// 			LocalObjectReference: core.LocalObjectReference{
-					// 				Name: v2vSecret.Name,
-					// 			},
-					// 		},
-					// 	},
-					// },
-					Image:         Settings.Migration.VirtV2vImage,
-					VolumeMounts:  volumeMounts,
-					VolumeDevices: volumeDevices,
-					Ports: []core.ContainerPort{
-						{
-							Name:          "metrics",
-							ContainerPort: 2112,
-							Protocol:      core.ProtocolTCP,
-						},
-					},
-					SecurityContext: &core.SecurityContext{
-						AllowPrivilegeEscalation: &allowPrivilageEscalation,
-						Capabilities: &core.Capabilities{
-							Drop: []core.Capability{"ALL"},
-							// Add SYS_ADMIN capability required for libguestfs to create user namespaces
-							// This is needed even with LIBGUESTFS_BACKEND=direct for some operations
-							Add: []core.Capability{"SYS_ADMIN"},
-						},
-					},
-				},
-			},
-			Volumes: volumes,
 		},
 	}
-	// Request access to /dev/kvm via Kubevirt's Device Manager
-	// That is to ensure the appliance virt-v2v uses would not
-	// run in emulation mode, which is significantly slower
-	r.setKvmOnPodSpec(&pod.Spec)
-
-	return
 }
 
-func (r *KubeVirt) podVolumeMounts(vmVolumes []cnv.Volume, libvirtConfigMap *core.ConfigMap, vddkConfigmap *core.ConfigMap, pvcs []*core.PersistentVolumeClaim, vm *plan.VMStatus) (volumes []core.Volume, mounts []core.VolumeMount, devices []core.VolumeDevice, err error) {
+// netAppShiftDiskPermsInitContainer delegates to the shared builder function.
+func netAppShiftDiskPermsInitContainer(mounts []core.VolumeMount, image string) core.Container {
+	return convbuilder.NetAppShiftDiskPermsInitContainer(mounts, image)
+}
+
+// Build the inspection pod environment
+func (r *KubeVirt) buildInspectionPodEnvironment(env []core.EnvVar, vm *plan.VMStatus, step *plan.Step) (newEnv []core.EnvVar, success bool, err error) {
+	newEnv = append(env,
+		core.EnvVar{
+			Name:  "V2V_remoteInspection",
+			Value: "true",
+		})
+
+	// Get VM model and data from inventory
+	virtualMachine := &model.VM{}
+	err = r.Context.Source.Inventory.Find(virtualMachine, vm.Ref)
+	if err != nil {
+		err = liberr.Wrap(err, "vm", vm.Ref.String())
+		return
+	}
+
+	var retries int
+	var limitExceeded bool
+	if step.Annotations == nil {
+		step.Annotations = make(map[string]string)
+	}
+	retriesAnnotation := step.Annotations[ParentBackingRetriesAnnotation]
+	if retriesAnnotation == "" {
+		step.Annotations[ParentBackingRetriesAnnotation] = "1"
+	} else {
+		retries, err = strconv.Atoi(retriesAnnotation)
+		if err != nil {
+			return
+		}
+		limitExceeded = retries > settings.Settings.MaxParentBackingRetries
+	}
+
+	// Add disks to be inspected
+	for i, disk := range virtualMachine.SortedDisksAsLibvirt() {
+		// If parent disk is empty then fail with error message
+		if disk.ParentFile != "" {
+			newEnv = append(newEnv, core.EnvVar{
+				Name:  fmt.Sprintf("V2V_remoteInspectDisk_%d", i),
+				Value: disk.ParentFile,
+			})
+		} else if limitExceeded {
+			// If retry limit was exceeded then collect all the failing disks and put them as a step errors
+			errMsg := fmt.Sprintf("Parent disk of %s was not found. This is possibly an environment issue. Please investigate if a precopy snapshot has a parent backing.", disk.File)
+			step.AddError(errMsg)
+			err = liberr.New(errMsg)
+			r.Log.Error(err, "Failed to get parent backing of VM disk.", "vm", vm.Ref.String())
+		} else {
+			// Retry on the next run and log the missing parent disk
+			retries += 1
+			step.Annotations[ParentBackingRetriesAnnotation] = strconv.Itoa(retries)
+			errMsg := fmt.Sprintf("Parent disk of %s was not found, will retry on next attempt", disk.File)
+			r.Log.Info(errMsg,
+				"vm", vm.Ref.String())
+			return
+		}
+	}
+	if limitExceeded {
+		return
+	}
+	return newEnv, true, nil
+}
+
+func (r *KubeVirt) podVolumeMounts(vmVolumes []cnv.Volume, vddkConfigmap *core.ConfigMap, pvcs []*core.PersistentVolumeClaim, vm *plan.VMStatus) (volumes []core.Volume, mounts []core.VolumeMount, devices []core.VolumeDevice, extraVolumes []core.Volume, extraMounts []core.VolumeMount, err error) {
 	pvcsByName := make(map[string]*core.PersistentVolumeClaim)
 	for _, pvc := range pvcs {
 		pvcsByName[pvc.Name] = pvc
@@ -2137,19 +3392,6 @@ func (r *KubeVirt) podVolumeMounts(vmVolumes []cnv.Volume, libvirtConfigMap *cor
 		}
 	}
 
-	// add volume and mount for the libvirt domain xml config map.
-	// the virt-v2v pod expects to see the libvirt xml at /mnt/v2v/input.xml
-	volumes = append(volumes, core.Volume{
-		Name: "libvirt-domain-xml",
-		VolumeSource: core.VolumeSource{
-			ConfigMap: &core.ConfigMapVolumeSource{
-				LocalObjectReference: core.LocalObjectReference{
-					Name: libvirtConfigMap.Name,
-				},
-			},
-		},
-	})
-
 	extraConfigMapExists := len(Settings.Migration.VirtV2vExtraConfConfigMap) > 0
 	if extraConfigMapExists {
 		volumes = append(volumes, core.Volume{
@@ -2177,50 +3419,59 @@ func (r *KubeVirt) podVolumeMounts(vmVolumes []cnv.Volume, libvirtConfigMap *cor
 	}
 
 	switch r.Source.Provider.Type() {
-	case api.Ova:
-		var pvName string
-		pvName, err = r.CreatePvForNfs()
-		if err != nil {
-			return
+	case api.Ova, api.HyperV:
+		var pvc *core.PersistentVolumeClaim
+		var volumeName, mountPath string
+
+		if r.Source.Provider.Type() == api.Ova {
+			// OVA: Static NFS PV/PVC
+			pv := r.BuildPVForNFS(vm)
+			pv, err = r.EnsurePVForNFS(pv)
+			if err != nil {
+				return
+			}
+			pvc = r.BuildPVCForNFS(pv, vm)
+			volumeName = "store-pv"
+			mountPath = "/ova"
+		} else {
+			// HyperV: Static SMB CSI PV/PVC
+			pv := r.BuildPVForSMB(vm)
+			pv, err = r.EnsurePVForSMB(pv)
+			if err != nil {
+				return
+			}
+			pvc = r.BuildPVCForSMB(pv, vm)
+			volumeName = "hyperv-storage"
+			mountPath = "/hyperv"
 		}
-		pvcNamePrefix := getEntityPrefixName("pvc", r.Source.Provider.Name, r.Plan.Name)
-		var pvcName string
-		pvcName, err = r.CreatePvcForNfs(pvcNamePrefix, pvName, vm.ID)
+
+		// Ensure PVC exists (common logic)
+		pvc, err = r.EnsureProviderStoragePVC(pvc, r.Source.Provider.Type())
 		if err != nil {
 			return
 		}
 
-		//path from disk
-		volumes = append(volumes, core.Volume{
-			Name: "store-pv",
+		// Mount provider storage (common pattern)
+		providerVol := core.Volume{
+			Name: volumeName,
 			VolumeSource: core.VolumeSource{
 				PersistentVolumeClaim: &core.PersistentVolumeClaimVolumeSource{
-					ClaimName: pvcName,
+					ClaimName: pvc.Name,
 				},
 			},
-		})
-		mounts = append(mounts,
-			core.VolumeMount{
-				Name:      "libvirt-domain-xml",
-				MountPath: "/mnt/v2v",
-			},
-			core.VolumeMount{
-				Name:      VddkVolumeName,
-				MountPath: "/opt",
-			},
-			core.VolumeMount{
-				Name:      "store-pv",
-				MountPath: "/ova",
-			},
-		)
+		}
+		providerMount := core.VolumeMount{
+			Name:      volumeName,
+			MountPath: mountPath,
+		}
+		volumes = append(volumes, providerVol)
+		mounts = append(mounts, providerMount)
+		extraVolumes = append(extraVolumes, providerVol)
+		extraMounts = append(extraMounts, providerMount)
 	case api.VSphere:
 		mounts = append(mounts,
 			core.VolumeMount{
-				Name:      "libvirt-domain-xml",
-				MountPath: "/mnt/v2v",
-			},
-			core.VolumeMount{
-				Name:      "vddk-vol-mount",
+				Name:      VddkVolumeName,
 				MountPath: "/opt",
 			},
 		)
@@ -2242,26 +3493,50 @@ func (r *KubeVirt) podVolumeMounts(vmVolumes []cnv.Volume, libvirtConfigMap *cor
 		}
 	}
 
-	_, exists, err := r.findConfigMapInNamespace(Settings.VirtCustomizeConfigMap, r.Plan.Spec.TargetNamespace)
-	if err != nil {
-		err = liberr.Wrap(err)
-		return
-	}
-	if exists {
-		volumes = append(volumes, core.Volume{
+	// Use plan-level ConfigMap if specified
+	if r.Plan.Spec.CustomizationScripts != nil {
+		configMapName := r.Plan.Spec.CustomizationScripts.Name
+		configMapNamespace := r.Plan.Spec.CustomizationScripts.Namespace
+		if configMapNamespace == "" {
+			configMapNamespace = r.Plan.Namespace
+		}
+
+		// When the CM was copied to TargetNamespace, use the generated name
+		volumeConfigMapName := configMapName
+		if configMapNamespace != r.Plan.Spec.TargetNamespace {
+			volumeConfigMapName = genCustomizationScriptsConfigMapName(r.Plan)
+		}
+
+		var exists bool
+		_, exists, err = r.findConfigMapInNamespace(volumeConfigMapName, r.Plan.Spec.TargetNamespace)
+		if err != nil {
+			err = liberr.Wrap(err)
+			return
+		}
+		if !exists {
+			err = liberr.New(
+				fmt.Sprintf("CustomizationScripts ConfigMap %s not found in namespace %s",
+					volumeConfigMapName, r.Plan.Spec.TargetNamespace))
+			return
+		}
+		scriptsVol := core.Volume{
 			Name: DynamicScriptsVolumeName,
 			VolumeSource: core.VolumeSource{
 				ConfigMap: &core.ConfigMapVolumeSource{
 					LocalObjectReference: core.LocalObjectReference{
-						Name: Settings.VirtCustomizeConfigMap,
+						Name: volumeConfigMapName,
 					},
 				},
 			},
-		})
-		mounts = append(mounts, core.VolumeMount{
+		}
+		scriptsMount := core.VolumeMount{
 			Name:      DynamicScriptsVolumeName,
 			MountPath: DynamicScriptsMountPath,
-		})
+		}
+		volumes = append(volumes, scriptsVol)
+		mounts = append(mounts, scriptsMount)
+		extraVolumes = append(extraVolumes, scriptsVol)
+		extraMounts = append(extraMounts, scriptsMount)
 	}
 
 	// Temporary space for VDDK library
@@ -2297,89 +3572,24 @@ func (r *KubeVirt) podVolumeMounts(vmVolumes []cnv.Volume, libvirtConfigMap *cor
 	return
 }
 
-func (r *KubeVirt) libvirtDomain(vmCr *VirtualMachine, pvcs []*core.PersistentVolumeClaim) (domain *libvirtxml.Domain) {
-	pvcsByName := make(map[string]*core.PersistentVolumeClaim)
-	for _, pvc := range pvcs {
-		pvcsByName[pvc.Name] = pvc
+// DiskRefsFromPodVolumeMounts calls podVolumeMounts and converts the
+// PVC-backed volumes into DiskRef entries for a Conversion CR.
+func (r *KubeVirt) DiskRefsFromPodVolumeMounts(vmVolumes []cnv.Volume, pvcs []*core.PersistentVolumeClaim, vm *plan.VMStatus, podType int) (refs []api.DiskRef, err error) {
+	volumes, mounts, devices, extraVols, _, err := r.podVolumeMounts(vmVolumes, nil, pvcs, vm)
+	if err != nil {
+		return
 	}
-
-	// FIXME: this should really be as complete an XML domain definition as possible
-	// to give virt-v2v the best chance of converting the disk correctly. Things
-	// like block device name translation and network translation may not work properly
-	// without the full metadata, so we may see weird things happening in some
-	// conversions. For now, this xml definition is just a minimal domain XML file
-	// with the locations of each disk on the VM that is to be converted, but it
-	// should be fixed properly in the future.
-	libvirtDisks := make([]libvirtxml.DomainDisk, 0)
-	for i, vol := range vmCr.Spec.Template.Spec.Volumes {
-		diskSource := libvirtxml.DomainDiskSource{}
-
-		pvc := pvcsByName[vol.PersistentVolumeClaim.ClaimName]
-		if pvc == nil {
-			r.Log.V(1).Info(
-				"Failed to find the PVC to the Volume for the libvirt domain",
-				"volume",
-				vol.Name,
-				"pvc",
-				vol.PersistentVolumeClaim.ClaimName)
-			continue
-		}
-		if pvc.Spec.VolumeMode != nil && *pvc.Spec.VolumeMode == core.PersistentVolumeBlock {
-			diskSource.Block = &libvirtxml.DomainDiskSourceBlock{
-				Dev: fmt.Sprintf("/dev/block%v", i),
-			}
-		} else {
-			diskSource.File = &libvirtxml.DomainDiskSourceFile{
-				// the location where the disk images will be found on
-				// the virt-v2v pod. See also podVolumeMounts.
-				File: fmt.Sprintf("/mnt/disks/disk%v/disk.img", i),
-			}
-		}
-
-		libvirtDisk := libvirtxml.DomainDisk{
-			Device: "disk",
-			Driver: &libvirtxml.DomainDiskDriver{
-				Name: "qemu",
-				Type: "raw",
-			},
-			Source: &diskSource,
-			Target: &libvirtxml.DomainDiskTarget{
-				Dev: "sd" + string(rune('a'+i)),
-				Bus: "scsi",
-			},
-		}
-		libvirtDisks = append(libvirtDisks, libvirtDisk)
+	extraNames := make(map[string]bool, len(extraVols))
+	for _, v := range extraVols {
+		extraNames[v.Name] = true
 	}
-
-	kDomain := vmCr.Spec.Template.Spec.Domain
-	domain = &libvirtxml.Domain{
-		Type: "kvm",
-		Name: vmCr.Name,
-		Memory: &libvirtxml.DomainMemory{
-			Value: uint(kDomain.Resources.Requests.Memory().Value()),
-		},
-		CPU: &libvirtxml.DomainCPU{
-			Topology: &libvirtxml.DomainCPUTopology{
-				Sockets: int(kDomain.CPU.Sockets),
-				Cores:   int(kDomain.CPU.Cores),
-			},
-		},
-		OS: &libvirtxml.DomainOS{
-			Type: &libvirtxml.DomainOSType{
-				Type: "hvm",
-			},
-			BootDevices: []libvirtxml.DomainBootDevice{
-				{
-					Dev: "sd",
-				},
-			},
-		},
-		Devices: &libvirtxml.DomainDeviceList{
-			Disks: libvirtDisks,
-		},
+	var diskVolumes []core.Volume
+	for _, v := range volumes {
+		if !extraNames[v.Name] {
+			diskVolumes = append(diskVolumes, v)
+		}
 	}
-
-	return
+	return convbuilder.DiskRefsFromVolumes(diskVolumes, mounts, devices, pvcs), nil
 }
 
 func (r *KubeVirt) findConfigMapInNamespace(name string, namespace string) (configMap *core.ConfigMap, exists bool, err error) {
@@ -2404,6 +3614,7 @@ func (r *KubeVirt) ensureConfigMap(vmRef ref.Ref) (configMap *core.ConfigMap, er
 	if err != nil {
 		return
 	}
+
 	list := &core.ConfigMapList{}
 	err = r.Destination.Client.List(
 		context.TODO(),
@@ -2442,39 +3653,6 @@ func (r *KubeVirt) ensureConfigMap(vmRef ref.Ref) (configMap *core.ConfigMap, er
 	return
 }
 
-// Ensure the Libvirt domain config map exists on the destination.
-func (r *KubeVirt) ensureLibvirtConfigMap(vmRef ref.Ref, vmCr *VirtualMachine, pvcs []*core.PersistentVolumeClaim) (configMap *core.ConfigMap, err error) {
-	configMap, err = r.ensureConfigMap(vmRef)
-	if err != nil {
-		return
-	}
-	domain := r.libvirtDomain(vmCr, pvcs)
-	domainXML, err := xml.Marshal(domain)
-	if err != nil {
-		err = liberr.Wrap(err)
-		return
-	}
-	if configMap.BinaryData == nil {
-		configMap.BinaryData = make(map[string][]byte)
-	}
-	configMap.BinaryData["input.xml"] = domainXML
-	err = r.Destination.Client.Update(context.TODO(), configMap)
-	if err != nil {
-		err = liberr.Wrap(err)
-		return
-	}
-	r.Log.V(1).Info(
-		"ConfigMap updated.",
-		"configMap",
-		path.Join(
-			configMap.Namespace,
-			configMap.Name),
-		"vm",
-		vmRef.String())
-
-	return
-}
-
 // Build the config map.
 func (r *KubeVirt) configMap(vmRef ref.Ref) (object *core.ConfigMap, err error) {
 	object = &core.ConfigMap{
@@ -2484,7 +3662,8 @@ func (r *KubeVirt) configMap(vmRef ref.Ref) (object *core.ConfigMap, err error) 
 			GenerateName: strings.Join(
 				[]string{
 					r.Plan.Name,
-					vmRef.ID},
+					vmRef.ID,
+				},
 				"-") + "-",
 		},
 		BinaryData: make(map[string][]byte),
@@ -2544,6 +3723,8 @@ func (r *KubeVirt) ensureSecret(vmRef ref.Ref, setSecretData func(*core.Secret) 
 	}
 	if len(list.Items) > 0 {
 		secret = &list.Items[0]
+		// Copy Data because Builder.Secret() puts credentials (accessKeyId, secretKey) there, not in StringData.
+		secret.Data = newSecret.Data
 		secret.StringData = newSecret.StringData
 		err = r.Destination.Client.Update(context.TODO(), secret)
 		if err != nil {
@@ -2587,7 +3768,8 @@ func (r *KubeVirt) secret(vmRef ref.Ref, setSecretData func(*core.Secret) error,
 			GenerateName: strings.Join(
 				[]string{
 					r.Plan.Name,
-					vmRef.ID},
+					vmRef.ID,
+				},
 				"-") + "-",
 		},
 	}
@@ -2598,8 +3780,10 @@ func (r *KubeVirt) secret(vmRef ref.Ref, setSecretData func(*core.Secret) error,
 // Labels for plan and migration.
 func (r *KubeVirt) planLabels() map[string]string {
 	return map[string]string{
-		kMigration: string(r.Migration.UID),
-		kPlan:      string(r.Plan.GetUID()),
+		kMigration:     string(r.Migration.UID),
+		kPlan:          string(r.Plan.GetUID()),
+		kPlanName:      r.Plan.Name,
+		kPlanNamespace: r.Plan.Namespace,
 	}
 }
 
@@ -2625,10 +3809,25 @@ func (r *KubeVirt) conversionLabels(vmRef ref.Ref, filterOutMigrationLabel bool)
 	return
 }
 
+// Labels for an inspection pod.
+func (r *KubeVirt) inspectionLabels(vmRef ref.Ref) (labels map[string]string) {
+	labels = r.vmLabels(vmRef)
+	labels[kApp] = "virt-v2v-inspection"
+	return
+}
+
+func (r *KubeVirt) waitForRebootLabels(vmRef ref.Ref) map[string]string {
+	labels := r.vmLabels(vmRef)
+	labels[kApp] = "forklift-wait-for-reboot"
+	labels[kResource] = ResourceWaitForReboot
+	return labels
+}
+
 // Labels for a VM on a plan.
 func (r *KubeVirt) vmLabels(vmRef ref.Ref) (labels map[string]string) {
 	labels = r.planLabels()
 	labels[kVM] = vmRef.ID
+	labels[kResource] = ResourceVMConfig
 	return
 }
 
@@ -2637,6 +3836,7 @@ func (r *KubeVirt) vmLabels(vmRef ref.Ref) (labels map[string]string) {
 func (r *KubeVirt) vddkLabels() (labels map[string]string) {
 	labels = r.planLabels()
 	labels[kUse] = VddkConf
+	labels[kResource] = ResourceVDDKConfig
 	return
 }
 
@@ -2647,11 +3847,61 @@ func (r *KubeVirt) vmAllButMigrationLabels(vmRef ref.Ref) (labels map[string]str
 	return
 }
 
-// setTransferNetwork sets the transfer network annotation on the DataVolume so
-// that it can be used by the importer pod. If the `forklift.konveyor.io/route` annotation
-// is present on the referenced NAD, then it will be used with the `k8s.v1.cni.cncf.io/networks` annotation
-// to set the default route. If not, this will fall back to setting the `v1.multus-cni.io/default-network` annotation
-// with the namespaced name of the NAD.
+// guessTransferNetworkDefaultRoute determines the default gateway IP address for the transfer network
+// by checking the NetworkAttachmentDefinition in the following priority order:
+//
+//  1. Checks the AnnForkliftNetworkRoute annotation on the NAD
+//  2. Parses the NAD's spec.config JSON and looks for the default route (0.0.0.0/0 or ::/0)
+//     in the ipam.routes array, extracting the gateway IP from the matching route entry
+//
+// Returns:
+//   - route: The gateway IP address as a string (e.g., "192.168.1.1")
+//   - found: true if a route was found, false otherwise
+func (r *KubeVirt) guessTransferNetworkDefaultRoute(netAttachDef *k8snet.NetworkAttachmentDefinition) (route string, found bool) {
+	// First, try to get the default route from the annotation.
+	route, found = netAttachDef.Annotations[AnnForkliftNetworkRoute]
+	if found {
+		return route, true
+	}
+
+	// If the route annotation is not set, try to get the default route from the gw config value.
+	// Parse the Config string which is a JSON string containing network configuration.
+	if netAttachDef.Spec.Config != "" {
+		var config CNINetworkConfig
+		err := json.Unmarshal([]byte(netAttachDef.Spec.Config), &config)
+		if err != nil {
+			// If we can't parse the config, just return not found
+			return "", false
+		}
+
+		// Look for the default route (0.0.0.0/0 or ::/0) in the routes
+		for _, r := range config.IPAM.Routes {
+			if r.Dst == "0.0.0.0/0" || r.Dst == "::/0" {
+				return r.GW, true
+			}
+		}
+	}
+
+	return "", false
+}
+
+// setTransferNetwork configures the transfer network for the DataVolume's importer pod
+// by setting appropriate annotations based on whether a default gateway route can be determined.
+//
+// Behavior:
+//   - If a default gateway is found (via annotation or NAD config): Sets the
+//     k8s.v1.cni.cncf.io/networks annotation with the gateway IP in default-route
+//   - If route annotation is explicitly set to "none" (AnnForkliftRouteValueNone):
+//     Sets k8s.v1.cni.cncf.io/networks annotation without default-route field.
+//     Useful for example when only ESXi hosts are accessible via transfer network
+//     but vCenter is not.
+//   - If no route annotation exists and no gateway found in NAD config:
+//     Falls back to setting the legacy
+//     v1.multus-cni.io/default-network annotation with the NAD's namespaced name
+//
+// The default gateway is discovered by checking the NAD annotation and IPAM config
+// (see guessTransferNetworkDefaultRoute for details).
+//
 // FIXME: the codepath using the multus annotation should be phased out.
 func (r *KubeVirt) setTransferNetwork(annotations map[string]string) (err error) {
 	key := client.ObjectKey{
@@ -2665,21 +3915,25 @@ func (r *KubeVirt) setTransferNetwork(annotations map[string]string) (err error)
 		return
 	}
 
-	route, found := netAttachDef.Annotations[AnnForkliftNetworkRoute]
+	route, found := r.guessTransferNetworkDefaultRoute(netAttachDef)
 	if found {
 		nse := k8snet.NetworkSelectionElement{
 			Namespace: key.Namespace,
 			Name:      key.Name,
 		}
-		ip := net.ParseIP(route)
-		if ip != nil {
-			nse.GatewayRequest = []net.IP{ip}
-		} else {
-			err = liberr.New(
-				"Transfer network default route annotation is not a valid IP address.",
-				"route", route)
-			return
+
+		if route != AnnForkliftRouteValueNone {
+			ip := net.ParseIP(route)
+			if ip != nil {
+				nse.GatewayRequest = []net.IP{ip}
+			} else {
+				err = liberr.New(
+					"Transfer network default route is not a valid IP address.",
+					"route", route)
+				return
+			}
 		}
+
 		transferNetwork, jErr := json.Marshal([]k8snet.NetworkSelectionElement{nse})
 		if jErr != nil {
 			err = liberr.Wrap(jErr)
@@ -2771,7 +4025,7 @@ func vmOwnerReference(vm *cnv.VirtualMachine) (ref meta.OwnerReference) {
 	isController := false
 	ref = meta.OwnerReference{
 		APIVersion:         "kubevirt.io/v1",
-		Kind:               "VirtualMachine",
+		Kind:               util.VirtualMachineKind,
 		Name:               vm.Name,
 		UID:                vm.UID,
 		BlockOwnerDeletion: &blockOwnerDeletion,
@@ -2786,6 +4040,7 @@ func (r *KubeVirt) setPopulatorPodLabels(pod core.Pod, migrationId string) (err 
 		pod.Labels = make(map[string]string)
 	}
 	pod.Labels[kMigration] = migrationId
+	pod.Labels[kPlan] = string(r.Plan.GetUID())
 	patch := client.MergeFrom(podCopy)
 	err = r.Destination.Client.Patch(context.TODO(), &pod, patch)
 	return
@@ -2834,18 +4089,14 @@ func (r *KubeVirt) EnsurePersistentVolume(vmRef ref.Ref, persistentVolumes []cor
 	return
 }
 
-func GetOvaPvListNfs(dClient client.Client, planID string) (pvs *core.PersistentVolumeList, found bool, err error) {
+// getPvListByLabels is a generic helper function to get PVs by labels.
+func getPvListByLabels(dClient client.Client, labels map[string]string) (pvs *core.PersistentVolumeList, found bool, err error) {
 	pvs = &core.PersistentVolumeList{}
-	pvLabels := map[string]string{
-		"plan": planID,
-		"ova":  OvaPVLabel,
-	}
-
 	err = dClient.List(
 		context.TODO(),
 		pvs,
 		&client.ListOptions{
-			LabelSelector: k8slabels.SelectorFromSet(pvLabels),
+			LabelSelector: k8slabels.SelectorFromSet(labels),
 		},
 	)
 	if err != nil {
@@ -2858,19 +4109,15 @@ func GetOvaPvListNfs(dClient client.Client, planID string) (pvs *core.Persistent
 	return
 }
 
-func GetOvaPvcListNfs(dClient client.Client, planID string, planNamespace string) (pvcs *core.PersistentVolumeClaimList, found bool, err error) {
+// getPvcListByLabels is a generic helper function to get PVCs by labels in a namespace.
+func getPvcListByLabels(dClient client.Client, labels map[string]string, namespace string) (pvcs *core.PersistentVolumeClaimList, found bool, err error) {
 	pvcs = &core.PersistentVolumeClaimList{}
-	pvcLabels := map[string]string{
-		"plan": planID,
-		"ova":  OvaPVCLabel,
-	}
-
 	err = dClient.List(
 		context.TODO(),
 		pvcs,
 		&client.ListOptions{
-			LabelSelector: k8slabels.SelectorFromSet(pvcLabels),
-			Namespace:     planNamespace,
+			LabelSelector: k8slabels.SelectorFromSet(labels),
+			Namespace:     namespace,
 		},
 	)
 	if err != nil {
@@ -2883,22 +4130,82 @@ func GetOvaPvcListNfs(dClient client.Client, planID string, planNamespace string
 	return
 }
 
-func (r *KubeVirt) CreatePvForNfs() (pvName string, err error) {
+func GetOvaPvListNfs(dClient client.Client, planID string) (pvs *core.PersistentVolumeList, found bool, err error) {
+	labels := map[string]string{
+		"plan": planID,
+		"ova":  OvaPVLabel,
+	}
+	return getPvListByLabels(dClient, labels)
+}
+
+func GetOvaPvcListNfs(dClient client.Client, planID string, planNamespace string) (pvcs *core.PersistentVolumeClaimList, found bool, err error) {
+	labels := map[string]string{
+		"plan": planID,
+		"ova":  OvaPVCLabel,
+	}
+	return getPvcListByLabels(dClient, labels, planNamespace)
+}
+
+// GetHyperVPvcListSmb returns HyperV SMB PVCs for a plan.
+func GetHyperVPvcListSmb(dClient client.Client, planID string, planNamespace string) (pvcs *core.PersistentVolumeClaimList, found bool, err error) {
+	labels := map[string]string{
+		"plan":   planID,
+		"hyperv": HyperVPVCLabel,
+	}
+	return getPvcListByLabels(dClient, labels, planNamespace)
+}
+
+// GetHyperVPvListSmb returns HyperV SMB PVs for a plan.
+func GetHyperVPvListSmb(dClient client.Client, planID string) (pvs *core.PersistentVolumeList, found bool, err error) {
+	labels := map[string]string{
+		"plan":   planID,
+		"hyperv": HyperVPVLabel,
+	}
+	return getPvListByLabels(dClient, labels)
+}
+
+func (r *KubeVirt) EnsurePVForNFS(pv *core.PersistentVolume) (out *core.PersistentVolume, err error) {
+	list := &core.PersistentVolumeList{}
+	err = r.Destination.Client.List(
+		context.TODO(),
+		list,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(pv.Labels),
+		},
+	)
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+	if len(list.Items) > 0 {
+		out = &list.Items[0]
+	} else {
+		err = r.Destination.Client.Create(context.TODO(), pv)
+		if err != nil {
+			err = liberr.Wrap(err)
+			return
+		}
+		r.Log.Info("Created NFS PV for virt-v2v pod.", "pv", pv.Name)
+		out = pv
+	}
+	return
+}
+
+func (r *KubeVirt) BuildPVForNFS(vm *plan.VMStatus) (pv *core.PersistentVolume) {
 	sourceProvider := r.Source.Provider
 	splitted := strings.Split(sourceProvider.Spec.URL, ":")
 	nfsServer := splitted[0]
 	nfsPath := splitted[1]
 	pvcNamePrefix := getEntityPrefixName("pv", r.Source.Provider.Name, r.Plan.Name)
 
-	labels := map[string]string{"provider": r.Plan.Provider.Source.Name, "app": "forklift", "migration": r.Migration.Name, "plan": string(r.Plan.UID), "ova": OvaPVLabel}
-	pv := &core.PersistentVolume{
+	pv = &core.PersistentVolume{
 		ObjectMeta: meta.ObjectMeta{
 			GenerateName: pvcNamePrefix,
-			Labels:       labels,
+			Labels:       r.nfsPVLabels(vm.ID),
 		},
 		Spec: core.PersistentVolumeSpec{
 			Capacity: core.ResourceList{
-				core.ResourceStorage: resource.MustParse("1Gi"),
+				core.ResourceStorage: resource.MustParse(PVSize),
 			},
 			AccessModes: []core.PersistentVolumeAccessMode{
 				core.ReadOnlyMany,
@@ -2911,49 +4218,229 @@ func (r *KubeVirt) CreatePvForNfs() (pvName string, err error) {
 			},
 		},
 	}
-	err = r.Destination.Create(context.TODO(), pv)
-	if err != nil {
-		r.Log.Error(err, "Failed to create OVA plan PV")
-		return
-	}
-	pvName = pv.Name
 	return
 }
 
-func (r *KubeVirt) CreatePvcForNfs(pvcNamePrefix, pvName, vmID string) (pvcName string, err error) {
+// EnsureProviderStoragePVC returns existing PVC if found by labels, creates if not found (OVA NFS or HyperV SMB).
+func (r *KubeVirt) EnsureProviderStoragePVC(pvc *core.PersistentVolumeClaim, providerType api.ProviderType) (out *core.PersistentVolumeClaim, err error) {
+	// Query k8s for existing PVC matching labels (plan, migration, vmID)
+	list := &core.PersistentVolumeClaimList{}
+	err = r.Destination.Client.List(
+		context.TODO(),
+		list,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(pvc.Labels),
+			Namespace:     r.Plan.Spec.TargetNamespace,
+		},
+	)
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+
+	// Reuse existing PVC if found
+	if len(list.Items) > 0 {
+		out = &list.Items[0]
+	} else {
+		// Create PVC in k8s (triggers CSI provisioning for SMB)
+		err = r.Destination.Client.Create(context.TODO(), pvc)
+		if err != nil {
+			err = liberr.Wrap(err)
+			return
+		}
+		storageType := "NFS"
+		if providerType == api.HyperV {
+			storageType = "SMB"
+		}
+		r.Log.Info(fmt.Sprintf("Created %s PVC for virt-v2v pod.", storageType), "pvc", path.Join(pvc.Namespace, pvc.Name))
+		out = pvc
+	}
+	return
+}
+
+// EnsurePVCForNFS is deprecated, use EnsureProviderStoragePVC instead.
+// Kept for backwards compatibility with existing code paths.
+func (r *KubeVirt) EnsurePVCForNFS(pvc *core.PersistentVolumeClaim) (out *core.PersistentVolumeClaim, err error) {
+	return r.EnsureProviderStoragePVC(pvc, api.Ova)
+}
+
+func (r *KubeVirt) BuildPVCForNFS(pv *core.PersistentVolume, vm *plan.VMStatus) (pvc *core.PersistentVolumeClaim) {
 	sc := ""
-	labels := map[string]string{"provider": r.Plan.Provider.Source.Name, "app": "forklift", "migration": string(r.Migration.UID), "plan": string(r.Plan.UID), "ova": OvaPVCLabel, kVM: vmID}
-	pvc := &core.PersistentVolumeClaim{
+	pvcNamePrefix := getEntityPrefixName("pvc", r.Source.Provider.Name, r.Plan.Name)
+	pvc = &core.PersistentVolumeClaim{
 		ObjectMeta: meta.ObjectMeta{
 			GenerateName: pvcNamePrefix,
 			Namespace:    r.Plan.Spec.TargetNamespace,
-			Labels:       labels,
+			Labels:       r.nfsPVCLabels(vm.ID),
 		},
 		Spec: core.PersistentVolumeClaimSpec{
 			Resources: core.VolumeResourceRequirements{
 				Requests: core.ResourceList{
-					core.ResourceStorage: resource.MustParse("1Gi"),
+					core.ResourceStorage: resource.MustParse(PVSize),
 				},
 			},
 			AccessModes: []core.PersistentVolumeAccessMode{
 				core.ReadOnlyMany,
 			},
-			VolumeName:       pvName,
+			VolumeName:       pv.Name,
 			StorageClassName: &sc,
 		},
 	}
-	err = r.Destination.Create(context.TODO(), pvc)
-	if err != nil {
-		r.Log.Error(err, "Failed to create OVA plan PVC")
-		return
-	}
-
-	pvcName = pvc.Name
 	return
+}
+
+func (r *KubeVirt) nfsPVLabels(vmID string) map[string]string {
+	return map[string]string{
+		"provider":     r.Plan.Provider.Source.Name,
+		"app":          "forklift",
+		"migration":    r.Migration.Name,
+		"plan":         string(r.Plan.UID),
+		kPlanName:      r.Plan.Name,
+		kPlanNamespace: r.Plan.Namespace,
+		"ova":          OvaPVLabel,
+		kVM:            vmID,
+	}
+}
+
+func (r *KubeVirt) nfsPVCLabels(vmID string) map[string]string {
+	return map[string]string{
+		"provider":     r.Plan.Provider.Source.Name,
+		"app":          "forklift",
+		"migration":    string(r.Migration.UID),
+		"plan":         string(r.Plan.UID),
+		kPlanName:      r.Plan.Name,
+		kPlanNamespace: r.Plan.Namespace,
+		"ova":          OvaPVCLabel,
+		kVM:            vmID,
+	}
 }
 
 func getEntityPrefixName(resourceType, providerName, planName string) string {
 	return fmt.Sprintf("ova-store-%s-%s-%s-", resourceType, providerName, planName)
+}
+
+// BuildPVForSMB creates a static PV for HyperV using SMB CSI driver.
+func (r *KubeVirt) BuildPVForSMB(vm *plan.VMStatus) (pv *core.PersistentVolume) {
+	sourceProvider := r.Source.Provider
+	smbUrl := hvutil.SMBUrl(r.Source.Secret)
+	smbSource := ctrlutil.ParseSMBSource(smbUrl)
+	pvNamePrefix := fmt.Sprintf("hyperv-store-pv-%s-%s-", r.Source.Provider.Name, r.Plan.Name)
+
+	// Get secret reference from provider
+	secretName := sourceProvider.Spec.Secret.Name
+	secretNamespace := sourceProvider.Spec.Secret.Namespace
+
+	pv = &core.PersistentVolume{
+		ObjectMeta: meta.ObjectMeta{
+			GenerateName: pvNamePrefix,
+			Labels:       r.smbPVLabels(vm.ID),
+		},
+		Spec: core.PersistentVolumeSpec{
+			Capacity: core.ResourceList{
+				core.ResourceStorage: resource.MustParse(PVSize),
+			},
+			AccessModes: []core.PersistentVolumeAccessMode{
+				core.ReadOnlyMany,
+			},
+			PersistentVolumeSource: core.PersistentVolumeSource{
+				CSI: &core.CSIPersistentVolumeSource{
+					Driver:       SMBCSIDriver,
+					VolumeHandle: fmt.Sprintf("hyperv-%s-%s-%s", r.Source.Provider.Name, r.Plan.Name, vm.ID),
+					VolumeAttributes: map[string]string{
+						"source": smbSource,
+					},
+					NodeStageSecretRef: &core.SecretReference{
+						Name:      secretName,
+						Namespace: secretNamespace,
+					},
+				},
+			},
+		},
+	}
+	return
+}
+
+// EnsurePVForSMB ensures the static PV exists for HyperV SMB.
+func (r *KubeVirt) EnsurePVForSMB(pv *core.PersistentVolume) (out *core.PersistentVolume, err error) {
+	list := &core.PersistentVolumeList{}
+	err = r.Destination.Client.List(
+		context.TODO(),
+		list,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(pv.Labels),
+		},
+	)
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+
+	if len(list.Items) > 0 {
+		out = &list.Items[0]
+	} else {
+		err = r.Destination.Client.Create(context.TODO(), pv)
+		if err != nil {
+			err = liberr.Wrap(err)
+			return
+		}
+		r.Log.Info("Created SMB PV for virt-v2v pod.", "pv", pv.Name)
+		out = pv
+	}
+	return
+}
+
+// BuildPVCForSMB creates a PVC bound to a static SMB PV for HyperV.
+func (r *KubeVirt) BuildPVCForSMB(pv *core.PersistentVolume, vm *plan.VMStatus) (pvc *core.PersistentVolumeClaim) {
+	sc := ""
+	pvcNamePrefix := fmt.Sprintf("hyperv-pvc-%s-%s-", r.Source.Provider.Name, r.Plan.Name)
+	pvc = &core.PersistentVolumeClaim{
+		ObjectMeta: meta.ObjectMeta{
+			GenerateName: pvcNamePrefix,
+			Namespace:    r.Plan.Spec.TargetNamespace,
+			Labels:       r.smbPVCLabels(vm.ID),
+		},
+		Spec: core.PersistentVolumeClaimSpec{
+			Resources: core.VolumeResourceRequirements{
+				Requests: core.ResourceList{
+					core.ResourceStorage: resource.MustParse(PVSize),
+				},
+			},
+			AccessModes: []core.PersistentVolumeAccessMode{
+				core.ReadOnlyMany,
+			},
+			VolumeName:       pv.Name,
+			StorageClassName: &sc,
+		},
+	}
+	return
+}
+
+// smbPVLabels returns labels for HyperV SMB PV.
+func (r *KubeVirt) smbPVLabels(vmID string) map[string]string {
+	return map[string]string{
+		"provider":     r.Plan.Provider.Source.Name,
+		"app":          "forklift",
+		"migration":    r.Migration.Name,
+		"plan":         string(r.Plan.UID),
+		kPlanName:      r.Plan.Name,
+		kPlanNamespace: r.Plan.Namespace,
+		"hyperv":       HyperVPVLabel,
+		kVM:            vmID,
+	}
+}
+
+// smbPVCLabels returns labels for HyperV SMB PVC.
+func (r *KubeVirt) smbPVCLabels(vmID string) map[string]string {
+	return map[string]string{
+		"provider":     r.Plan.Provider.Source.Name,
+		"app":          "forklift",
+		"migration":    string(r.Migration.UID),
+		"plan":         string(r.Plan.UID),
+		kPlanName:      r.Plan.Name,
+		kPlanNamespace: r.Plan.Namespace,
+		"hyperv":       HyperVPVCLabel,
+		kVM:            vmID,
+	}
 }
 
 // Ensure the PV exist on the destination.
@@ -3053,4 +4540,57 @@ func (r *KubeVirt) IsCopyOffload(pvcs []*core.PersistentVolumeClaim) bool {
 		}
 	}
 	return false
+}
+
+// determineRunStrategy determines the appropriate run strategy based on the target power state configuration
+func (r *KubeVirt) determineRunStrategy(vm *plan.VMStatus) cnv.VirtualMachineRunStrategy {
+	// Determine the target power state based on plan configuration
+	targetPowerState := vm.TargetPowerState
+	if targetPowerState == "" {
+		targetPowerState = r.Plan.Spec.TargetPowerState
+	}
+
+	if settings.Settings.WindowsWaitForReboot &&
+		targetPowerState != plan.TargetPowerStateOff {
+		win, wErr := migbase.IsWindowsFromInventory(r.Source.Inventory, vm.Ref)
+		if wErr != nil {
+			r.Log.Error(wErr, "Windows inventory lookup failed; falling back to default run strategy.", "vm", vm.String())
+		} else if win {
+			return cnv.RunStrategyAlways
+		}
+	}
+
+	switch targetPowerState {
+	case plan.TargetPowerStateOn:
+		// Force target VM to be powered on
+		return cnv.RunStrategyAlways
+	case plan.TargetPowerStateOff:
+		// Force target VM to be powered off
+		return cnv.RunStrategyHalted
+	default:
+		// Default behavior: match the source VM's power state
+		if vm.RestorePowerState == plan.VMPowerStateOn {
+			return cnv.RunStrategyAlways
+		}
+		return cnv.RunStrategyHalted
+	}
+}
+
+func getVirtV2vImage(plan *api.Plan) string {
+	cfg := convctx.PodConfigFromPlan(plan)
+	return convctx.GetVirtV2vImage(&cfg)
+}
+
+// buildUDNAnnotation returns the YAML-encoded value for the
+// k8s.ovn.org/open-default-ports annotation required for User Defined Networks.
+func buildUDNAnnotation() (string, error) {
+	ports := []OpenPort{
+		{Protocol: "tcp", Port: 2112},
+		{Protocol: "tcp", Port: 8080},
+	}
+	out, err := yaml.Marshal(ports)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }

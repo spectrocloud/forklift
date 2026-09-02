@@ -1,0 +1,691 @@
+package create
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+
+	forkliftv1beta1 "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
+	planv1beta1 "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
+	"github.com/spf13/cobra"
+	"github.com/yaacov/karl-interpreter/pkg/karl"
+	"gopkg.in/yaml.v3"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+
+	"github.com/yaacov/kubectl-mtv/pkg/cmd/create/plan"
+	"github.com/yaacov/kubectl-mtv/pkg/cmd/get/inventory"
+	"github.com/yaacov/kubectl-mtv/pkg/util/client"
+	"github.com/yaacov/kubectl-mtv/pkg/util/completion"
+	"github.com/yaacov/kubectl-mtv/pkg/util/flags"
+)
+
+// parseKeyValuePairs parses a slice of strings containing comma-separated key=value pairs
+// and returns a map[string]string with trimmed keys and values
+func parseKeyValuePairs(pairs []string, fieldName string) (map[string]string, error) {
+	result := make(map[string]string)
+	for _, pairGroup := range pairs {
+		// Split by comma to handle multiple pairs in one flag value
+		keyValuePairs := strings.Split(pairGroup, ",")
+		for _, pair := range keyValuePairs {
+			pair = strings.TrimSpace(pair)
+			if pair == "" {
+				continue
+			}
+			parts := strings.SplitN(pair, "=", 2)
+			if len(parts) == 2 {
+				key := strings.TrimSpace(parts[0])
+				value := strings.TrimSpace(parts[1])
+				result[key] = value
+			} else {
+				return nil, fmt.Errorf("invalid %s: %s", fieldName, pair)
+			}
+		}
+	}
+	return result, nil
+}
+
+// NewPlanCmd creates the plan creation command
+func NewPlanCmd(kubeConfigFlags *genericclioptions.ConfigFlags, globalConfig GlobalConfigGetter) *cobra.Command {
+	var name, sourceProvider, targetProvider string
+	var networkMapping, storageMapping string
+	var vmNamesQuaryOrFile string
+	var defaultTargetNetwork, defaultTargetStorageClass string
+	var networkPairs, storagePairs string
+	var preHook, postHook string
+
+	// Storage mapping enhancement options
+	var defaultVolumeMode, defaultAccessMode string
+	var defaultOffloadPlugin, defaultOffloadSecret, defaultOffloadVendor string
+
+	// Offload secret creation flags
+	var offloadVSphereUsername, offloadVSpherePassword, offloadVSphereURL string
+	var offloadStorageUsername, offloadStoragePassword, offloadStorageEndpoint string
+	var offloadCACert string
+	var offloadInsecureSkipTLS bool
+
+	// PlanSpec fields
+	var planSpec forkliftv1beta1.PlanSpec
+	var transferNetwork string
+	var installLegacyDrivers string       // "true", "false", or "auto" for nil (auto-detect)
+	var enableNestedVirtualization string // "true", "false", or "auto" for nil (auto-detect)
+	migrationTypeFlag := flags.NewMigrationTypeFlag()
+	var targetLabels []string
+	var targetNodeSelector []string
+	var useCompatibilityMode bool
+	var targetAffinity string
+	var targetPowerState string
+
+	// Conversion temporary storage flags (providers requiring guest conversion)
+	var customizationScripts string
+
+	// Convertor-related flags
+	var convertorLabels []string
+	var convertorNodeSelector []string
+	var convertorAffinity string
+
+	// Tag mapping flags (vSphere only)
+	var tagMappingDisabled bool
+	var tagMappingLabelTags []string
+
+	var dryRun bool
+	var outputFormat string
+
+	cmd := &cobra.Command{
+		Use:   "plan",
+		Short: "Create a migration plan",
+		Long: `Create a migration plan to move VMs from a source provider to OpenShift.
+
+Only --name, --source, and --vms are required. All other flags are optional
+and have sensible defaults — only set them when you need to override the
+default behavior (see "Optional Fields" below).
+
+VMs can be specified as:
+  - Comma-separated names: --vms "vm1,vm2,vm3"
+  - TSL query: --vms "where name ~= 'prod-.*' and cpuCount <= 8"
+  - YAML/JSON file: --vms @vms.yaml
+
+Providers:
+  --source is the name of the source provider resource (e.g. "vsphere-prod").
+  --target is the name of the target provider resource (e.g. "host", "ocp-target").
+  If --target is omitted, the first OpenShift provider in the namespace is used.
+
+Optional Fields — leave unset unless you need to override:
+  Network/storage mappings are auto-generated from provider inventory when
+  omitted. Only specify --network-pairs, --storage-pairs, --network-mapping,
+  or --storage-mapping if you need custom mappings that differ from the
+  auto-detected defaults.
+
+  Similarly, flags like --migration-type (default: cold), --target-namespace
+  (default: plan namespace), --target-power-state (default: match source),
+  --preserve-static-ips (default: true), and other boolean/string flags all
+  have reasonable defaults. Setting them unnecessarily makes commands harder
+  to read and may override values you actually want.
+
+Mapping Pair Formats (when overriding auto-generated mappings):
+  --network-pairs: comma-separated "source:target" pairs. Target forms:
+    source:default                    - Pod networking
+    source:nad-name                   - NAD in plan namespace
+    source:namespace/nad-name         - NAD in explicit namespace
+    source:ignored                    - Skip this network
+    Example: "VM Network:default,Production:myns/br-ext,Backup:ignored"
+
+  --storage-pairs: comma-separated "source:storageclass[;options]" pairs.
+    source:storageclass               - Basic mapping
+    source:sc;volumeMode=Block        - With volume mode (Filesystem|Block)
+    source:sc;accessMode=ReadWriteMany - With access mode
+    source:sc;offloadPlugin=vsphere;offloadVendor=ontap - Storage offload
+    Options are semicolon-separated and can be combined:
+    Example: "ds1:fast-ssd,ds2:economy;volumeMode=Block;accessMode=ReadWriteOnce"
+
+Query Language (TSL):
+  The --vms flag accepts TSL queries to select VMs dynamically:
+    --vms "where name ~= 'prod-.*' and cpuCount <= 8"
+    --vms "where powerState = 'poweredOn' and memoryMB > 4096"
+    --vms "where len(disks) > 1"
+  Run 'kubectl-mtv help tsl' for the full syntax reference and field list.
+
+Affinity Syntax (KARL):
+  The --target-affinity and --convertor-affinity flags use KARL syntax:
+    --target-affinity "REQUIRE pods(app=database) on node"
+    --convertor-affinity "PREFER pods(app=cache) on zone weight=80"
+  Rule types: REQUIRE, PREFER, AVOID, REPEL. Topology: node, zone, region, rack.
+  Run 'kubectl-mtv help karl' for the full syntax reference.`,
+		Example: `  # Minimal plan — only required flags; mappings and target are auto-detected
+  kubectl-mtv create plan --name my-migration \
+    --source vsphere-prod \
+    --vms "web-server,db-server"
+
+  # Minimal plan with a TSL query to select VMs dynamically
+  kubectl-mtv create plan --name batch-migration \
+    --source vsphere-prod \
+    --vms "where name ~= 'legacy-.*'"
+
+  # Minimal plan from a VM file (auto-detect mappings and target)
+  kubectl-mtv get inventory vms --provider vsphere-prod --output planvms > vms.yaml
+  kubectl-mtv create plan --name file-migration \
+    --source vsphere-prod \
+    --vms @vms.yaml
+
+  # Override the migration type (default is cold)
+  kubectl-mtv create plan --name warm-migration \
+    --source vsphere-prod \
+    --vms "critical-vm" \
+    --migration-type warm
+
+  # Override auto-detected mappings with explicit inline pairs
+  # Only do this if the auto-generated mappings don't suit your needs
+  kubectl-mtv create plan --name custom-map \
+    --source vsphere-prod \
+    --vms "app-vm,cache-vm" \
+    --network-pairs "VM Network:default,Production:myns/br-ext,Backup:ignored" \
+    --storage-pairs "datastore1:fast-ssd,datastore2:economy"
+
+  # Storage pairs with advanced options (volume mode, access mode, offload)
+  kubectl-mtv create plan --name advanced-storage \
+    --source vsphere-prod \
+    --vms "db-server" \
+    --storage-pairs "fast-ds:premium;volumeMode=Block;accessMode=ReadWriteOnce,shared-ds:nfs-class;volumeMode=Filesystem;accessMode=ReadWriteMany"
+
+  # Override default target network and storage class
+  # Only needed when auto-detection doesn't pick the right defaults
+  kubectl-mtv create plan --name explicit-defaults \
+    --source vsphere-prod \
+    --vms "where name ~= 'test-.*'" \
+    --default-target-network default \
+    --default-target-storage-class standard
+
+  # Disable default-true boolean flags with explicit false
+  kubectl-mtv create plan --name no-preflight \
+    --source vsphere-prod \
+    --vms "quick-vm" \
+    --run-preflight-inspection false \
+    --preserve-static-ips false`,
+		Args:         cobra.MaximumNArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := flags.ResolveNameArg(&name, args); err != nil {
+				return err
+			}
+			if name == "" {
+				return fmt.Errorf("--name is required")
+			}
+
+			// Resolve the appropriate namespace based on context and flags
+			namespace := client.ResolveNamespace(kubeConfigFlags)
+
+			// Get inventory URL and insecure skip TLS from global config (auto-discovers if needed)
+			inventoryURL := globalConfig.GetInventoryURL()
+			inventoryInsecureSkipTLS := globalConfig.GetInventoryInsecureSkipTLS()
+
+			// Validate that existing mapping flags and mapping pair flags are not used together
+			if networkMapping != "" && networkPairs != "" {
+				return fmt.Errorf("cannot use both --network-mapping and --network-pairs flags")
+			}
+			if storageMapping != "" && storagePairs != "" {
+				return fmt.Errorf("cannot use both --storage-mapping and --storage-pairs flags")
+			}
+
+			// Validate that conversion-only migrations don't use storage mappings
+			if migrationTypeFlag.GetValue() == "conversion" {
+				if storageMapping != "" {
+					return fmt.Errorf("cannot use --storage-mapping with migration type 'conversion'. Conversion-only migrations require empty storage mapping")
+				}
+				if storagePairs != "" {
+					return fmt.Errorf("cannot use --storage-pairs with migration type 'conversion'. Conversion-only migrations require empty storage mapping")
+				}
+			}
+
+			var vmList []planv1beta1.VM
+
+			if strings.HasPrefix(vmNamesQuaryOrFile, "where ") {
+				// It's a query string - fetch VMs from inventory
+				query := vmNamesQuaryOrFile // The full string including "where "
+
+				// Parse source provider to extract name and namespace
+				sourceProviderName := sourceProvider
+				sourceProviderNamespace := namespace
+				if strings.Contains(sourceProvider, "/") {
+					parts := strings.SplitN(sourceProvider, "/", 2)
+					sourceProviderNamespace = strings.TrimSpace(parts[0])
+					sourceProviderName = strings.TrimSpace(parts[1])
+				}
+
+				fmt.Printf("Fetching VMs from provider '%s' using query: %s\n", sourceProviderName, query)
+
+				var err error
+				vmList, err = inventory.FetchVMsByQueryWithInsecure(cmd.Context(), kubeConfigFlags, sourceProviderName, sourceProviderNamespace, inventoryURL, query, inventoryInsecureSkipTLS)
+				if err != nil {
+					return fmt.Errorf("failed to fetch VMs using query: %v", err)
+				}
+
+				if len(vmList) == 0 {
+					return fmt.Errorf("no VMs found matching the query")
+				}
+
+				fmt.Printf("Found %d VM(s) matching the query\n", len(vmList))
+			} else if strings.HasPrefix(vmNamesQuaryOrFile, "@") {
+				// It's a file
+				filePath := vmNamesQuaryOrFile[1:]
+				content, err := os.ReadFile(filePath)
+				if err != nil {
+					return fmt.Errorf("failed to read file %s: %v", filePath, err)
+				}
+
+				// Attempt to unmarshal as YAML first, then try JSON
+				err = yaml.Unmarshal(content, &vmList)
+				if err != nil {
+					err = json.Unmarshal(content, &vmList)
+					if err != nil {
+						return fmt.Errorf("failed to unmarshal file %s as YAML or JSON: %v", filePath, err)
+					}
+				}
+			} else {
+				// It's a comma-separated list
+				vmNameSlice := strings.Split(vmNamesQuaryOrFile, ",")
+				for _, vmName := range vmNameSlice {
+					newVM := planv1beta1.VM{}
+					newVM.Name = strings.TrimSpace(vmName)
+					vmList = append(vmList, newVM)
+				}
+			}
+
+			// Add hooks to all VMs if specified
+			if preHook != "" || postHook != "" {
+				for i := range vmList {
+					var hooks []planv1beta1.HookRef
+
+					// Add pre-hook if specified
+					if preHook != "" {
+						preHookRef := planv1beta1.HookRef{
+							Step: "PreHook",
+							Hook: corev1.ObjectReference{
+								Kind:       "Hook",
+								APIVersion: "forklift.konveyor.io/v1beta1",
+								Name:       strings.TrimSpace(preHook),
+								Namespace:  namespace,
+							},
+						}
+						hooks = append(hooks, preHookRef)
+					}
+
+					// Add post-hook if specified
+					if postHook != "" {
+						postHookRef := planv1beta1.HookRef{
+							Step: "PostHook",
+							Hook: corev1.ObjectReference{
+								Kind:       "Hook",
+								APIVersion: "forklift.konveyor.io/v1beta1",
+								Name:       strings.TrimSpace(postHook),
+								Namespace:  namespace,
+							},
+						}
+						hooks = append(hooks, postHookRef)
+					}
+
+					// Add hooks to the VM (append to existing hooks if any)
+					vmList[i].Hooks = append(vmList[i].Hooks, hooks...)
+				}
+			}
+
+			// Create transfer network reference if provided
+			if transferNetwork != "" {
+				transferNetworkName := strings.TrimSpace(transferNetwork)
+				transferNetworkNamespace := namespace
+
+				// If tansferNetwork has "/", the first part is the namespace
+				if strings.Contains(transferNetwork, "/") {
+					parts := strings.SplitN(transferNetwork, "/", 2)
+					transferNetworkName = strings.TrimSpace(parts[1])
+					transferNetworkNamespace = strings.TrimSpace(parts[0])
+				}
+
+				planSpec.TransferNetwork = &corev1.ObjectReference{
+					Kind:       "NetworkAttachmentDefinition",
+					APIVersion: "k8s.cni.cncf.io/v1",
+					Name:       transferNetworkName,
+					Namespace:  transferNetworkNamespace,
+				}
+			}
+
+			// Handle InstallLegacyDrivers flag
+			switch installLegacyDrivers {
+			case "true":
+				val := true
+				planSpec.InstallLegacyDrivers = &val
+			case "false":
+				val := false
+				planSpec.InstallLegacyDrivers = &val
+			case "auto":
+				// leave nil (auto-detect)
+			default:
+				return fmt.Errorf("invalid value for --install-legacy-drivers: %q (must be 'true', 'false', or 'auto')", installLegacyDrivers)
+			}
+
+			// Handle EnableNestedVirtualization flag
+			switch enableNestedVirtualization {
+			case "true":
+				val := true
+				planSpec.EnableNestedVirtualization = &val
+			case "false":
+				val := false
+				planSpec.EnableNestedVirtualization = &val
+			case "auto":
+				// leave nil (auto-detect)
+			default:
+				return fmt.Errorf("invalid value for --enable-nested-virtualization: %q (must be 'true', 'false', or 'auto')", enableNestedVirtualization)
+			}
+
+			// Handle migration type flag
+			if migrationTypeFlag.GetValue() != "" {
+				if planSpec.Warm {
+					return fmt.Errorf("setting --warm flag is not supported when migration type is specified")
+				}
+
+				planSpec.Type = migrationTypeFlag.GetValue()
+
+				// Also set the warm field for backward compatibility when migration type is warm
+				if migrationTypeFlag.GetValue() == "warm" {
+					planSpec.Warm = true
+				}
+			}
+
+			// Handle target labels (convert from key=value slice to map)
+			if len(targetLabels) > 0 {
+				labels, err := parseKeyValuePairs(targetLabels, "target label")
+				if err != nil {
+					return err
+				}
+				planSpec.TargetLabels = labels
+			}
+
+			// Handle target node selector (convert from key=value slice to map)
+			if len(targetNodeSelector) > 0 {
+				nodeSelector, err := parseKeyValuePairs(targetNodeSelector, "target node selector")
+				if err != nil {
+					return err
+				}
+				planSpec.TargetNodeSelector = nodeSelector
+			}
+
+			// Handle target affinity (parse KARL rule)
+			if targetAffinity != "" {
+				interpreter := karl.NewKARLInterpreter()
+				err := interpreter.Parse(targetAffinity)
+				if err != nil {
+					return fmt.Errorf("failed to parse target affinity KARL rule: %v", err)
+				}
+
+				affinity, err := interpreter.ToAffinity()
+				if err != nil {
+					return fmt.Errorf("failed to convert KARL rule to affinity: %v", err)
+				}
+				planSpec.TargetAffinity = affinity
+			}
+
+			// Handle target power state
+			if targetPowerState != "" {
+				planSpec.TargetPowerState = planv1beta1.TargetPowerState(targetPowerState)
+			}
+
+			// Handle convertor labels (convert from key=value slice to map)
+			if len(convertorLabels) > 0 {
+				labels, err := parseKeyValuePairs(convertorLabels, "convertor label")
+				if err != nil {
+					return err
+				}
+				planSpec.ConvertorLabels = labels
+			}
+
+			// Handle convertor node selector (convert from key=value slice to map)
+			if len(convertorNodeSelector) > 0 {
+				nodeSelector, err := parseKeyValuePairs(convertorNodeSelector, "convertor node selector")
+				if err != nil {
+					return err
+				}
+				planSpec.ConvertorNodeSelector = nodeSelector
+			}
+
+			// Handle convertor affinity (parse KARL rule)
+			if convertorAffinity != "" {
+				interpreter := karl.NewKARLInterpreter()
+				err := interpreter.Parse(convertorAffinity)
+				if err != nil {
+					return fmt.Errorf("failed to parse convertor affinity KARL rule: %v", err)
+				}
+
+				affinity, err := interpreter.ToAffinity()
+				if err != nil {
+					return fmt.Errorf("failed to convert KARL rule to affinity: %v", err)
+				}
+				planSpec.ConvertorAffinity = affinity
+			}
+
+			// Handle tag mapping (vSphere only)
+			if tagMappingDisabled || len(tagMappingLabelTags) > 0 {
+				planSpec.TagMapping = &forkliftv1beta1.TagMapping{
+					Disabled:  tagMappingDisabled,
+					LabelTags: tagMappingLabelTags,
+				}
+			}
+
+			// Handle customization scripts reference (ConfigMap)
+			if customizationScripts != "" {
+				scriptsNamespace, scriptsName, err := flags.ParseResourceRef(customizationScripts, namespace)
+				if err != nil {
+					return fmt.Errorf("invalid --customization-scripts value: %w", err)
+				}
+
+				planSpec.CustomizationScripts = &corev1.ObjectReference{
+					Kind:       "ConfigMap",
+					APIVersion: "v1",
+					Name:       scriptsName,
+					Namespace:  scriptsNamespace,
+				}
+			}
+
+			// Handle use compatibility mode
+			planSpec.UseCompatibilityMode = useCompatibilityMode
+
+			// Set VMs in the PlanSpec
+			planSpec.VMs = vmList
+
+			if !dryRun && outputFormat != "" {
+				return fmt.Errorf("--output flag can only be used with --dry-run")
+			}
+			if dryRun && outputFormat != "" && outputFormat != "json" && outputFormat != "yaml" {
+				return fmt.Errorf("invalid output format for dry-run: %s. Valid formats are: json, yaml", outputFormat)
+			}
+			resolvedFormat := outputFormat
+			if dryRun && resolvedFormat == "" {
+				resolvedFormat = "yaml"
+			}
+
+			opts := plan.CreatePlanOptions{
+				Name:                      name,
+				Namespace:                 namespace,
+				SourceProvider:            sourceProvider,
+				TargetProvider:            targetProvider,
+				NetworkMapping:            networkMapping,
+				StorageMapping:            storageMapping,
+				ConfigFlags:               kubeConfigFlags,
+				InventoryURL:              inventoryURL,
+				InventoryInsecureSkipTLS:  inventoryInsecureSkipTLS,
+				DefaultTargetNetwork:      defaultTargetNetwork,
+				DefaultTargetStorageClass: defaultTargetStorageClass,
+				PlanSpec:                  planSpec,
+				NetworkPairs:              networkPairs,
+				StoragePairs:              storagePairs,
+				DefaultVolumeMode:         defaultVolumeMode,
+				DefaultAccessMode:         defaultAccessMode,
+				DefaultOffloadPlugin:      defaultOffloadPlugin,
+				DefaultOffloadSecret:      defaultOffloadSecret,
+				DefaultOffloadVendor:      defaultOffloadVendor,
+				// Offload secret creation options
+				OffloadVSphereUsername: offloadVSphereUsername,
+				OffloadVSpherePassword: offloadVSpherePassword,
+				OffloadVSphereURL:      offloadVSphereURL,
+				OffloadStorageUsername: offloadStorageUsername,
+				OffloadStoragePassword: offloadStoragePassword,
+				OffloadStorageEndpoint: offloadStorageEndpoint,
+				OffloadCACert:          offloadCACert,
+				OffloadInsecureSkipTLS: offloadInsecureSkipTLS,
+				DryRun:                 dryRun,
+				OutputFormat:           resolvedFormat,
+			}
+
+			err := plan.Create(cmd.Context(), opts)
+			return err
+		},
+	}
+
+	cmd.Flags().StringVarP(&name, "name", "M", "", "Plan name")
+	cmd.Flags().StringVarP(&sourceProvider, "source", "S", "", "Source provider name (supports namespace/name pattern, defaults to plan namespace)")
+	cmd.Flags().StringVarP(&targetProvider, "target", "t", "", "Target provider name (auto-detects first OpenShift provider when omitted)")
+	cmd.Flags().StringVar(&networkMapping, "network-mapping", "", "Network mapping name (auto-generated when omitted)")
+	cmd.Flags().StringVar(&storageMapping, "storage-mapping", "", "Storage mapping name (auto-generated when omitted)")
+	cmd.Flags().StringVar(&networkPairs, "network-pairs", "", "Inline network mapping pairs (auto-generated when omitted). Format: 'source:target' (comma-separated)")
+	cmd.Flags().StringVar(&storagePairs, "storage-pairs", "", "Inline storage mapping pairs (auto-generated when omitted). Format: 'source:storage-class[;param=value]' (comma-separated)")
+
+	// Storage enhancement flags
+	cmd.Flags().StringVar(&defaultVolumeMode, "default-volume-mode", "", "Default volume mode for storage pairs (Filesystem|Block)")
+	cmd.Flags().StringVar(&defaultAccessMode, "default-access-mode", "", "Default access mode for storage pairs (ReadWriteOnce|ReadWriteMany|ReadOnlyMany)")
+	cmd.Flags().StringVar(&defaultOffloadPlugin, "default-offload-plugin", "", "Default offload plugin type for storage pairs (vsphere)")
+	cmd.Flags().StringVar(&defaultOffloadSecret, "default-offload-secret", "", "Existing offload secret name to use for storage offload")
+	cmd.Flags().StringVar(&defaultOffloadVendor, "default-offload-vendor", "", "Default offload plugin vendor for storage pairs (flashsystem|vantara|ontap|primera3par|pureFlashArray|powerflex|powermax|powerstore|infinibox)")
+
+	// Offload secret creation flags (storage offload/XCOPY is vSphere-only)
+	cmd.Flags().StringVar(&offloadVSphereUsername, "offload-vsphere-username", "", "vSphere username for offload secret (creates new secret if no --default-offload-secret provided)")
+	cmd.Flags().StringVar(&offloadVSpherePassword, "offload-vsphere-password", "", "vSphere password for offload secret")
+	cmd.Flags().StringVar(&offloadVSphereURL, "offload-vsphere-url", "", "vSphere vCenter URL for offload secret")
+	cmd.Flags().StringVar(&offloadStorageUsername, "offload-storage-username", "", "Storage array username for offload secret")
+	cmd.Flags().StringVar(&offloadStoragePassword, "offload-storage-password", "", "Storage array password for offload secret")
+	cmd.Flags().StringVar(&offloadStorageEndpoint, "offload-storage-endpoint", "", "Storage array management endpoint URL for offload secret")
+	cmd.Flags().StringVar(&offloadCACert, "offload-cacert", "", "CA certificate for offload secret (use @filename to load from file)")
+	cmd.Flags().BoolVar(&offloadInsecureSkipTLS, "offload-insecure-skip-tls", false, "Skip TLS verification for offload connections")
+
+	flags.MarkRequiredForMCP(cmd, "name")
+	_ = cmd.MarkFlagRequired("source")
+	cmd.Flags().StringVar(&vmNamesQuaryOrFile, "vms", "", "List of VM names (comma-separated), path to YAML/JSON file (prefix with @), or query string (prefix with 'where ')")
+	_ = cmd.MarkFlagRequired("vms")
+	cmd.Flags().StringVar(&preHook, "pre-hook", "", "Pre-migration hook to add to all VMs in the plan")
+	cmd.Flags().StringVar(&postHook, "post-hook", "", "Post-migration hook to add to all VMs in the plan")
+
+	// PlanSpec flags
+	cmd.Flags().StringVar(&planSpec.Description, "description", "", "Plan description")
+	cmd.Flags().StringVar(&planSpec.TargetNamespace, "target-namespace", "", "Target namespace (defaults to plan namespace)")
+	cmd.Flags().StringVar(&transferNetwork, "transfer-network", "", "Network attachment definition for disk transfer. Supports 'namespace/network-name' or 'network-name'")
+	cmd.Flags().BoolVar(&planSpec.PreserveClusterCPUModel, "preserve-cluster-cpu-model", false, "Preserve the CPU model and flags the VM runs with in its cluster")
+	flags.ExplicitBoolVar(cmd.Flags(), &planSpec.PreserveStaticIPs, "preserve-static-ips", true, "Preserve static IP configurations during migration (true/false)")
+	cmd.Flags().StringVar(&planSpec.PVCNameTemplate, "pvc-name-template", "", "Template for generating PVC names. Variables: {{.VmName}}, {{.PlanName}}, {{.DiskIndex}}, {{.WinDriveLetter}}, {{.RootDiskIndex}}, {{.Shared}}, {{.FileName}}")
+	cmd.Flags().StringVar(&planSpec.VolumeNameTemplate, "volume-name-template", "", "Template for generating volume interface names in the target VM. Variables: {{.PVCName}}, {{.VolumeIndex}}")
+	cmd.Flags().StringVar(&planSpec.NetworkNameTemplate, "network-name-template", "", "Template for generating network interface names in the target VM. Variables: {{.NetworkName}}, {{.NetworkNamespace}}, {{.NetworkType}}, {{.NetworkIndex}}")
+	flags.ExplicitBoolVar(cmd.Flags(), &planSpec.MigrateSharedDisks, "migrate-shared-disks", true, "Migrate disks shared between multiple VMs (true/false)")
+	cmd.Flags().BoolVar(&planSpec.Archived, "archived", false, "Whether this plan should be archived")
+	flags.ExplicitBoolVar(cmd.Flags(), &planSpec.PVCNameTemplateUseGenerateName, "pvc-name-template-use-generate-name", true, "Use generateName instead of name for PVC name template (true/false)")
+	cmd.Flags().BoolVar(&planSpec.DeleteGuestConversionPod, "delete-guest-conversion-pod", false, "Delete guest conversion pod after successful migration")
+	flags.ExplicitBoolVar(cmd.Flags(), &planSpec.DeleteVmOnFailMigration, "delete-vm-on-fail-migration", true, "Delete target VM when migration fails (true/false)")
+	cmd.Flags().BoolVar(&planSpec.SkipGuestConversion, "skip-guest-conversion", false, "Skip the guest conversion process (raw disk copy mode)")
+	flags.ExplicitBoolVar(cmd.Flags(), &planSpec.RunPreflightInspection, "run-preflight-inspection", true, "Run preflight inspection on VM base disks before starting disk transfer (true/false)")
+	cmd.Flags().StringVar(&installLegacyDrivers, "install-legacy-drivers", "auto", "Install legacy Windows drivers (true/false/auto)")
+	cmd.Flags().VarP(migrationTypeFlag, "migration-type", "m", "Migration type: cold, warm, live, or conversion (default: cold)")
+	cmd.Flags().StringVarP(&defaultTargetNetwork, "default-target-network", "N", "", "Default target network for auto-generated mapping. Use 'default' for pod networking, 'namespace/network-name', or 'network-name'")
+	cmd.Flags().StringVar(&defaultTargetStorageClass, "default-target-storage-class", "", "Default target storage class for auto-generated mapping")
+	flags.ExplicitBoolVar(cmd.Flags(), &useCompatibilityMode, "use-compatibility-mode", true, "Use compatibility devices (SATA bus, E1000E NIC) when skipGuestConversion is true (true/false)")
+	cmd.Flags().StringSliceVarP(&targetLabels, "target-labels", "L", nil, "Target labels to be added to the VM (e.g., key1=value1,key2=value2)")
+	cmd.Flags().StringSliceVar(&targetNodeSelector, "target-node-selector", nil, "Target node selector to constrain VM scheduling (e.g., key1=value1,key2=value2)")
+	cmd.Flags().BoolVar(&planSpec.Warm, "warm", false, "Enable warm migration (use --migration-type=warm instead)")
+	cmd.Flags().StringVar(&targetAffinity, "target-affinity", "", "Target affinity to constrain VM scheduling using KARL syntax (e.g. 'REQUIRE pods(app=database) on node')")
+	cmd.Flags().StringVar(&targetPowerState, "target-power-state", "", "Target power state for VMs after migration: 'on', 'off', or 'auto' (default: match source VM power state)")
+
+	// Convertor-related flags (only apply to providers requiring guest conversion)
+	cmd.Flags().StringSliceVar(&convertorLabels, "convertor-labels", nil, "Labels to be added to virt-v2v convertor pods (e.g., key1=value1,key2=value2)")
+	cmd.Flags().StringSliceVar(&convertorNodeSelector, "convertor-node-selector", nil, "Node selector to constrain convertor pod scheduling (e.g., key1=value1,key2=value2)")
+	cmd.Flags().StringVar(&convertorAffinity, "convertor-affinity", "", "Convertor affinity to constrain convertor pod scheduling using KARL syntax")
+
+	// Conversion temporary storage flags (providers requiring guest conversion)
+	cmd.Flags().StringVar(&planSpec.ConversionTempStorageClass, "conversion-temp-storage-class", "", "Storage class for temporary conversion PVCs (useful for large VM migrations where node ephemeral storage is insufficient)")
+	cmd.Flags().StringVar(&planSpec.ConversionTempStorageSize, "conversion-temp-storage-size", "", "Size of temporary conversion PVC, e.g. '30Gi' or '1Ti' (only used when --conversion-temp-storage-class is set)")
+
+	// Provider-specific flags
+	cmd.Flags().BoolVar(&planSpec.SkipZoneNodeSelector, "skip-zone-node-selector", false, "Skip adding zone-based node selector to migrated VMs (EC2 only)")
+	cmd.Flags().StringVar(&customizationScripts, "customization-scripts", "", "ConfigMap containing customization scripts for guest conversion. Supports 'namespace/name' or 'name'")
+	cmd.Flags().StringVar(&planSpec.VirtV2vImage, "virt-v2v-image", "", "Override global virt-v2v container image for this plan")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Output Plan CR(s) to stdout instead of creating them")
+	cmd.Flags().StringVarP(&outputFormat, "output", "o", "", "Output format for dry-run (json, yaml). Defaults to yaml when --dry-run is used")
+	cmd.Flags().StringVar(&enableNestedVirtualization, "enable-nested-virtualization", "auto", "Enable nested virtualization on target VMs (true/false/auto)")
+	cmd.Flags().BoolVar(&planSpec.XfsCompatibility, "xfs-compatibility", false, "Use XFS-compatible virt-v2v image for this plan")
+	cmd.Flags().BoolVar(&planSpec.RDMAsLun, "rdm-as-lun", false, "Map VMware RDM disks as LUN devices (SCSI passthrough) in the target VM (vSphere only)")
+	cmd.Flags().StringVar(&planSpec.ServiceAccount, "service-account", "", "ServiceAccount for migration pods in the target namespace (overrides global setting)")
+	cmd.Flags().BoolVar(&tagMappingDisabled, "tag-mapping-disabled", false, "Disable vSphere tag-to-label conversion entirely (vSphere only)")
+	cmd.Flags().StringSliceVar(&tagMappingLabelTags, "tag-mapping-label-tags", nil, "Only convert these vSphere tag categories to labels (comma-separated, vSphere only)")
+
+	_ = cmd.RegisterFlagCompletionFunc("source", completion.ProviderNameCompletion(kubeConfigFlags))
+	_ = cmd.RegisterFlagCompletionFunc("target", completion.ProviderNameCompletionByType(kubeConfigFlags, "openshift"))
+	_ = cmd.RegisterFlagCompletionFunc("network-mapping", completion.MappingNameCompletion(kubeConfigFlags, "network"))
+	_ = cmd.RegisterFlagCompletionFunc("storage-mapping", completion.MappingNameCompletion(kubeConfigFlags, "storage"))
+
+	if err := cmd.RegisterFlagCompletionFunc("default-volume-mode", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return []string{"Filesystem", "Block"}, cobra.ShellCompDirectiveNoFileComp
+	}); err != nil {
+		panic(err)
+	}
+
+	if err := cmd.RegisterFlagCompletionFunc("default-access-mode", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return []string{"ReadWriteOnce", "ReadWriteMany", "ReadOnlyMany"}, cobra.ShellCompDirectiveNoFileComp
+	}); err != nil {
+		panic(err)
+	}
+
+	if err := cmd.RegisterFlagCompletionFunc("default-offload-plugin", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return []string{"vsphere"}, cobra.ShellCompDirectiveNoFileComp
+	}); err != nil {
+		panic(err)
+	}
+
+	if err := cmd.RegisterFlagCompletionFunc("default-offload-vendor", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return []string{"flashsystem", "vantara", "ontap", "primera3par", "pureFlashArray", "powerflex", "powermax", "powerstore", "infinibox"}, cobra.ShellCompDirectiveNoFileComp
+	}); err != nil {
+		panic(err)
+	}
+
+	// Add completion for migration type flag
+	if err := cmd.RegisterFlagCompletionFunc("migration-type", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return migrationTypeFlag.GetValidValues(), cobra.ShellCompDirectiveNoFileComp
+	}); err != nil {
+		panic(err)
+	}
+
+	// Add completion for install legacy drivers flag
+	if err := cmd.RegisterFlagCompletionFunc("install-legacy-drivers", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return []string{"true", "false", "auto"}, cobra.ShellCompDirectiveNoFileComp
+	}); err != nil {
+		panic(err)
+	}
+
+	if err := cmd.RegisterFlagCompletionFunc("enable-nested-virtualization", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return []string{"true", "false", "auto"}, cobra.ShellCompDirectiveNoFileComp
+	}); err != nil {
+		panic(err)
+	}
+
+	// Add completion for target power state flag
+	if err := cmd.RegisterFlagCompletionFunc("target-power-state", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return []string{"on", "off", "auto"}, cobra.ShellCompDirectiveNoFileComp
+	}); err != nil {
+		panic(err)
+	}
+
+	// Add completion for pre-hook flag
+	if err := cmd.RegisterFlagCompletionFunc("pre-hook", completion.HookResourceNameCompletion(kubeConfigFlags)); err != nil {
+		panic(err)
+	}
+
+	// Add completion for post-hook flag
+	if err := cmd.RegisterFlagCompletionFunc("post-hook", completion.HookResourceNameCompletion(kubeConfigFlags)); err != nil {
+		panic(err)
+	}
+
+	return cmd
+}

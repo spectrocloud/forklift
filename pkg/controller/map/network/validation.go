@@ -99,7 +99,7 @@ func (r *Reconciler) validateSource(mp *api.NetworkMap) (err error) {
 			})
 			continue
 		}
-		_, pErr := inventory.Network(ref)
+		_, pErr := inventory.Network(&ref.Ref)
 		if pErr != nil {
 			if errors.As(pErr, &web.NotFoundError{}) {
 				notValid = append(notValid, ref.String())
@@ -112,7 +112,9 @@ func (r *Reconciler) validateSource(mp *api.NetworkMap) (err error) {
 			err = pErr
 			return
 		}
-		references.List = append(references.List, *ref)
+		if !references.Find(ref.Ref) {
+			references.List = append(references.List, ref.Ref)
+		}
 	}
 	mp.Status.Refs = references
 	if len(notValid) > 0 {
@@ -120,7 +122,7 @@ func (r *Reconciler) validateSource(mp *api.NetworkMap) (err error) {
 			Type:     SourceNetworkNotValid,
 			Status:   True,
 			Reason:   NotFound,
-			Category: Critical,
+			Category: Warn,
 			Message:  "Source network not found.",
 			Items:    notValid,
 		})

@@ -12,11 +12,13 @@ const (
 	Running   = "Running"
 	Pending   = "Pending"
 	Canceled  = "Canceled"
+	Completed = "Completed"
 	Blocked   = "Blocked"
 	Ready     = "Ready"
 	Deleted   = "Deleted"
 	Warm      = "Warm"
 	Cold      = "Cold"
+	Live      = "Live"
 	Local     = "Local"
 	Remote    = "Remote"
 )
@@ -24,7 +26,7 @@ const (
 var (
 	// 'status' - [ Succeeded, Failed, Canceled]
 	// 'provider' - [oVirt, VSphere, Openstack, OVA, Openshift]
-	// 'mode' - [Cold, Warm]
+	// 'mode' - [Cold, Warm, Live]
 	// 'target' - [Local, Remote]
 	migrationStatusCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "mtv_migrations_status_total",
@@ -40,7 +42,7 @@ var (
 
 	// 'status' - [ Succeeded, Failed, Executing, Running, Pending, Canceled, Blocked, Deleted]
 	// 'provider' - [oVirt, VSphere, Openstack, OVA, Openshift]
-	// 'mode' - [Cold, Warm]
+	// 'mode' - [Cold, Warm, Live]
 	// 'target' - [Local, Remote]
 	planStatusGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "mtv_plans_status",
@@ -54,9 +56,31 @@ var (
 		},
 	)
 
+	// 'status' - [Succeeded, Failed]
+	// 'provider' - [oVirt, VSphere, Openstack, OVA, Openshift]
+	// 'mode' - [Cold, Warm, Live]
+	// 'target' - [Local, Remote]
+	// 'plan' - [Id]
+	// 'plan_name' - [Plan name]
+	// 'phase' - [Plan phase]
+	planAlertStatusGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "mtv_plan_alert_status",
+		Help: "VM Migration plan statuses for alerting",
+	},
+		[]string{
+			"status",
+			"provider",
+			"mode",
+			"target",
+			"plan",
+			"plan_name",
+			"phase",
+		},
+	)
+
 	// 'status' - [ Succeeded, Failed, Executing, Canceled]
 	// 'provider' - [oVirt, VSphere, Openstack, OVA, Openshift]
-	// 'mode' - [Cold, Warm]
+	// 'mode' - [Cold, Warm, Live]
 	// 'target' - [Local, Remote]
 	// 'plan' - [Id]
 	migrationDurationGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -67,7 +91,7 @@ var (
 	)
 
 	// 'provider' - [oVirt, VSphere, Openstack, OVA, Openshift]
-	// 'mode' - [Cold, Warm]
+	// 'mode' - [Cold, Warm, Live]
 	// 'target' - [Local, Remote]
 	// 'plan' - [Id]
 	dataTransferredGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -84,7 +108,7 @@ var (
 
 	// 'status' - [ Succeeded, Failed, Canceled]
 	// 'provider' - [oVirt, VSphere, Openstack, OVA, Openshift]
-	// 'mode' - [Cold, Warm]
+	// 'mode' - [Cold, Warm, Live]
 	// 'target' - [Local, Remote]
 	// 'plan' - [Id]
 	migrationPlanCorrelationStatusCounter = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -101,7 +125,7 @@ var (
 	)
 
 	// 'provider' - [oVirt, VSphere, Openstack, OVA, Openshift]
-	// 'mode' - [Cold, Warm]
+	// 'mode' - [Cold, Warm, Live]
 	// 'target' - [Local, Remote]
 	migrationDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "mtv_migrations_duration_seconds",
@@ -109,6 +133,36 @@ var (
 		Buckets: []float64{1 * 3600, 2 * 3600, 5 * 3600, 10 * 3600, 24 * 3600, 48 * 3600}, // 1, 2, 5, 10, 24, 48 hours in seconds
 	},
 		[]string{
+			"provider",
+			"mode",
+			"target",
+		},
+	)
+
+	// 'provider' - [oVirt, VSphere, Openstack, OVA, Openshift]
+	// 'mode' - [Cold, Warm, Live]
+	// 'target' - [Local, Remote]
+	plannedVMsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mtv_planned_vms_total",
+		Help: "Number of VMs listed in migration plan specs",
+	},
+		[]string{
+			"provider",
+			"mode",
+			"target",
+		},
+	)
+
+	// 'status' - [Succeeded, Failed, Canceled]
+	// 'provider' - [oVirt, VSphere, Openstack, OVA, Openshift]
+	// 'mode' - [Cold, Warm, Live]
+	// 'target' - [Local, Remote]
+	migratedVMsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mtv_migrated_vms_total",
+		Help: "Individual VM migration outcomes sorted by status, provider, mode and target",
+	},
+		[]string{
+			"status",
 			"provider",
 			"mode",
 			"target",
