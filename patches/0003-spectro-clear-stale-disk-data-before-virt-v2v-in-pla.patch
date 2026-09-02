@@ -1,0 +1,128 @@
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 14:12:06 -0700
+Subject: [PATCH] spectro: clear stale disk data before virt-v2v-in-place
+
+Re-derived on upstream v2.12.1 (was d23ed9e49 on the 2.9.2 line).
+
+virt-v2v-in-place writes RAW directly into the files named by the libvirt
+XML. A file still holding partial VMDK data from a failed attempt makes
+virt-v2v (or its qemu-img probe) fail, so truncate those first.
+
+Fixes a bug carried in the 2.9.2 version: it compared a 20-byte slice to
+the 21-char literal "# Disk DescriptorFile", so the VMDK check was always
+false and only the short-file fallback ever fired. A VMDK descriptor of
+512 bytes or more was left in place and the conversion still failed.
+Now uses bytes.HasPrefix; verified truncating a 602-byte descriptor while
+leaving a valid 4KB RAW image untouched.
+
+Also drops the local min() helper (builtin since Go 1.21) and moves the
+file read into a helper so the handle is not deferred inside a loop.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ pkg/virt-v2v/conversion/conversion.go         |  5 ++
+ pkg/virt-v2v/conversion/conversion_spectro.go | 79 +++++++++++++++++++
+ 2 files changed, 84 insertions(+)
+ create mode 100644 pkg/virt-v2v/conversion/conversion_spectro.go
+
+diff --git a/pkg/virt-v2v/conversion/conversion.go b/pkg/virt-v2v/conversion/conversion.go
+index 0000000..0000000 100644
+--- a/pkg/virt-v2v/conversion/conversion.go
++++ b/pkg/virt-v2v/conversion/conversion.go
+@@ -144,6 +144,11 @@ func (c *Conversion) RunVirtV2VInspection() error {
+ }
+ 
+ func (c *Conversion) RunVirtV2vInPlace() error {
++	// Spectro: clear any leftover/partial disk data before converting in place.
++	if err := c.prepareDiskFilesForInPlace(); err != nil {
++		return fmt.Errorf("failed to prepare disk files for in-place conversion: %w", err)
++	}
++
+ 	v2vCmdBuilder := c.CommandBuilder.New("virt-v2v-in-place").
+ 		AddFlag("-v").
+ 		AddFlag("-x").
+diff --git a/pkg/virt-v2v/conversion/conversion_spectro.go b/pkg/virt-v2v/conversion/conversion_spectro.go
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/pkg/virt-v2v/conversion/conversion_spectro.go
+@@ -0,0 +1,79 @@
++package conversion
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"os"
++)
++
++// vmdkDescriptorMagic is the first line of a VMDK descriptor file.
++const vmdkDescriptorMagic = "# Disk DescriptorFile"
++
++// diskHeaderSize is how many bytes we sniff to decide whether a disk file
++// still holds leftover data from an earlier attempt.
++const diskHeaderSize = 512
++
++// prepareDiskFilesForInPlace ensures disk files are ready for virt-v2v-in-place.
++//
++// virt-v2v-in-place reads VM data from vSphere (via the libvirt connection) and
++// writes RAW format directly to the disk files named in the libvirt XML. Those
++// files must be empty or absent: if one still holds invalid or partially written
++// VMDK data from a failed attempt, virt-v2v-in-place (or the qemu-img it shells
++// out to) fails while probing the format.
++func (c *Conversion) prepareDiskFilesForInPlace() error {
++	for _, disk := range c.Disks {
++		// Block devices need no preparation.
++		if disk.IsBlockDev {
++			continue
++		}
++
++		info, err := os.Stat(disk.Path)
++		if err != nil {
++			if os.IsNotExist(err) {
++				// virt-v2v-in-place will create it.
++				continue
++			}
++			return fmt.Errorf("failed to stat disk file %s: %w", disk.Path, err)
++		}
++
++		// Empty file is exactly what we want.
++		if info.Size() == 0 {
++			continue
++		}
++
++		header, err := readDiskHeader(disk.Path, diskHeaderSize)
++		if err != nil {
++			return fmt.Errorf("failed to read disk file %s: %w", disk.Path, err)
++		}
++
++		// Truncate when the file is a VMDK descriptor, or is too short to be a
++		// usable image. A valid RAW image is left alone.
++		if bytes.HasPrefix(header, []byte(vmdkDescriptorMagic)) || len(header) < diskHeaderSize {
++			fmt.Printf("Truncating disk file %s (size: %d) to prepare for in-place conversion\n",
++				disk.Path, info.Size())
++			if err := os.Truncate(disk.Path, 0); err != nil {
++				return fmt.Errorf("failed to truncate disk file %s: %w", disk.Path, err)
++			}
++		}
++	}
++
++	return nil
++}
++
++// readDiskHeader reads up to n leading bytes of path. A short read is not an
++// error: the caller treats a short header as "not a usable image".
++func readDiskHeader(path string, n int) ([]byte, error) {
++	file, err := os.Open(path)
++	if err != nil {
++		return nil, err
++	}
++	defer file.Close()
++
++	buf := make([]byte, n)
++	read, err := io.ReadFull(file, buf)
++	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
++		return nil, err
++	}
++	return buf[:read], nil
++}

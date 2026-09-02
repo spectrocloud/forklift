@@ -1,0 +1,67 @@
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 16:59:49 -0700
+Subject: [PATCH 7/8] spectro: fedora virt-v2v image target and nbdkit fix
+
+Re-derived on upstream v2.12.1 (was 51f4b6625/8053d5635 PR #29, and
+59eb19619 + eb91d63cd/bdd3b674b PR #46 on the 2.9.2 line).
+
+Adds build-virt-v2v-fedora-image / push-virt-v2v-fedora-image and bumps
+the Fedora base 41 -> 43 with virtio-win 1.9.45-1.el10, which is the
+nbdkit fix the VMO appliance needs.
+
+Deliberately NOT carried from the 2.9.2 version:
+  - builder image is left as upstream's centos:stream9 + libvirt-devel.
+    The 2.9.2 fork used ubi9/go-toolset, which predates the libvirt cgo
+    dependency in pkg/virt-v2v/conversion and can no longer build it.
+  - LIBGUESTFS_BACKEND is left as upstream's libvirt:qemu:///session.
+    v2.12.1 already fixes RHEL-104684/105490/105529 (direct backend for
+    the appliance build, qemu cache dir, catatonit as PID 1). Our
+    conversion pod still sets LIBGUESTFS_BACKEND=direct at runtime, which
+    overrides the image default where we need it.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ Makefile                                     | 7 +++++++
+ build/virt-v2v/Containerfile-upstream-fedora | 4 ++--
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 0000000..0000000 100644
+--- a/Makefile
++++ b/Makefile
+@@ -358,6 +358,13 @@ push-virt-v2v-xfs-image: build-virt-v2v-xfs-image
+ 		$(CONTAINER_CMD) push $(VIRT_V2V_IMAGE_RHEL9)$(PLATFORM_SUFFIX); \
+ 	fi
+ 
++build-virt-v2v-fedora-image: check_container_runtime
++	$(eval VIRT_V2V_IMAGE=$(REGISTRY)/$(REGISTRY_ORG)/forklift-virt-v2v:$(REGISTRY_TAG))
++	$(CONTAINER_CMD) build $(PLATFORM_FLAG) -t $(VIRT_V2V_IMAGE) -f build/virt-v2v/Containerfile-upstream-fedora .
++
++push-virt-v2v-fedora-image: build-virt-v2v-fedora-image
++	$(CONTAINER_CMD) push $(VIRT_V2V_IMAGE)
++
+ build-operator-bundle-image: check_container_runtime
+ 	$(CONTAINER_CMD) build $(PLATFORM_FLAG) $(BUILD_LABEL_ARGS) \
+ 		-t $(OPERATOR_BUNDLE_IMAGE)$(PLATFORM_SUFFIX) \
+diff --git a/build/virt-v2v/Containerfile-upstream-fedora b/build/virt-v2v/Containerfile-upstream-fedora
+index 0000000..0000000 100644
+--- a/build/virt-v2v/Containerfile-upstream-fedora
++++ b/build/virt-v2v/Containerfile-upstream-fedora
+@@ -13,7 +13,7 @@ RUN go build -buildvcs=false -ldflags="-w -s" -o virt-v2v-wrapper ./cmd/virt-v2v
+ RUN go build -buildvcs=false -ldflags="-w -s" -o forklift-wait-for-reboot github.com/kubev2v/forklift/cmd/forklift-wait-for-reboot
+ 
+ # Main container
+-FROM quay.io/fedora/fedora:41
++FROM quay.io/fedora/fedora:43
+ RUN rm /etc/pki/tls/fips_local.cnf && \
+     echo -e '[fips_sect]\ntls1-prf-ems-check = 0\nactivate = 1' > /etc/pki/tls/fips_local.cnf && \
+     sed -i '/^\\[ crypto_policy \\]/a Options=RHNoEnforceEMSinFIPS' /etc/pki/tls/openssl.cnf
+@@ -26,7 +26,7 @@ RUN mkdir /disks && \
+         virt-v2v && \
+     dnf clean all
+ 
+-RUN dnf install -y https://kojihub.stream.centos.org/kojifiles/packages/virtio-win/1.9.40/1.el9/noarch/virtio-win-1.9.40-1.el9.noarch.rpm
++RUN dnf install -y https://kojihub.stream.centos.org/kojifiles/packages/virtio-win/1.9.45/1.el10/noarch/virtio-win-1.9.45-1.el10.noarch.rpm
+ 
+ 
+ # Missing `libguestfs-winsupport` in the Fedora packages, this is not needed for Fedora as the v2v uses ntfs-3g

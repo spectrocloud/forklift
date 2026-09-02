@@ -1,0 +1,206 @@
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 14:15:16 -0700
+Subject: [PATCH] spectro: secure boot SMM, vCenter session leak, resource
+ limits
+
+Re-derived on upstream v2.12.1. All three were checked against v2.12.1
+first and are still needed there.
+
+Secure Boot (was 509daed38): upstream replaces Domain.Features wholesale
+when SecureBoot is set, discarding anything set earlier. Set only the SMM
+field. KubeVirt's webhook rejects SecureBoot without SMM.
+
+vCenter sessions (was 7d618f832, PVM-113): Collector.Follow now logs out
+before closing, Collector.Test and EsxHost.TestConnection release the
+client even when connect fails, and both buildClient/connect return or
+retain no half-built client after a failed Login.
+
+Resources (was c26fe9fbf + part of cb469fa97): inventory limits
+2 cpu/1Gi -> 8000m/8Gi; virt-v2v memory 8Gi -> 12Gi.
+
+Also restores PEM-8212: seed the vSphere OS map ConfigMap only when
+absent, so reconcile stops overwriting forklift-vsphere-osmap.
+
+Deliberately NOT carried: the 2.9.2 change hardcoding cpu/memory in
+setKvmOnPodSpec. v2.12.1 sets the conversion container's resources from
+VirtV2vContainerRequests/Limits settings, so hardcoding would override
+configuration that now works properly.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../forkliftcontroller/defaults/main.yml      |  6 +++--
+ .../roles/forkliftcontroller/tasks/main.yml   | 11 ++++++++
+ .../plan/adapter/vsphere/builder.go           | 12 ++++++---
+ pkg/controller/plan/adapter/vsphere/host.go   | 15 +++++++----
+ .../provider/container/vsphere/collector.go   | 26 ++++++++++++++-----
+ pkg/settings/migration.go                     |  4 ++-
+ 6 files changed, 55 insertions(+), 19 deletions(-)
+
+diff --git a/operator/roles/forkliftcontroller/defaults/main.yml b/operator/roles/forkliftcontroller/defaults/main.yml
+index 0000000..0000000 100644
+--- a/operator/roles/forkliftcontroller/defaults/main.yml
++++ b/operator/roles/forkliftcontroller/defaults/main.yml
+@@ -78,8 +78,10 @@ inventory_container_name: "{{ app_name }}-inventory"
+ inventory_service_name: "{{ app_name }}-inventory"
+ inventory_route_name: "{{ inventory_service_name }}"
+ inventory_route_timeout: "360s"
+-inventory_container_limits_cpu: "2"
+-inventory_container_limits_memory: "1Gi"
++# Spectro: upstream defaults are 2 cpu / 1Gi; the inventory container was
++# throttled and OOM-killed collecting large vSphere inventories.
++inventory_container_limits_cpu: "8000m"
++inventory_container_limits_memory: "8Gi"
+ inventory_container_requests_cpu: "500m"
+ inventory_container_requests_memory: "500Mi"
+ inventory_tls_secret_name: "{{ inventory_service_name }}-serving-cert"
+diff --git a/operator/roles/forkliftcontroller/tasks/main.yml b/operator/roles/forkliftcontroller/tasks/main.yml
+index 0000000..0000000 100644
+--- a/operator/roles/forkliftcontroller/tasks/main.yml
++++ b/operator/roles/forkliftcontroller/tasks/main.yml
+@@ -63,10 +63,21 @@
+       state : present
+       definition: "{{ lookup('template', 'controller/configmap-osmap-ovirt.yml.j2') }}"
+ 
++  # Spectro (PEM-8212): only seed the vSphere OS map when it is absent, so
++  # reconcile stops overwriting user edits to forklift-vsphere-osmap.
++  - name: "Check if vSphere OS map configmap exists"
++    k8s_info:
++      api_version: v1
++      kind: ConfigMap
++      name: "forklift-vsphere-osmap"
++      namespace: "{{ app_namespace }}"
++    register: vsphere_osmap_cm
++
+   - name: "Setup operating systems config map for vSphere"
+     k8s:
+       state : present
+       definition: "{{ lookup('template', 'controller/configmap-osmap-vsphere.yml.j2') }}"
++    when: vsphere_osmap_cm.resources|length == 0
+ 
+   - name: "Setup inventory service"
+     k8s:
+diff --git a/pkg/controller/plan/adapter/vsphere/builder.go b/pkg/controller/plan/adapter/vsphere/builder.go
+index 0000000..0000000 100644
+--- a/pkg/controller/plan/adapter/vsphere/builder.go
++++ b/pkg/controller/plan/adapter/vsphere/builder.go
+@@ -925,11 +925,15 @@ func (r *Builder) mapFirmware(vm *model.VM, object *cnv.VirtualMachineSpec) {
+ 			EFI: &cnv.EFI{
+ 				SecureBoot: &vm.SecureBoot,
+ 			}}
++		// SecureBoot requires SMM or the KubeVirt webhook rejects the VM.
++		// Upstream replaces Features wholesale here, discarding anything set
++		// earlier; only set the SMM field.
+ 		if vm.SecureBoot {
+-			object.Template.Spec.Domain.Features = &cnv.Features{
+-				SMM: &cnv.FeatureState{
+-					Enabled: &vm.SecureBoot,
+-				},
++			if object.Template.Spec.Domain.Features == nil {
++				object.Template.Spec.Domain.Features = &cnv.Features{}
++			}
++			object.Template.Spec.Domain.Features.SMM = &cnv.FeatureState{
++				Enabled: ptr.To(true),
+ 			}
+ 		}
+ 	default:
+diff --git a/pkg/controller/plan/adapter/vsphere/host.go b/pkg/controller/plan/adapter/vsphere/host.go
+index 0000000..0000000 100644
+--- a/pkg/controller/plan/adapter/vsphere/host.go
++++ b/pkg/controller/plan/adapter/vsphere/host.go
+@@ -34,10 +34,9 @@ func (r *EsxHost) TestConnection() (err error) {
+ 	ctx := context.Background()
+ 	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+ 	defer cancel()
++	// Release the session even when connect() fails part-way.
++	defer r.close()
+ 	err = r.connect(ctx)
+-	if err == nil {
+-		r.close()
+-	}
+ 	return
+ }
+ 
+@@ -98,8 +97,14 @@ func (r *EsxHost) connect(ctx context.Context) (err error) {
+ 		SessionManager: session.NewManager(vimClient),
+ 		Client:         vimClient,
+ 	}
+-	err = r.client.Login(ctx, url.User)
+-	if err != nil {
++	if err = r.client.Login(ctx, url.User); err != nil {
++		// Login failed after vim25.NewClient already opened the SOAP/HTTP
++		// stack. Best-effort logout, release keep-alive sockets, and clear the
++		// client/finder so a half-built host cannot be reused on retry.
++		_ = r.client.Logout(context.Background())
++		r.client.CloseIdleConnections()
++		r.client = nil
++		r.finder = nil
+ 		return liberr.Wrap(err)
+ 	}
+ 
+diff --git a/pkg/controller/provider/container/vsphere/collector.go b/pkg/controller/provider/container/vsphere/collector.go
+index 0000000..0000000 100644
+--- a/pkg/controller/provider/container/vsphere/collector.go
++++ b/pkg/controller/provider/container/vsphere/collector.go
+@@ -359,7 +359,14 @@ func (r *Collector) Follow(moRef interface{}, p []string, dst interface{}) error
+ 	if err != nil {
+ 		return err
+ 	}
+-	defer client.CloseIdleConnections()
++	defer func() {
++		// Every Login here must be paired with a Logout, otherwise each Follow
++		// call leaks a vCenter session for the lifetime of the inventory API.
++		if logoutErr := client.Logout(context.Background()); logoutErr != nil {
++			r.log.V(1).Info("vsphere logout (Follow) failed", "err", logoutErr)
++		}
++		client.CloseIdleConnections()
++	}()
+ 	return client.RetrieveOne(ctx, ref, p, dst)
+ }
+ 
+@@ -368,11 +375,9 @@ func (r *Collector) Test() (status int, err error) {
+ 	ctx := context.Background()
+ 	ctx, cancel := context.WithTimeout(ctx, ConnectionTimeout)
+ 	defer cancel()
++	// Release the client even when connect() fails part-way.
++	defer r.close()
+ 	status, err = r.connect(ctx)
+-	if err == nil {
+-		r.close()
+-	}
+-
+ 	return
+ }
+ 
+@@ -821,8 +826,15 @@ func (r *Collector) buildClient(ctx context.Context) (*govmomi.Client, error) {
+ 		SessionManager: session.NewManager(vimClient),
+ 		Client:         vimClient,
+ 	}
+-	err = client.Login(ctx, url.User)
+-	return client, err
++	if err = client.Login(ctx, url.User); err != nil {
++		// Mirror govmomi.NewClient: on Login failure best-effort Logout (a
++		// partial session may exist), release keep-alive sockets, and return a
++		// nil client so callers cannot reference a half-built one.
++		_ = client.Logout(context.Background())
++		client.CloseIdleConnections()
++		return nil, err
++	}
++	return client, nil
+ 
+ }
+ 
+diff --git a/pkg/settings/migration.go b/pkg/settings/migration.go
+index 0000000..0000000 100644
+--- a/pkg/settings/migration.go
++++ b/pkg/settings/migration.go
+@@ -328,7 +328,9 @@ func (r *Migration) Load() (err error) {
+ 	if val, found := os.LookupEnv(VirtV2vContainerLimitsMemory); found {
+ 		r.VirtV2vContainerLimitsMemory = val
+ 	} else {
+-		r.VirtV2vContainerLimitsMemory = "8Gi"
++		// Spectro: 8Gi upstream. virt-v2v converting large Windows guests was
++		// OOM-killed at 8Gi.
++		r.VirtV2vContainerLimitsMemory = "12Gi"
+ 	}
+ 	if val, found := os.LookupEnv(VirtV2vContainerRequestsCpu); found {
+ 		r.VirtV2vContainerRequestsCpu = val
