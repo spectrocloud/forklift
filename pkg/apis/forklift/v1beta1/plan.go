@@ -256,6 +256,14 @@ type PlanSpec struct {
 	// direct SCSI access, such as shared storage clusters or database applications.
 	// +optional
 	RDMAsLun bool `json:"rdmAsLun,omitempty"`
+	// SCSIReservation controls whether SCSI persistent reservation is enabled for
+	// shared RDM LUN disks. Requires rdmAsLun=true to have any effect.
+	// When false (default), shared RDM LUNs are migrated without persistent reservation.
+	// When true, shared RDM LUNs are configured with KubeVirt lun.reservation=true,
+	// which is required for workloads that use SCSI PR-based fencing (e.g. shared-disk clusters).
+	// Can be overridden per VM via spec.vms[].scsiReservation.
+	// +optional
+	SCSIReservation bool `json:"scsiReservation,omitempty"`
 	// DeleteGuestConversionPod determines if the guest conversion pod should be deleted after successful migration.
 	// Note:
 	//   - If this option is enabled and migration succeeds then the pod will get deleted. However the VM could still not boot and the virt-v2v logs, with additional information, will be deleted alongside guest conversion pod.
@@ -404,6 +412,10 @@ type PlanStatus struct {
 	// The most recent generation observed by the controller.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// NetAppShiftDestination indicates whether the plan's storage map resolves to a NetApp
+	// Shift/Trident destination StorageClass.
+	// +optional
+	NetAppShiftDestination bool `json:"netAppShiftDestination,omitempty"`
 	// Migration
 	Migration plan.MigrationStatus `json:"migration,omitempty"`
 }
@@ -438,12 +450,15 @@ func (p *Plan) IsWarm() bool {
 // just use virt-v2v directly to convert the vm while copying data over. In other
 // cases, we use CDI to transfer disks to the destination cluster and then use
 // virt-v2v-in-place to convert these disks after cutover.
-func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref, destinationClient k8sclient.Client) (bool, error) {
-	source := p.Referenced.Provider.Source
+//
+// Note: this is called once per VM from several places (adapters, scheduler, migrator,
+// kubevirt.go, migration.go) on every reconcile, so it must not perform any API/client calls itself.
+func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref) (bool, error) {
+	source := p.Provider.Source
 	if source == nil {
 		return false, liberr.New("Cannot analyze plan, source provider is missing.")
 	}
-	destination := p.Referenced.Provider.Destination
+	destination := p.Provider.Destination
 	if destination == nil {
 		return false, liberr.New("Cannot analyze plan, destination provider is missing.")
 	}
@@ -467,6 +482,10 @@ func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref, destinationClient k8sclien
 	default:
 		return false, nil
 	}
+}
+
+func (p *Plan) HasNetAppShiftDestination() bool {
+	return p.Status.NetAppShiftDestination
 }
 
 func (r *Plan) DestinationHasUdnNetwork(client k8sclient.Client) bool {
@@ -543,7 +562,7 @@ func (r *Plan) IsUsingOffloadPlugin() bool {
 	}
 	dsMapIn := r.Map.Storage.Spec.Map
 	for _, m := range dsMapIn {
-		if m.OffloadPlugin != nil && m.OffloadPlugin.VSphereXcopyPluginConfig != nil {
+		if m.OffloadPlugin != nil && (m.OffloadPlugin.VSphereXcopyPluginConfig != nil || m.OffloadPlugin.CsiVolumeImport != nil) {
 			return true
 		}
 	}

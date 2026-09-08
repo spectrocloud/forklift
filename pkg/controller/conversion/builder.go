@@ -362,6 +362,13 @@ func (b *Builder) GetDeepInspectionPodSpec(volumes []core.Volume, volumeMounts [
 	}
 
 	seccompProfile := core.SeccompProfile{Type: core.SeccompProfileTypeRuntimeDefault}
+	if settings.Settings.OpenShift {
+		unshare := "profiles/unshare.json"
+		seccompProfile = core.SeccompProfile{
+			Type:             core.SeccompProfileTypeLocalhost,
+			LocalhostProfile: &unshare,
+		}
+	}
 
 	podLabels := make(map[string]string)
 	if cfg.PodLabels != nil {

@@ -5,7 +5,9 @@ import (
 	"fmt"
 
 	v1beta1 "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
+	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
+	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
 	"github.com/kubev2v/forklift/pkg/controller/provider/model/vsphere"
 	model "github.com/kubev2v/forklift/pkg/controller/provider/web/vsphere"
@@ -20,11 +22,39 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	cnv "kubevirt.io/api/core/v1"
+	cdi "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 var builderLog = logging.WithName("vsphere-builder-test")
+
+var _ = Describe("shouldIncludeNetwork", func() {
+	manual := string(types.NetIpConfigInfoIpAddressOriginManual)
+	linklayer := string(types.NetIpConfigInfoIpAddressOriginLinklayer)
+	dhcp := string(types.NetIpConfigInfoIpAddressOriginDhcp)
+
+	DescribeTable("filters correctly",
+		func(ip, origin string, isWindows, expected bool) {
+			gn := vsphere.GuestNetwork{IP: ip, Origin: origin, MAC: "00:11:22:33:44:55"}
+			Expect(shouldIncludeNetwork(gn, isWindows)).To(Equal(expected))
+		},
+		// Linux: include everything except link-local
+		Entry("Linux manual IPv4", "10.0.0.1", manual, false, true),
+		Entry("Linux manual IPv6", "2620:52::1", manual, false, true),
+		Entry("Linux DHCP IPv4", "10.0.0.2", dhcp, false, true),
+		Entry("Linux SLAAC IPv6", "2620:52::19", linklayer, false, true),
+		Entry("Linux link-local IPv4", "169.254.1.1", manual, false, false),
+		Entry("Linux link-local IPv6", "fe80::1", manual, false, false),
+		// Windows: only manual, never SLAAC
+		Entry("Windows manual IPv4", "192.168.1.1", manual, true, true),
+		Entry("Windows manual IPv6", "2620:52::baad", manual, true, true),
+		Entry("Windows SLAAC IPv6", "2620:52::19", linklayer, true, false),
+		Entry("Windows DHCP IPv4", "10.0.0.5", dhcp, true, false),
+		Entry("Windows link-local IPv6", "fe80::1", linklayer, true, false),
+	)
+})
 
 const ManualOrigin = string(types.NetIpConfigInfoIpAddressOriginManual)
 
@@ -139,7 +169,7 @@ var _ = Describe("vSphere builder", func() {
 				vm: vm,
 			}
 			builder.Source.Inventory = inventory
-			builder.Context.Map.Storage = &storageMap
+			builder.Map.Storage = &storageMap
 
 			// Execute
 			pvcs, err := builder.PopulatorVolumes(ref.Ref{ID: vm.ID}, annotations, secretName)
@@ -207,7 +237,7 @@ var _ = Describe("vSphere builder", func() {
 				vm: vm,
 			}
 			builder.Source.Inventory = inventory
-			builder.Context.Map.Storage = &storageMap
+			builder.Map.Storage = &storageMap
 
 			// Execute
 			pvcs, err := builder.PopulatorVolumes(ref.Ref{ID: vm.ID}, annotations, secretName)
@@ -620,10 +650,10 @@ var _ = Describe("vSphere builder", func() {
 				},
 				{
 					MAC:          "00:50:56:83:25:47",
-					IP:           "fe80::5da:b7a5:e0a2:a097",
+					IP:           "2001:db8::97",
 					Origin:       ManualOrigin,
 					PrefixLength: 64,
-					DNS:          []string{"fec0:0:0:ffff::1", "fec0:0:0:ffff::2", "fec0:0:0:ffff::3"},
+					DNS:          []string{"2001:db8:1::1", "2001:db8:1::2", "2001:db8:1::3"},
 				},
 			},
 			GuestIpStacks: []vsphere.GuestIpStack{
@@ -632,11 +662,11 @@ var _ = Describe("vSphere builder", func() {
 					Network: "0.0.0.0",
 				},
 				{
-					Gateway: "fe80::5da:b7a5:e0a2:a095",
-					Network: "0.0.0.0",
+					Gateway: "2001:db8::1",
+					Network: "::",
 				},
 			},
-		}, "00:50:56:83:25:47:ip:172.29.3.193,172.29.3.1,16,8.8.8.8_00:50:56:83:25:47:ip:fe80::5da:b7a5:e0a2:a097,fe80::5da:b7a5:e0a2:a095,64,fec0:0:0:ffff::1,fec0:0:0:ffff::2,fec0:0:0:ffff::3"),
+		}, "00:50:56:83:25:47:ip:172.29.3.193,172.29.3.1,16,8.8.8.8_00:50:56:83:25:47:ip:2001:db8::97,2001:db8::1,64,2001:db8:1::1,2001:db8:1::2,2001:db8:1::3"),
 		Entry("non-static ip", &model.VM{GuestID: "windows9Guest", GuestNetworks: []vsphere.GuestNetwork{{MAC: "00:50:56:83:25:47", IP: "172.29.3.193", Origin: string(types.NetIpConfigInfoIpAddressOriginDhcp)}}}, ""),
 		Entry("non windows vm", &model.VM{GuestID: "other", GuestNetworks: []vsphere.GuestNetwork{{MAC: "00:50:56:83:25:47", IP: "172.29.3.193", Origin: ManualOrigin}}}, "00:50:56:83:25:47:ip:172.29.3.193,,0"),
 		Entry("no OS vm", &model.VM{GuestNetworks: []vsphere.GuestNetwork{{MAC: "00:50:56:83:25:47", IP: "172.29.3.193", Origin: ManualOrigin}}}, "00:50:56:83:25:47:ip:172.29.3.193,,0"),
@@ -644,6 +674,7 @@ var _ = Describe("vSphere builder", func() {
 			GuestID: "windows9Guest",
 			GuestNetworks: []vsphere.GuestNetwork{
 				{
+					Device:       "0",
 					MAC:          "00:50:56:83:25:47",
 					IP:           "172.29.3.193",
 					Origin:       ManualOrigin,
@@ -651,13 +682,15 @@ var _ = Describe("vSphere builder", func() {
 					DNS:          []string{"8.8.8.8"},
 				},
 				{
+					Device:       "0",
 					MAC:          "00:50:56:83:25:47",
-					IP:           "fe80::5da:b7a5:e0a2:a097",
+					IP:           "2620:52:9:162e::97",
 					Origin:       ManualOrigin,
 					PrefixLength: 64,
-					DNS:          []string{"fec0:0:0:ffff::1", "fec0:0:0:ffff::2", "fec0:0:0:ffff::3"},
+					DNS:          []string{"2620:52:9:162e::1", "2620:52:9:162e::2", "2620:52:9:162e::3"},
 				},
 				{
+					Device:       "1",
 					MAC:          "00:50:56:83:25:48",
 					IP:           "172.29.3.192",
 					Origin:       ManualOrigin,
@@ -665,87 +698,37 @@ var _ = Describe("vSphere builder", func() {
 					DNS:          []string{"4.4.4.4"},
 				},
 				{
+					Device:       "1",
 					MAC:          "00:50:56:83:25:48",
-					IP:           "fe80::5da:b7a5:e0a2:a090",
+					IP:           "2620:52:9:162e::90",
 					Origin:       ManualOrigin,
 					PrefixLength: 32,
-					DNS:          []string{"fec0:0:0:ffff::4", "fec0:0:0:ffff::5", "fec0:0:0:ffff::6"},
+					DNS:          []string{"2620:52:9:162e::4", "2620:52:9:162e::5", "2620:52:9:162e::6"},
 				},
 			},
 			GuestIpStacks: []vsphere.GuestIpStack{
 				{
+					Device:  "0",
 					Gateway: "172.29.3.2",
 					Network: "0.0.0.0",
 				},
 				{
-					Gateway: "fe80::5da:b7a5:e0a2:a098",
-					Network: "0.0.0.0",
+					Device:  "0",
+					Gateway: "2620:52:9:162e::98",
+					Network: "::",
 				},
 				{
+					Device:  "1",
 					Gateway: "172.29.3.1",
 					Network: "0.0.0.0",
 				},
 				{
-					Gateway: "fe80::5da:b7a5:e0a2:a095",
-					Network: "0.0.0.0",
+					Device:  "1",
+					Gateway: "2620:52:9:162e::95",
+					Network: "::",
 				},
 			},
-		}, "00:50:56:83:25:47:ip:172.29.3.193,172.29.3.1,16,8.8.8.8_00:50:56:83:25:47:ip:fe80::5da:b7a5:e0a2:a097,fe80::5da:b7a5:e0a2:a095,64,fec0:0:0:ffff::1,fec0:0:0:ffff::2,fec0:0:0:ffff::3_00:50:56:83:25:48:ip:172.29.3.192,172.29.3.1,24,4.4.4.4_00:50:56:83:25:48:ip:fe80::5da:b7a5:e0a2:a090,fe80::5da:b7a5:e0a2:a095,32,fec0:0:0:ffff::4,fec0:0:0:ffff::5,fec0:0:0:ffff::6"),
-		Entry("single static ip without DNS", &model.VM{
-			GuestID: "windows9Guest",
-			GuestNetworks: []vsphere.GuestNetwork{
-				{
-					MAC:          "00:50:56:83:25:47",
-					IP:           "172.29.3.193",
-					Origin:       ManualOrigin,
-					PrefixLength: 16,
-				}},
-			GuestIpStacks: []vsphere.GuestIpStack{
-				{
-					Gateway: "172.29.3.1",
-					Network: "0.0.0.0",
-				}},
-		}, "00:50:56:83:25:47:ip:172.29.3.193,172.29.3.1,16"),
-		Entry("gateway from different subnet", &model.VM{
-			GuestID: "windows9Guest",
-			GuestNetworks: []vsphere.GuestNetwork{
-				{
-					MAC:          "00:50:56:83:25:47",
-					IP:           "172.29.3.193",
-					Origin:       ManualOrigin,
-					PrefixLength: 24,
-					DNS:          []string{"8.8.8.8"},
-				}},
-			GuestIpStacks: []vsphere.GuestIpStack{
-				{
-					Gateway: "172.29.4.1",
-					Network: "0.0.0.0",
-				}},
-		}, "00:50:56:83:25:47:ip:172.29.3.193,172.29.4.1,24,8.8.8.8"),
-		Entry("multiple gateways with different networks", &model.VM{
-			GuestID: "windows9Guest",
-			GuestNetworks: []vsphere.GuestNetwork{
-				{
-					MAC:          "00:50:56:83:25:47",
-					IP:           "172.29.3.193",
-					Origin:       ManualOrigin,
-					PrefixLength: 24,
-					DNS:          []string{"8.8.8.8"},
-				}},
-			GuestIpStacks: []vsphere.GuestIpStack{
-				{
-					Gateway: "10.10.10.2",
-					Network: "10.10.10.1",
-				},
-				{
-					Gateway: "172.29.3.1",
-					Network: "0.0.0.0",
-				},
-				{
-					Gateway: "10.10.10.1",
-					Network: "10.10.10.0",
-				}},
-		}, "00:50:56:83:25:47:ip:172.29.3.193,172.29.3.1,24,8.8.8.8"),
+		}, "00:50:56:83:25:47:ip:172.29.3.193,172.29.3.2,16,8.8.8.8_00:50:56:83:25:48:ip:172.29.3.192,172.29.3.1,24,4.4.4.4_00:50:56:83:25:47:ip:2620:52:9:162e::97,2620:52:9:162e::98,64,2620:52:9:162e::1,2620:52:9:162e::2,2620:52:9:162e::3_00:50:56:83:25:48:ip:2620:52:9:162e::90,2620:52:9:162e::95,32,2620:52:9:162e::4,2620:52:9:162e::5,2620:52:9:162e::6"),
 	)
 
 	DescribeTable("should", func(disks []vsphere.Disk, output []vsphere.Disk) {
@@ -898,7 +881,550 @@ var _ = Describe("vSphere builder", func() {
 			},
 		),
 	)
+
+	DescribeTable("should set instance UUID if available", func(instanceUUID, biosUUID, expectedUUID string) {
+		builder := createBuilder(
+			&core.Secret{
+				ObjectMeta: meta.ObjectMeta{Name: "storage-test-secret", Namespace: "test"},
+				Data: map[string][]byte{
+					"storagekey": []byte("storageval"),
+				},
+			},
+			&core.Secret{
+				ObjectMeta: meta.ObjectMeta{Name: "migration-test-secret", Namespace: "test"},
+				Data: map[string][]byte{
+					"providerkey": []byte("providerval"),
+				},
+			},
+			&core.Secret{
+				ObjectMeta: meta.ObjectMeta{Name: "offload-ssh-keys-test-vsphere-provider-private", Namespace: "test"},
+				Data: map[string][]byte{
+					"private-key": []byte("fake-private-key"),
+				},
+			},
+			&core.Secret{
+				ObjectMeta: meta.ObjectMeta{Name: "offload-ssh-keys-test-vsphere-provider-public", Namespace: "test"},
+				Data: map[string][]byte{
+					"public-key": []byte("fake-public-key"),
+				},
+			},
+			&core.PersistentVolumeClaim{
+				ObjectMeta: meta.ObjectMeta{Name: "test-pvc", Namespace: "test"},
+			},
+		)
+		cdiCDI := &cdi.CDI{
+			ObjectMeta: meta.ObjectMeta{
+				Name: "test-cdi",
+			},
+		}
+		cdiCDI.Status.ObservedVersion = "4.22.1"
+		_ = cdi.AddToScheme(builder.Destination.Scheme())
+		err := builder.Destination.Create(context.TODO(), cdiCDI)
+		Expect(err).ToNot(HaveOccurred())
+		vm := model.VM{
+			InstanceUUID: instanceUUID,
+			UUID:         biosUUID,
+			VM1: model.VM1{
+				VM0: model.VM0{ID: "vm-2", Name: "vm"},
+				Disks: []vsphere.Disk{
+					{
+						Datastore: vsphere.Ref{ID: "ds-2"},
+						File:      "[datastore2] vm-2/vm-2.vmdk",
+						Bus:       vsphere.SCSI, Capacity: 1 << 20, Key: 2000,
+					},
+				},
+			},
+		}
+		builder.Source.Inventory = &mockInventory{ds: model.Datastore{Resource: model.Resource{ID: "ds-2"}}, vm: vm}
+		builder.Map.Storage = &v1beta1.StorageMap{
+			Spec: v1beta1.StorageMapSpec{
+				Map: []v1beta1.StoragePair{{
+					Source: ref.Ref{ID: "ds-2"},
+					Destination: v1beta1.DestinationStorage{
+						StorageClass: "test-sc",
+						AccessMode:   core.ReadWriteOnce,
+						VolumeMode:   core.PersistentVolumeFilesystem,
+					},
+					OffloadPlugin: &v1beta1.OffloadPlugin{
+						VSphereXcopyPluginConfig: &v1beta1.VSphereXcopyPluginConfig{
+							StorageVendorProduct: "test-vendor",
+							SecretRef:            "migration-test-secret",
+						},
+					},
+				}},
+			},
+		}
+		builder.Plan.Spec.Type = v1beta1.MigrationWarm
+		builder.Plan.Status.Migration.VMs = []*plan.VMStatus{
+			{
+				VM: plan.VM{
+					Ref: ref.Ref{ID: vm.ID, Name: vm.Name},
+				},
+				Warm: &plan.Warm{},
+			},
+		}
+		pvcs, err := builder.PopulatorVolumes(ref.Ref{ID: vm.ID}, map[string]string{}, "migration-test-secret")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(pvcs).To(HaveLen(1))
+		Expect(pvcs[0].Annotations[planbase.AnnUUID]).To(Equal(expectedUUID))
+	},
+		Entry("should set instance UUID correctly", "12345", "", "12345"),
+		Entry("should set BIOS UUID if instance UUID is missing", "", "54321", "54321"),
+	)
 })
+
+var _ = Describe("PopulatorOffloadInfo", func() {
+	It("should return xcopyUsed when populator CR has the field set", func() {
+		populatorCr := &v1beta1.VSphereXcopyVolumePopulator{
+			ObjectMeta: meta.ObjectMeta{
+				Name:      "test-pop",
+				Namespace: "test",
+				Labels: map[string]string{
+					"migration": "123",
+					"vmdkKey":   "2000",
+					"vmID":      "vm-1",
+				},
+			},
+			Spec: v1beta1.VSphereXcopyVolumePopulatorSpec{
+				VmId: "vm-1",
+			},
+			Status: v1beta1.VSphereXcopyVolumePopulatorStatus{
+				Progress:  "100",
+				XcopyUsed: "1",
+			},
+		}
+		builder := createBuilder(populatorCr)
+		pvc := &core.PersistentVolumeClaim{
+			ObjectMeta: meta.ObjectMeta{
+				Name:      "test-pvc",
+				Namespace: "test",
+				Labels: map[string]string{
+					"vmdkKey": "2000",
+					"vmID":    "vm-1",
+				},
+			},
+		}
+
+		info, err := builder.PopulatorOffloadInfo(pvc)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(info).To(HaveKeyWithValue("xcopyUsed", "1"))
+	})
+
+	It("should omit xcopyUsed when it is empty", func() {
+		populatorCr := &v1beta1.VSphereXcopyVolumePopulator{
+			ObjectMeta: meta.ObjectMeta{
+				Name:      "test-pop",
+				Namespace: "test",
+				Labels: map[string]string{
+					"migration": "123",
+					"vmdkKey":   "2000",
+					"vmID":      "vm-1",
+				},
+			},
+			Spec: v1beta1.VSphereXcopyVolumePopulatorSpec{
+				VmId: "vm-1",
+			},
+			Status: v1beta1.VSphereXcopyVolumePopulatorStatus{
+				Progress: "50",
+			},
+		}
+		builder := createBuilder(populatorCr)
+		pvc := &core.PersistentVolumeClaim{
+			ObjectMeta: meta.ObjectMeta{
+				Name:      "test-pvc",
+				Namespace: "test",
+				Labels: map[string]string{
+					"vmdkKey": "2000",
+					"vmID":    "vm-1",
+				},
+			},
+		}
+
+		info, err := builder.PopulatorOffloadInfo(pvc)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(info).NotTo(HaveKey("xcopyUsed"))
+	})
+
+	It("should return error when populator CR is not found", func() {
+		builder := createBuilder()
+		pvc := &core.PersistentVolumeClaim{
+			ObjectMeta: meta.ObjectMeta{
+				Name:      "test-pvc",
+				Namespace: "test",
+				Labels: map[string]string{
+					"vmdkKey": "2000",
+					"vmID":    "vm-1",
+				},
+			},
+		}
+
+		_, err := builder.PopulatorOffloadInfo(pvc)
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("should return all completion metric fields when set", func() {
+		populatorCr := &v1beta1.VSphereXcopyVolumePopulator{
+			ObjectMeta: meta.ObjectMeta{
+				Name:      "test-pop",
+				Namespace: "test",
+				Labels: map[string]string{
+					"migration": "123",
+					"vmdkKey":   "2000",
+					"vmID":      "vm-1",
+				},
+			},
+			Spec: v1beta1.VSphereXcopyVolumePopulatorSpec{
+				VmId: "vm-1",
+			},
+			Status: v1beta1.VSphereXcopyVolumePopulatorStatus{
+				Progress:            "100",
+				XcopyUsed:           "1",
+				CopyDurationSeconds: "42.5",
+				Result:              "success",
+				StorageVendor:       "ontap",
+				CloneMethod:         "vib",
+				StorageProtocol:     "iscsi",
+				ProvisionedBytes:    "1.073741824e+10",
+				AllocatedBytes:      "5.36870912e+09",
+			},
+		}
+		builder := createBuilder(populatorCr)
+		pvc := &core.PersistentVolumeClaim{
+			ObjectMeta: meta.ObjectMeta{
+				Name:      "test-pvc",
+				Namespace: "test",
+				Labels: map[string]string{
+					"vmdkKey": "2000",
+					"vmID":    "vm-1",
+				},
+			},
+		}
+
+		info, err := builder.PopulatorOffloadInfo(pvc)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(info).To(HaveKeyWithValue("xcopyUsed", "1"))
+		Expect(info).To(HaveKeyWithValue("copyDurationSeconds", "42.5"))
+		Expect(info).To(HaveKeyWithValue("result", "success"))
+		Expect(info).To(HaveKeyWithValue("storageVendor", "ontap"))
+		Expect(info).To(HaveKeyWithValue("cloneMethod", "vib"))
+		Expect(info).To(HaveKeyWithValue("storageProtocol", "iscsi"))
+		Expect(info).To(HaveKeyWithValue("provisionedBytes", "1.073741824e+10"))
+		Expect(info).To(HaveKeyWithValue("allocatedBytes", "5.36870912e+09"))
+	})
+
+	It("should return xcopyUsed=0 when xcopy was not used", func() {
+		populatorCr := &v1beta1.VSphereXcopyVolumePopulator{
+			ObjectMeta: meta.ObjectMeta{
+				Name:      "test-pop",
+				Namespace: "test",
+				Labels: map[string]string{
+					"migration": "123",
+					"vmdkKey":   "2000",
+					"vmID":      "vm-1",
+				},
+			},
+			Spec: v1beta1.VSphereXcopyVolumePopulatorSpec{
+				VmId: "vm-1",
+			},
+			Status: v1beta1.VSphereXcopyVolumePopulatorStatus{
+				Progress:  "100",
+				XcopyUsed: "0",
+			},
+		}
+		builder := createBuilder(populatorCr)
+		pvc := &core.PersistentVolumeClaim{
+			ObjectMeta: meta.ObjectMeta{
+				Name:      "test-pvc",
+				Namespace: "test",
+				Labels: map[string]string{
+					"vmdkKey": "2000",
+					"vmID":    "vm-1",
+				},
+			},
+		}
+
+		info, err := builder.PopulatorOffloadInfo(pvc)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(info).To(HaveKeyWithValue("xcopyUsed", "0"))
+	})
+})
+
+var _ = Describe("mapDisks SCSI reservation", func() {
+	var builder *Builder
+
+	BeforeEach(func() {
+		builder = createBuilder()
+	})
+
+	buildPVC := func(diskFile string) *core.PersistentVolumeClaim {
+		return &core.PersistentVolumeClaim{
+			ObjectMeta: meta.ObjectMeta{
+				Name:      "test-pvc",
+				Namespace: "test",
+				Annotations: map[string]string{
+					"forklift.konveyor.io/disk-source": diskFile,
+				},
+			},
+		}
+	}
+
+	It("should set Reservation and ErrorPolicy on shared RDM LUN disk when scsiReservation is enabled", func() {
+		builder.Plan.Spec.RDMAsLun = true
+		builder.Plan.Spec.SCSIReservation = true
+		vm := &model.VM{
+			VM1: model.VM1{
+				VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				Disks: []vsphere.Disk{
+					{
+						Key:      2000,
+						File:     "[ds1] vm/disk.vmdk",
+						Capacity: 1 << 30,
+						RDM:      true,
+						Shared:   true,
+						Bus:      vsphere.SCSI,
+					},
+				},
+			},
+		}
+		pvcs := []*core.PersistentVolumeClaim{buildPVC("[ds1] vm/disk.vmdk")}
+		spec := &cnv.VirtualMachineSpec{Template: &cnv.VirtualMachineInstanceTemplateSpec{}}
+
+		err := builder.mapDisks(vm, ref.Ref{ID: "vm-1"}, pvcs, spec, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(spec.Template.Spec.Domain.Devices.Disks).To(HaveLen(1))
+		disk := spec.Template.Spec.Domain.Devices.Disks[0]
+		Expect(disk.LUN).NotTo(BeNil())
+		Expect(disk.LUN.Bus).To(Equal(cnv.DiskBusSCSI))
+		Expect(disk.LUN.Reservation).To(BeTrue())
+		Expect(disk.Shareable).To(Equal(ptr.To(true)))
+		Expect(disk.ErrorPolicy).To(Equal(ptr.To(cnv.DiskErrorPolicyReport)))
+	})
+
+	It("should NOT set Reservation when disk is RDM+LUN but not shared", func() {
+		builder.Plan.Spec.RDMAsLun = true
+		vm := &model.VM{
+			VM1: model.VM1{
+				VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				Disks: []vsphere.Disk{
+					{
+						Key:      2000,
+						File:     "[ds1] vm/disk.vmdk",
+						Capacity: 1 << 30,
+						RDM:      true,
+						Shared:   false,
+						Bus:      vsphere.SCSI,
+					},
+				},
+			},
+		}
+		pvcs := []*core.PersistentVolumeClaim{buildPVC("[ds1] vm/disk.vmdk")}
+		spec := &cnv.VirtualMachineSpec{Template: &cnv.VirtualMachineInstanceTemplateSpec{}}
+
+		err := builder.mapDisks(vm, ref.Ref{ID: "vm-1"}, pvcs, spec, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		disk := spec.Template.Spec.Domain.Devices.Disks[0]
+		Expect(disk.LUN).NotTo(BeNil())
+		Expect(disk.LUN.Reservation).To(BeFalse())
+		Expect(disk.Shareable).To(BeNil())
+		Expect(disk.ErrorPolicy).To(BeNil())
+	})
+
+	It("should NOT set LUN or Reservation when disk is shared but not RDM", func() {
+		builder.Plan.Spec.RDMAsLun = true
+		vm := &model.VM{
+			VM1: model.VM1{
+				VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				Disks: []vsphere.Disk{
+					{
+						Key:      2000,
+						File:     "[ds1] vm/disk.vmdk",
+						Capacity: 1 << 30,
+						RDM:      false,
+						Shared:   true,
+						Bus:      vsphere.SCSI,
+					},
+				},
+			},
+		}
+		pvcs := []*core.PersistentVolumeClaim{buildPVC("[ds1] vm/disk.vmdk")}
+		spec := &cnv.VirtualMachineSpec{Template: &cnv.VirtualMachineInstanceTemplateSpec{}}
+
+		err := builder.mapDisks(vm, ref.Ref{ID: "vm-1"}, pvcs, spec, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		disk := spec.Template.Spec.Domain.Devices.Disks[0]
+		Expect(disk.LUN).To(BeNil())
+		Expect(disk.Disk).NotTo(BeNil())
+		Expect(disk.Shareable).To(Equal(ptr.To(true)))
+		Expect(disk.ErrorPolicy).To(BeNil())
+	})
+
+	It("should NOT set Reservation when rdmAsLun is false", func() {
+		builder.Plan.Spec.RDMAsLun = false
+		vm := &model.VM{
+			VM1: model.VM1{
+				VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				Disks: []vsphere.Disk{
+					{
+						Key:      2000,
+						File:     "[ds1] vm/disk.vmdk",
+						Capacity: 1 << 30,
+						RDM:      true,
+						Shared:   true,
+						Bus:      vsphere.SCSI,
+					},
+				},
+			},
+		}
+		pvcs := []*core.PersistentVolumeClaim{buildPVC("[ds1] vm/disk.vmdk")}
+		spec := &cnv.VirtualMachineSpec{Template: &cnv.VirtualMachineInstanceTemplateSpec{}}
+
+		err := builder.mapDisks(vm, ref.Ref{ID: "vm-1"}, pvcs, spec, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		disk := spec.Template.Spec.Domain.Devices.Disks[0]
+		Expect(disk.LUN).To(BeNil())
+		Expect(disk.Disk).NotTo(BeNil())
+		Expect(disk.Shareable).To(Equal(ptr.To(true)))
+		Expect(disk.ErrorPolicy).To(BeNil())
+	})
+
+	It("should NOT set Reservation on shared RDM LUN disk when scsiReservation flag is disabled (default)", func() {
+		builder.Plan.Spec.RDMAsLun = true
+		// SCSIReservation defaults to false — reservation must stay off
+		vm := &model.VM{
+			VM1: model.VM1{
+				VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				Disks: []vsphere.Disk{
+					{
+						Key:      2000,
+						File:     "[ds1] vm/disk.vmdk",
+						Capacity: 1 << 30,
+						RDM:      true,
+						Shared:   true,
+						Bus:      vsphere.SCSI,
+					},
+				},
+			},
+		}
+		pvcs := []*core.PersistentVolumeClaim{buildPVC("[ds1] vm/disk.vmdk")}
+		spec := &cnv.VirtualMachineSpec{Template: &cnv.VirtualMachineInstanceTemplateSpec{}}
+
+		err := builder.mapDisks(vm, ref.Ref{ID: "vm-1"}, pvcs, spec, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		disk := spec.Template.Spec.Domain.Devices.Disks[0]
+		Expect(disk.LUN).NotTo(BeNil())
+		Expect(disk.LUN.Reservation).To(BeFalse())
+		Expect(disk.Shareable).To(Equal(ptr.To(true)))
+	})
+
+	It("should set Reservation when VM-level scsiReservation overrides a disabled plan-level flag", func() {
+		builder.Plan.Spec.RDMAsLun = true
+		builder.Plan.Spec.SCSIReservation = false
+		scsiReservation := true
+		builder.Plan.Spec.VMs = []plan.VM{
+			{
+				Ref:             ref.Ref{ID: "vm-1"},
+				SCSIReservation: &scsiReservation,
+			},
+		}
+		vm := &model.VM{
+			VM1: model.VM1{
+				VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				Disks: []vsphere.Disk{
+					{
+						Key:      2000,
+						File:     "[ds1] vm/disk.vmdk",
+						Capacity: 1 << 30,
+						RDM:      true,
+						Shared:   true,
+						Bus:      vsphere.SCSI,
+					},
+				},
+			},
+		}
+		pvcs := []*core.PersistentVolumeClaim{buildPVC("[ds1] vm/disk.vmdk")}
+		spec := &cnv.VirtualMachineSpec{Template: &cnv.VirtualMachineInstanceTemplateSpec{}}
+
+		err := builder.mapDisks(vm, ref.Ref{ID: "vm-1"}, pvcs, spec, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		disk := spec.Template.Spec.Domain.Devices.Disks[0]
+		Expect(disk.LUN).NotTo(BeNil())
+		Expect(disk.LUN.Reservation).To(BeTrue())
+		Expect(disk.Shareable).To(Equal(ptr.To(true)))
+		Expect(disk.ErrorPolicy).To(Equal(ptr.To(cnv.DiskErrorPolicyReport)))
+	})
+
+	It("should NOT set Reservation when VM-level scsiReservation overrides an enabled plan-level flag", func() {
+		builder.Plan.Spec.RDMAsLun = true
+		builder.Plan.Spec.SCSIReservation = true
+		scsiReservation := false
+		builder.Plan.Spec.VMs = []plan.VM{
+			{
+				Ref:             ref.Ref{ID: "vm-1"},
+				SCSIReservation: &scsiReservation,
+			},
+		}
+		vm := &model.VM{
+			VM1: model.VM1{
+				VM0: model.VM0{ID: "vm-1", Name: "test-vm"},
+				Disks: []vsphere.Disk{
+					{
+						Key:      2000,
+						File:     "[ds1] vm/disk.vmdk",
+						Capacity: 1 << 30,
+						RDM:      true,
+						Shared:   true,
+						Bus:      vsphere.SCSI,
+					},
+				},
+			},
+		}
+		pvcs := []*core.PersistentVolumeClaim{buildPVC("[ds1] vm/disk.vmdk")}
+		spec := &cnv.VirtualMachineSpec{Template: &cnv.VirtualMachineInstanceTemplateSpec{}}
+
+		err := builder.mapDisks(vm, ref.Ref{ID: "vm-1"}, pvcs, spec, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		disk := spec.Template.Spec.Domain.Devices.Disks[0]
+		Expect(disk.LUN).NotTo(BeNil())
+		Expect(disk.LUN.Reservation).To(BeFalse())
+		Expect(disk.Shareable).To(Equal(ptr.To(true)))
+	})
+})
+
+var _ = DescribeTable("instance UUID check", func(cdiVersion string, expected bool) {
+	builder := createBuilder()
+	cdiCDI := &cdi.CDI{
+		ObjectMeta: meta.ObjectMeta{
+			Name: "test-cdi",
+		},
+	}
+	cdiCDI.Status.ObservedVersion = cdiVersion
+	_ = cdi.AddToScheme(builder.Destination.Scheme())
+	err := builder.Destination.Create(context.TODO(), cdiCDI)
+	Expect(err).ToNot(HaveOccurred())
+	Expect(builder.canUseInstanceUUID()).To(Equal(expected))
+},
+	Entry("should use instance UUIDs on 4.22.1", "4.22.1", true),
+	Entry("should use instance UUIDs on 4.22.2", "4.22.2", true),
+	Entry("should use instance UUIDs on 4.22.3", "4.22.3", true),
+	Entry("should use instance UUIDs on 4.21.9", "4.21.9", true),
+	Entry("should use instance UUIDs on 4.21.200", "4.21.200", true),
+	Entry("should use instance UUIDs on 4.20.16", "4.20.16", true),
+	Entry("should use instance UUIDs on 4.20.17", "4.20.17", true),
+	Entry("should use instance UUIDs on 4.23.0", "4.23.0", true),
+	Entry("should use instance UUIDs on upstream 1.65.0", "1.65.0", true),
+	Entry("should not use instance UUIDs on 4.22.0", "4.22.0", false),
+	Entry("should not use instance UUIDs on 4.21.2", "4.21.2", false),
+	Entry("should not use instance UUIDs on 4.20.0", "4.20.0", false),
+	Entry("should not use instance UUIDs on 4.19.0", "4.19.0", false),
+	Entry("should not use instance UUIDs on 4.18.5", "4.18.5", false),
+)
 
 //nolint:errcheck
 func createBuilder(objs ...runtime.Object) *Builder {
@@ -915,6 +1441,12 @@ func createBuilder(objs ...runtime.Object) *Builder {
 		Context: &plancontext.Context{
 			Destination: plancontext.Destination{
 				Client: client,
+				Provider: &v1beta1.Provider{
+					ObjectMeta: meta.ObjectMeta{Name: "test-openshift", Namespace: "test"},
+					Spec: v1beta1.ProviderSpec{
+						Type: (*v1beta1.ProviderType)(ptr.To(v1beta1.OpenShift)),
+					},
+				},
 			},
 			Source: plancontext.Source{
 				Provider: &v1beta1.Provider{

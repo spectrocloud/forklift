@@ -64,7 +64,6 @@ const (
 	VMStorageNotMapped              = "VMStorageNotMapped"
 	VMStorageNotSupported           = "VMStorageNotSupported"
 	VMMultiplePodNetworkMappings    = "VMMultiplePodNetworkMappings"
-	VMDuplicateNADMappings          = "VMDuplicateNADMappings"
 	VMMissingGuestIPs               = "VMMissingGuestIPs"
 	VMIpNotMatchingUdnSubnet        = "VMIpNotMatchingUdnSubnet"
 	VMMissingChangedBlockTracking   = "VMMissingChangedBlockTracking"
@@ -376,7 +375,7 @@ func (r *Reconciler) ensureSecretForProvider(plan *api.Plan) error {
 // and returns whether the plan uses Shift storage so callers can pass the flag forward.
 func (r *Reconciler) validateNetAppShift(ctx *plancontext.Context) (err error) {
 	plan := ctx.Plan
-	src := plan.Referenced.Provider.Source
+	src := plan.Provider.Source
 	if src == nil || src.Type() != api.VSphere || plan.Map.Storage == nil {
 		return nil
 	}
@@ -384,6 +383,7 @@ func (r *Reconciler) validateNetAppShift(ctx *plancontext.Context) (err error) {
 	if err != nil {
 		return liberr.Wrap(err, "check NetApp Shift storage")
 	}
+	plan.Status.NetAppShiftDestination = shift
 	if !shift {
 		return nil
 	}
@@ -800,14 +800,6 @@ func (r *Reconciler) validateVM(plan *api.Plan, ctx *plancontext.Context) error 
 		Message:  "VM has more than one interface mapped to the pod network.",
 		Items:    []string{},
 	}
-	duplicateNADMappings := libcnd.Condition{
-		Type:     VMDuplicateNADMappings,
-		Status:   True,
-		Reason:   NotValid,
-		Category: api.CategoryCritical,
-		Message:  "Multiple VM NICs mapped to the same Multus NAD. Add additional NetworkMap entries with different destination NADs for the same source network.",
-		Items:    []string{},
-	}
 	missingStaticIPs := libcnd.Condition{
 		Type:     VMMissingGuestIPs,
 		Status:   True,
@@ -1003,17 +995,7 @@ func (r *Reconciler) validateVM(plan *api.Plan, ctx *plancontext.Context) error 
 	source := plan.Referenced.Provider.Source
 	checkMixedUsage := source != nil && source.Type() == api.VSphere && settings.Settings.Features.CopyOffload
 	planUsesOffload := checkMixedUsage && plan.IsUsingOffloadPlugin()
-	netAppShift := false
-	var err error
-	if source != nil && source.Type() == api.VSphere && plan.Map.Storage != nil {
-		netAppShift, err = plan.Map.Storage.HasNetAppShiftDestination(ctx.Destination.Client)
-		if err != nil {
-			return liberr.Wrap(err, "check NetApp Shift storage")
-		}
-	}
-	if err != nil {
-		return liberr.Wrap(err, "check NetApp Shift storage")
-	}
+	netAppShift := plan.HasNetAppShiftDestination()
 
 	// Referenced VMs.
 	for i := range plan.Spec.VMs {
@@ -1111,6 +1093,8 @@ func (r *Reconciler) validateVM(plan *api.Plan, ctx *plancontext.Context) error 
 
 		// Check for mixed VDDK/Offload usage (vSphere only)
 		// If plan uses offload, add VMs with VDDK disks to the condition
+		// TODO: Also validate VMDK disks on CSI-import-only datastores (no xcopy).
+		// CSI import only supports VVol and RDM — VMDK disks require xcopy.
 		if planUsesOffload {
 			if vsphereVM, ok := v.(*vsphere.VM); ok {
 				storageMap := plan.Referenced.Map.Storage
@@ -1150,12 +1134,8 @@ func (r *Reconciler) validateVM(plan *api.Plan, ctx *plancontext.Context) error 
 			if nErr != nil {
 				return nErr
 			}
-			foundNadDup, foundPodDup := planbase.ValidateNetworkDuplicates(nicRefs, plan.Referenced.Map.Network)
-			if foundPodDup {
+			if planbase.ValidatePodNetworkDuplicates(nicRefs, plan.Map.Network) {
 				multiplePodNetworkMappings.Items = append(multiplePodNetworkMappings.Items, ref.String())
-			}
-			if foundNadDup {
-				duplicateNADMappings.Items = append(duplicateNADMappings.Items, ref.String())
 			}
 		}
 		if plan.Referenced.Map.Storage != nil {
@@ -1415,9 +1395,6 @@ func (r *Reconciler) validateVM(plan *api.Plan, ctx *plancontext.Context) error 
 	}
 	if len(multiplePodNetworkMappings.Items) > 0 {
 		plan.Status.SetCondition(multiplePodNetworkMappings)
-	}
-	if len(duplicateNADMappings.Items) > 0 {
-		plan.Status.SetCondition(duplicateNADMappings)
 	}
 	if len(missingStaticIPs.Items) > 0 {
 		plan.Status.SetCondition(missingStaticIPs)
@@ -2527,16 +2504,24 @@ func (r *Reconciler) validateVirtV2vImage(plan *api.Plan) error {
 	return nil
 }
 
-// vmUsesVddk checks if the VM requires VDDK for migration (i.e., if any disk doesn't use storage offload)
+// vmUsesVddk checks if the VM requires VDDK for migration (i.e., if any disk doesn't use storage offload).
+// Both xcopy and CSI import are considered valid offload methods.
 func (r *Reconciler) vmUsesVddk(storageMap *api.StorageMap, vsphereVM *vsphere.VM, vmName string) (bool, error) {
 	for _, disk := range vsphereVM.Disks {
 		mapping, found := storageMap.FindStorage(disk.Datastore.ID)
 		if !found {
 			continue // Another validation will handle this
 		}
-		if mapping.OffloadPlugin == nil || mapping.OffloadPlugin.VSphereXcopyPluginConfig == nil {
+		if mapping.OffloadPlugin == nil {
 			return true, nil
 		}
+		if mapping.OffloadPlugin.VSphereXcopyPluginConfig != nil {
+			continue
+		}
+		if mapping.OffloadPlugin.CsiVolumeImport != nil {
+			continue
+		}
+		return true, nil
 	}
 
 	return false, nil

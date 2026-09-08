@@ -517,15 +517,15 @@ func (r *Collector) getUpdates(ctx context.Context) error {
 		}
 		if err == nil {
 			err = tx.Commit()
+			if err != nil {
+				r.log.Error(err, "tx commit failed.")
+			}
 		} else {
-			err = tx.End()
+			if endErr := tx.End(); endErr != nil {
+				r.log.Error(endErr, "tx rollback failed.")
+			}
 		}
-		if err != nil {
-			r.log.Error(
-				err,
-				"tx commit failed.")
-		}
-		if updateSet.Truncated == nil || !*updateSet.Truncated {
+		if err == nil && (updateSet.Truncated == nil || !*updateSet.Truncated) {
 			if !r.parity {
 				r.parity = true
 				r.log.Info(
@@ -1106,7 +1106,7 @@ func (r *Collector) apply(ctx context.Context, tx *libmodel.Tx, updates []types.
 			break
 		}
 
-		if u.Obj.Type == VirtualMachine {
+		if u.Obj.Type == VirtualMachine && string(u.Kind) != Leave {
 			if !vmTagsFetched {
 				vmTagsMap, vmTagsErr = r.getVMsWithTags(ctx)
 				if vmTagsErr != nil {

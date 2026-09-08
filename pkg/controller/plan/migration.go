@@ -117,7 +117,8 @@ func (r *Migration) Run() (reQ time.Duration, err error) {
 				if !r.Source.Provider.Status.HasCondition(libcnd.Ready) {
 					r.Log.Info(
 						"VM not found in inventory but source provider is not ready, will retry.",
-						"vm", vm.String())
+						"vm", vm.String(),
+					)
 					return
 				}
 				vm.SetCondition(libcnd.Condition{
@@ -207,7 +208,8 @@ func (r *Migration) begin() (err error) {
 			Category: api.CategoryAdvisory,
 			Message:  "The plan is EXECUTING.",
 			Durable:  true,
-		})
+		},
+	)
 	err = r.kubevirt.EnsureNamespace()
 	if err != nil {
 		err = liberr.Wrap(err)
@@ -255,12 +257,14 @@ func (r *Migration) begin() (err error) {
 			log.Info(
 				"Pipeline reset.",
 				"vm",
-				vm.String())
+				vm.String(),
+			)
 		} else {
 			log.Info(
 				"Pipeline preserved.",
 				"vm",
-				vm.String())
+				vm.String(),
+			)
 		}
 		list = append(list, status)
 	}
@@ -528,7 +532,8 @@ func (r *Migration) removeLastWarmSnapshot(vm *plan.VMStatus) {
 		r.Log.Error(
 			err,
 			"Failed to clean up warm migration snapshots.",
-			"vm", vm)
+			"vm", vm,
+		)
 	}
 }
 
@@ -714,12 +719,14 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 				Reason:   UserRequested,
 				Message:  "The migration has been canceled.",
 				Durable:  true,
-			})
+			},
+		)
 		vm.Phase = api.PhaseCompleted
 		r.Log.Info(
 			"Migration [CANCELED]",
 			"vm",
-			vm.String())
+			vm.String(),
+		)
 		return
 	}
 
@@ -728,11 +735,13 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 		"vm",
 		vm.String(),
 		"phase",
-		vm.Phase)
+		vm.Phase,
+	)
 	r.Log.V(2).Info(
 		"Migrating VM (definition).",
 		"vm",
-		vm)
+		vm,
+	)
 
 	// delegate to a provider-specific implementation of a phase
 	// if one exists, otherwise run through the default implementation.
@@ -861,6 +870,31 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 				}
 			}
 
+			csiPVCs, csiErr := r.kubevirt.CsiImportPVCs(vm)
+			if csiErr != nil {
+				if !errors.As(csiErr, &web.ProviderNotReadyError{}) {
+					r.Log.Error(csiErr, "error creating CSI import PVCs", "vm", vm.Name)
+					step.AddError(csiErr.Error())
+					err = nil
+					break
+				} else {
+					err = csiErr
+					return
+				}
+			}
+			if len(csiPVCs) > 0 {
+				if csiErr = r.ensurer.PersistentVolumeClaims(vm, csiPVCs); csiErr != nil {
+					if !errors.As(csiErr, &web.ProviderNotReadyError{}) {
+						step.AddError(csiErr.Error())
+						err = nil
+						break
+					} else {
+						err = csiErr
+						return
+					}
+				}
+			}
+
 			if r.builder.SupportsVolumePopulators() {
 				var pvcs []*core.PersistentVolumeClaim
 				if pvcs, err = r.kubevirt.PopulatorVolumes(vm.Ref); err != nil {
@@ -945,7 +979,8 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 						err = r.Destination.Client.Get(
 							context.TODO(),
 							types.NamespacedName{Namespace: pvc.Namespace, Name: owner.Name},
-							dataVolume)
+							dataVolume,
+						)
 						if err != nil {
 							r.Log.Error(err, "error getting matching DataVolume for PVC", "pvc", pvc.Name)
 							return
@@ -1099,7 +1134,8 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 				if len(pod.Status.ContainerStatuses) > 0 {
 					cs := pod.Status.ContainerStatuses[0]
 					if cs.State.Terminated != nil {
-						logFields = append(logFields,
+						logFields = append(
+							logFields,
 							"exitCode", cs.State.Terminated.ExitCode,
 							"terminationReason", cs.State.Terminated.Reason,
 							"terminationMessage", cs.State.Terminated.Message,
@@ -1486,7 +1522,8 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 
 				if cr == nil {
 					_, err = r.kubevirt.CreateDeepInspectionConversion(
-						vm, snapshotMoref, r.Plan.Name, string(r.Plan.UID))
+						vm, snapshotMoref, r.Plan.Name, string(r.Plan.UID),
+					)
 					if err != nil {
 						step.AddError(err.Error())
 						err = nil
@@ -1574,16 +1611,20 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 			r.Log.Info(
 				"Migration [COMPLETED]",
 				"vm",
-				vm.String())
+				vm.String(),
+			)
 		default:
 			r.Log.Info(
 				"Phase unknown.",
 				"vm",
-				vm)
+				vm,
+			)
 			vm.AddError(
 				fmt.Sprintf(
 					"Phase [%s] unknown",
-					vm.Phase))
+					vm.Phase,
+				),
+			)
 			vm.Phase = api.PhaseCompleted
 		}
 	}
@@ -1610,7 +1651,8 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 				Category: api.CategoryAdvisory,
 				Message:  "The VM migration has SUCCEEDED.",
 				Durable:  true,
-			})
+			},
+		)
 		_ = r.cleanup(vm, func(err error) bool {
 			if err != nil {
 				r.Log.Error(err, "Cleanup after successful VM migration.", "vm", vm.String())
@@ -1634,7 +1676,8 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 				Category: api.CategoryAdvisory,
 				Message:  "The VM migration has FAILED.",
 				Durable:  true,
-			})
+			},
+		)
 	}
 
 	return
@@ -1679,7 +1722,8 @@ func (r *Migration) end() (completed bool, err error) {
 				Category: api.CategoryAdvisory,
 				Message:  "The plan execution has FAILED.",
 				Durable:  true,
-			})
+			},
+		)
 	} else if succeeded > 0 {
 		// if the migration didn't fail and at least one VM succeeded,
 		// then the migration succeeded.
@@ -1692,7 +1736,8 @@ func (r *Migration) end() (completed bool, err error) {
 				Category: api.CategoryAdvisory,
 				Message:  "The plan execution has SUCCEEDED.",
 				Durable:  true,
-			})
+			},
+		)
 	} else {
 		// if there were no failures or successes, but
 		// all the VMs are complete, then the migration must
@@ -1705,7 +1750,8 @@ func (r *Migration) end() (completed bool, err error) {
 				Category: api.CategoryAdvisory,
 				Message:  "The plan execution has been CANCELED.",
 				Durable:  true,
-			})
+			},
+		)
 	}
 
 	completed = true
@@ -1785,7 +1831,8 @@ func (r *Migration) updateCopyProgress(vm *plan.VMStatus, step *plan.Step) (err 
 						"vm",
 						vm.String(),
 						"dv",
-						path.Join(dv.Namespace, dv.Name))
+						path.Join(dv.Namespace, dv.Name),
+					)
 					continue
 				}
 				snapshot := dv.Spec.Checkpoints[len(dv.Spec.Checkpoints)-1].Current
@@ -1845,7 +1892,8 @@ func (r *Migration) updateCopyProgress(vm *plan.VMStatus, step *plan.Step) (err 
 							"vm",
 							vm.String(),
 							"dv",
-							path.Join(dv.Namespace, dv.Name))
+							path.Join(dv.Namespace, dv.Name),
+						)
 						continue
 					}
 					err = r.Destination.Client.Get(context.TODO(), types.NamespacedName{
@@ -1864,7 +1912,8 @@ func (r *Migration) updateCopyProgress(vm *plan.VMStatus, step *plan.Step) (err 
 								"vm",
 								vm.String(),
 								"dv",
-								path.Join(dv.Namespace, dv.Name))
+								path.Join(dv.Namespace, dv.Name),
+							)
 							continue
 						}
 					}
@@ -1878,7 +1927,8 @@ func (r *Migration) updateCopyProgress(vm *plan.VMStatus, step *plan.Step) (err 
 						"vm",
 						vm.String(),
 						"dv",
-						path.Join(dv.Namespace, dv.Name))
+						path.Join(dv.Namespace, dv.Name),
+					)
 					continue
 				}
 
@@ -1888,7 +1938,8 @@ func (r *Migration) updateCopyProgress(vm *plan.VMStatus, step *plan.Step) (err 
 						"vm",
 						vm.String(),
 						"dv",
-						path.Join(dv.Namespace, dv.Name))
+						path.Join(dv.Namespace, dv.Name),
+					)
 					continue
 				}
 
@@ -1982,7 +2033,7 @@ func (r *Migration) updateConversionProgress(vm *plan.VMStatus, step *plan.Step)
 			break
 		}
 
-		useV2vForTransfer, err := r.Context.Plan.ShouldUseV2vForTransfer(vm.Ref, r.Destination.Client)
+		useV2vForTransfer, err := r.Plan.ShouldUseV2vForTransfer(vm.Ref)
 		switch {
 		case err != nil:
 			return liberr.Wrap(err)
@@ -2100,6 +2151,17 @@ func (r *Migration) updatePopulatorCopyProgress(vm *plan.VMStatus, step *plan.St
 		}
 
 		taskSeen[taskName] = true
+
+		if offloadInfo, offloadErr := r.builder.PopulatorOffloadInfo(pvc); offloadErr != nil {
+			r.Log.Info("Failed to get populator offload info", "pvc", pvc.Name, "error", offloadErr)
+		} else if len(offloadInfo) > 0 {
+			if task.Annotations == nil {
+				task.Annotations = make(map[string]string)
+			}
+			for k, v := range offloadInfo {
+				task.Annotations[k] = v
+			}
+		}
 
 		if pvc.Status.Phase == core.ClaimBound {
 			task.Phase = api.StepCompleted

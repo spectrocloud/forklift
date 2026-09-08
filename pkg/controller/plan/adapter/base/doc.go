@@ -34,6 +34,15 @@ const (
 	// Set the source PVC of the conversion, used on the DV for filtering
 	AnnConversionSourcePVC = "forklift.konveyor.io/conversionSourcePVC"
 
+	// Copy method annotation indicates which method was used for volume migration
+	AnnCopyMethod = "forklift.konveyor.io/copy-method"
+
+	// Copy offload annotation contains the source disk identifier for offloaded copies
+	AnnCopyOffload = "copy-offload"
+
+	// Copy method values
+	CopyMethodCsiImport = "csi-import"
+
 	// CDI
 
 	// Causes the importer pod to be retained after import.
@@ -177,6 +186,8 @@ type Builder interface {
 	PopulatorVolumes(vmRef ref.Ref, annotations map[string]string, secretName string) ([]*core.PersistentVolumeClaim, error)
 	// Transferred bytes
 	PopulatorTransferredBytes(persistentVolumeClaim *core.PersistentVolumeClaim) (transferredBytes int64, err error)
+	// Storage offload metadata for the populator copy (e.g. "xcopyUsed"), surfaced as task annotations.
+	PopulatorOffloadInfo(pvc *core.PersistentVolumeClaim) (info map[string]string, err error)
 	// Set the populator PVC labels
 	SetPopulatorDataSourceLabels(vmRef ref.Ref, pvcs []*core.PersistentVolumeClaim) (err error)
 	// Get the populator task name associated to a PVC
@@ -194,6 +205,8 @@ type Builder interface {
 	// NetAppShiftPVCs builds PVCs for disks mapped to NetApp Shift StorageClasses.
 	// Returns nil for non-vSphere providers or when no Shift mappings exist.
 	NetAppShiftPVCs(vmRef ref.Ref, labels map[string]string) ([]core.PersistentVolumeClaim, error)
+	// CsiImportPVCs builds PVCs for disks that have CsiVolumeImport configured.
+	CsiImportPVCs(vmRef ref.Ref, pvcLabels map[string]string) ([]core.PersistentVolumeClaim, error)
 	// SourceVMLabelsAndAnnotations returns provider-specific labels and annotations
 	// derived from source VM metadata (e.g. vSphere tags and custom attributes).
 	SourceVMLabelsAndAnnotations(vmRef ref.Ref, tagMapping *api.TagMapping) (labels map[string]string, annotations map[string]string, sanitizationReport map[string]string, err error)

@@ -1,6 +1,7 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shphadnis <134159681+shphadnis@users.noreply.github.com>
 Date: Wed, 26 Aug 2026 14:13:35 -0700
-Subject: [PATCH] spectro: relax virt-v2v confinement outside OpenShift
+Subject: [PATCH 4/9] spectro: relax virt-v2v confinement outside OpenShift
 
 Re-derived on upstream v2.12.1 (was b8695747e + 29b534580, and part of
 cb469fa97, on the 2.9.2 line). Upstream moved the conversion pod into
@@ -17,13 +18,14 @@ On OpenShift the upstream localhost/unshare.json profile is untouched;
 only LIBGUESTFS_BACKEND is set. Inspection pods are unaffected.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 03947c74a393c4dc473258919553b10ee53d7472)
 ---
  pkg/controller/conversion/builder.go | 42 ++++++++++++++++++++++++++
  pkg/controller/plan/util.go          | 45 +++++++++++++++++++++++++---
  2 files changed, 83 insertions(+), 4 deletions(-)
 
 diff --git a/pkg/controller/conversion/builder.go b/pkg/controller/conversion/builder.go
-index 0000000..0000000 100644
+index 72fe3a44c..49ecaf2d6 100644
 --- a/pkg/controller/conversion/builder.go
 +++ b/pkg/controller/conversion/builder.go
 @@ -230,9 +230,51 @@ func (b *Builder) BuildVirtV2vConversionPod(pod *core.Pod, environment []core.En
@@ -79,7 +81,7 @@ index 0000000..0000000 100644
  // Inspection env vars must be populated in b.Config.Environment by the caller.
  func (b *Builder) BuildVirtV2vInspectionPod(pod *core.Pod, environment []core.EnvVar, vm *plan.VMStatus) (*core.Pod, error) {
 diff --git a/pkg/controller/plan/util.go b/pkg/controller/plan/util.go
-index 0000000..0000000 100644
+index 9ec8fa59a..8ba044b99 100644
 --- a/pkg/controller/plan/util.go
 +++ b/pkg/controller/plan/util.go
 @@ -2,26 +2,63 @@ package plan

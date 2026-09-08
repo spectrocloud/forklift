@@ -7,6 +7,7 @@ import (
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
 	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
+	model "github.com/kubev2v/forklift/pkg/controller/provider/model/hyperv"
 	webbase "github.com/kubev2v/forklift/pkg/controller/provider/web/base"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web/hyperv"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
@@ -65,7 +66,12 @@ func (r *Validator) NetworksMapped(vmRef ref.Ref) (bool, error) {
 
 	for _, nic := range vm.NICs {
 		if nic.Network.ID == "" {
-			continue // Disconnected NIC is OK
+			if nic.NetworkName != "" {
+				// NIC is attached to a switch that wasn't discovered in inventory.
+				// Treat as unmapped rather than silently skipping.
+				return false, nil
+			}
+			continue // Truly disconnected NIC
 		}
 		mapped := false
 		for _, pair := range r.Context.Map.Network.Spec.Map {
@@ -81,9 +87,36 @@ func (r *Validator) NetworksMapped(vmRef ref.Ref) (bool, error) {
 	return true, nil
 }
 
-// NO-OP
-func (r *Validator) MaintenanceMode(_ ref.Ref) (bool, error) {
-	return true, nil
+// MaintenanceMode checks whether the VM's owner node is in a Paused or Down
+// state. In standalone mode there are no Host records, so it always returns ok.
+func (r *Validator) MaintenanceMode(vmRef ref.Ref) (bool, error) {
+	if !r.Source.Provider.IsHyperVCluster() {
+		return true, nil
+	}
+
+	vm := &hyperv.VM{}
+	err := r.Source.Inventory.Find(vm, vmRef)
+	if err != nil {
+		return false, liberr.Wrap(err, "vm", vmRef.String())
+	}
+
+	if vm.Host == "" {
+		return true, nil
+	}
+
+	host := &hyperv.Host{}
+	hostRef := ref.Ref{ID: vm.Host}
+	err = r.Source.Inventory.Find(host, hostRef)
+	if err != nil {
+		return false, liberr.Wrap(err, "vm", vmRef.String(), "host", hostRef.String())
+	}
+
+	switch host.State {
+	case model.NodeStatePaused, model.NodeStateDown:
+		return false, nil
+	default:
+		return true, nil
+	}
 }
 
 // NICNetworkRefs returns one source-network ref per VM NIC.
@@ -221,12 +254,15 @@ func (r *Validator) PVCNameTemplate(vmRef ref.Ref, pvcNameTemplate string) (bool
 		return false, liberr.Wrap(err, "vm", vmRef.String())
 	}
 
+	targetVmName := planbase.ResolveTargetVmName(r.Plan, vm.ID, vm.Name)
+
 	// Validate template produces valid k8s labels for each disk
 	for i, disk := range vm.Disks {
 		testData := map[string]interface{}{
-			"VmName":    vm.Name,
-			"DiskIndex": i,
-			"DiskId":    disk.ID,
+			"VmName":       vm.Name,
+			"TargetVmName": targetVmName,
+			"DiskIndex":    i,
+			"DiskId":       disk.ID,
 		}
 		_, err := planbase.ValidatePVCNameTemplate(pvcNameTemplate, testData)
 		if err != nil {

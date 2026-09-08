@@ -2,7 +2,9 @@ package hyperv
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	liburl "net/url"
 	"os"
 	libpath "path"
@@ -12,6 +14,7 @@ import (
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	hvutil "github.com/kubev2v/forklift/pkg/controller/hyperv"
 	model "github.com/kubev2v/forklift/pkg/controller/provider/model/hyperv"
+	"github.com/kubev2v/forklift/pkg/lib/hyperv/driver"
 	libmodel "github.com/kubev2v/forklift/pkg/lib/inventory/model"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
 	core "k8s.io/api/core/v1"
@@ -161,10 +164,40 @@ func (r *Collector) HasParity() bool {
 	return r.parity
 }
 
-// Test connect/logout.
-func (r *Collector) Test() (_ int, err error) {
-	err = r.client.Connect(r.provider)
+// Test validates connectivity and credentials against the Hyper-V host.
+func (r *Collector) Test() (status int, err error) {
+	if err = r.client.Connect(r.provider); err != nil {
+		if errors.Is(err, driver.ErrUnauthorized) {
+			status = http.StatusUnauthorized
+		}
+		return
+	}
+	if _, err = r.client.driver.IsAlive(); err != nil {
+		if errors.Is(err, driver.ErrUnauthorized) {
+			status = http.StatusUnauthorized
+		}
+		return
+	}
+	if r.provider.IsHyperVCluster() {
+		if err = r.validateClusterMembership(); err != nil {
+			return
+		}
+		r.log.Info("Connected to Hyper-V Failover Cluster via WinRM/HTTPS.")
+	} else {
+		r.log.Info("Connected to Hyper-V host via WinRM/HTTPS.")
+	}
 	return
+}
+
+// validateClusterMembership verifies the connected host is a Failover Cluster member.
+func (r *Collector) validateClusterMembership() error {
+	_, err := r.client.driver.GetCluster()
+	if err != nil {
+		return fmt.Errorf(
+			"managementType is 'cluster' but Get-Cluster failed on this host — "+
+				"verify the host is a Failover Cluster member: %w", err)
+	}
+	return nil
 }
 
 // NO-OP
@@ -191,10 +224,16 @@ func (r *Collector) Start() error {
 			r.log.Info("Stopped.")
 		}()
 		for {
-			if !ctx.canceled() {
-				_ = r.run(&ctx)
-			} else {
+			if ctx.canceled() {
 				return
+			}
+			if err := r.run(&ctx); err != nil {
+				r.log.Error(err, "Run failed.", "retry", RetryInterval)
+				select {
+				case <-ctx.ctx.Done():
+					return
+				case <-time.After(RetryInterval):
+				}
 			}
 		}
 	}
@@ -218,12 +257,6 @@ func (r *Collector) run(ctx *Context) (err error) {
 	r.startTime = time.Now()
 	r.phase = Started
 
-	defer func() {
-		if err != nil {
-			r.log.Error(err, "Run failed.")
-		}
-	}()
-
 	// Connect directly to HyperV host via WinRM using Secret credentials
 	err = r.client.Connect(r.provider)
 	if err != nil {
@@ -238,11 +271,21 @@ func (r *Collector) run(ctx *Context) (err error) {
 
 	r.parity = true
 	r.phase = Parity
-	r.log.Info("Initial inventory loaded.",
-		"vms", r.vmCount(),
-		"networks", r.networkCount(),
-		"storages", r.storageCount(),
-		"disks", r.diskCount())
+	if r.provider.IsHyperVCluster() {
+		r.log.Info("Initial inventory loaded (cluster mode).",
+			"clusters", r.clusterCount(),
+			"hosts", r.hostCount(),
+			"vms", r.vmCount(),
+			"networks", r.networkCount(),
+			"storages", r.storageCount(),
+			"disks", r.diskCount())
+	} else {
+		r.log.Info("Initial inventory loaded.",
+			"vms", r.vmCount(),
+			"networks", r.networkCount(),
+			"storages", r.storageCount(),
+			"disks", r.diskCount())
+	}
 
 	// Start periodic refresh
 	r.beginWatch()
@@ -259,11 +302,20 @@ func (r *Collector) run(ctx *Context) (err error) {
 	}
 }
 
+// adapters returns the full adapter list, prepending cluster adapters if in cluster mode.
+func (r *Collector) adapters() []Adapter {
+	if r.provider.IsHyperVCluster() {
+		return append(clusterAdapterList, adapterList...)
+	}
+	return adapterList
+}
+
 // Load the inventory.
 func (r *Collector) load(ctx *Context) (err error) {
 	r.phase = Load
+	r.client.InvalidateClusterCache()
 	mark := time.Now()
-	for _, adapter := range adapterList {
+	for _, adapter := range r.adapters() {
 		if ctx.canceled() {
 			return
 		}
@@ -322,9 +374,10 @@ func (r *Collector) create(ctx *Context, adapter Adapter) (err error) {
 // can block or be slow.
 func (r *Collector) refresh(ctx *Context) (err error) {
 	r.phase = Refresh
+	r.client.InvalidateClusterCache()
 	var deletions, updates []Updater
 	mark := time.Now()
-	for _, adapter := range adapterList {
+	for _, adapter := range r.adapters() {
 		if ctx.canceled() {
 			return
 		}
@@ -371,6 +424,24 @@ func (r *Collector) apply(changeSet []Updater) (err error) {
 	return
 }
 
+// clusterCount returns the number of clusters in the database.
+func (r *Collector) clusterCount() int {
+	count, err := r.db.Count(&model.Cluster{}, nil)
+	if err != nil {
+		r.log.Error(err, "Cluster count failed.")
+	}
+	return int(count)
+}
+
+// hostCount returns the number of hosts in the database.
+func (r *Collector) hostCount() int {
+	count, err := r.db.Count(&model.Host{}, nil)
+	if err != nil {
+		r.log.Error(err, "Host count failed.")
+	}
+	return int(count)
+}
+
 // vmCount returns the number of VMs in the database.
 func (r *Collector) vmCount() int {
 	count, _ := r.db.Count(&model.VM{}, nil)
@@ -397,6 +468,33 @@ func (r *Collector) diskCount() int {
 
 // Add model watches.
 func (r *Collector) beginWatch() {
+	// Cluster watch — triggers VM revalidation when cluster state changes.
+	if r.provider.IsHyperVCluster() {
+		w, err := r.db.Watch(
+			&model.Cluster{},
+			&ClusterEventHandler{
+				DB:  r.db,
+				log: r.log,
+			})
+		if err != nil {
+			r.log.Error(err, "Cluster watch failed.")
+		} else {
+			r.watches = append(r.watches, w)
+		}
+
+		w, err = r.db.Watch(
+			&model.Host{},
+			&HostEventHandler{
+				DB:  r.db,
+				log: r.log,
+			})
+		if err != nil {
+			r.log.Error(err, "Host watch failed.")
+		} else {
+			r.watches = append(r.watches, w)
+		}
+	}
+
 	w, err := r.db.Watch(
 		&model.VM{},
 		&VMEventHandler{

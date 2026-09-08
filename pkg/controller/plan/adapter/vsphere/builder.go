@@ -35,6 +35,7 @@ import (
 	libref "github.com/kubev2v/forklift/pkg/lib/ref"
 	"github.com/kubev2v/forklift/pkg/lib/util"
 	"github.com/kubev2v/forklift/pkg/settings"
+	"github.com/kubev2v/forklift/pkg/storage/resolver"
 	"github.com/kubev2v/forklift/pkg/templateutil"
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/types"
@@ -45,6 +46,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/utils/ptr"
 	cnv "kubevirt.io/api/core/v1"
 	cdi "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
@@ -185,7 +187,6 @@ func (r *Builder) ConfigMap(_ ref.Ref, _ *core.Secret, _ *core.ConfigMap) (err e
 }
 
 func IsLegacyWindows(vm *model.VM) bool {
-
 	guestID := strings.ToLower(vm.GuestID)
 	guestName := strings.ToLower(vm.GuestName)
 
@@ -232,24 +233,18 @@ func (r *Builder) PodEnvironment(vmRef ref.Ref, sourceSecret *core.Secret) (env 
 			Name:  "VIRTIO_WIN",
 			Value: "/usr/local/virtio-win-legacy.iso",
 		})
-	} else if isWindows(vm) { // We check for multiple IPs per NIC only on Windows VMs
-		macIPCount := make(map[string]int)
-
+	} else if isWindows(vm) {
+		var manualMACs []string
 		for _, gn := range vm.GuestNetworks {
-			//IS ipv4
-			if gn.Origin == string(types.NetIpConfigInfoIpAddressOriginManual) && net.IP.To4(net.ParseIP(gn.IP)) != nil {
-				macIPCount[gn.MAC]++
+			if gn.Origin == string(types.NetIpConfigInfoIpAddressOriginManual) {
+				manualMACs = append(manualMACs, gn.MAC)
 			}
 		}
-
-		for _, count := range macIPCount {
-			if count > 1 {
-				env = append(env, core.EnvVar{
-					Name:  "V2V_multipleIPsPerNic",
-					Value: "true",
-				})
-				break // stop after the first match
-			}
+		if planbase.HasMultipleIPsPerMAC(manualMACs) {
+			env = append(env, core.EnvVar{
+				Name:  "V2V_multipleIPsPerNic",
+				Value: "true",
+			})
 		}
 	}
 
@@ -310,36 +305,125 @@ func (r *Builder) PodEnvironment(vmRef ref.Ref, sourceSecret *core.Secret) (env 
 	return
 }
 
+// isNonGlobalIPv6 returns true for link-local (fe80::/10) and ULA (fc00::/7) IPv6 addresses.
+func isNonGlobalIPv6(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil || ip.To4() != nil {
+		return false
+	}
+	if ip.IsLinkLocalUnicast() {
+		return true
+	}
+	if ipv6 := ip.To16(); ipv6 != nil && ipv6[0]&0xfe == 0xfc {
+		return true
+	}
+	return false
+}
+
+func isDefaultRoute(network string) bool {
+	return network == "0.0.0.0" || network == "0.0.0.0/0" || network == "::" || network == "::/0"
+}
+
+// findMatchingStacks returns IP stacks for the given device that have a valid
+// default-route gateway matching the requested IP family.
+func findMatchingStacks(allStacks []vsphere.GuestIpStack, device string, isIPv4 bool) []vsphere.GuestIpStack {
+	var matched []vsphere.GuestIpStack
+	for _, stack := range allStacks {
+		if stack.Device != device {
+			continue
+		}
+		gatewayIP := net.ParseIP(stack.Gateway)
+		if gatewayIP == nil {
+			continue
+		}
+		if isIPv4 != (gatewayIP.To4() != nil) {
+			continue
+		}
+		if !isDefaultRoute(stack.Network) {
+			continue
+		}
+		matched = append(matched, stack)
+	}
+	return matched
+}
+
+// selectIPv6Gateway prefers a global gateway; falls back to link-local for SLAAC scenarios.
+func selectIPv6Gateway(stacks []vsphere.GuestIpStack, isGlobalIPv6 bool) string {
+	var fallbackGW string
+	for _, stack := range stacks {
+		gatewayIP := net.ParseIP(stack.Gateway)
+		if gatewayIP.IsLinkLocalUnicast() {
+			if fallbackGW == "" {
+				fallbackGW = stack.Gateway
+			}
+			continue
+		}
+		return stack.Gateway
+	}
+	if isGlobalIPv6 {
+		return fallbackGW
+	}
+	return ""
+}
+
+// selectGateway picks the default-route gateway for an IP on the given device.
+// Linux: skips non-global IPv6 (link-local/ULA). Windows: considers all addresses.
+// IPv6 prefers global gateways, falling back to link-local (SLAAC).
+func selectGateway(ip string, device string, stacks []vsphere.GuestIpStack, isWindows bool) string {
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return ""
+	}
+
+	isIPv4 := parsedIP.To4() != nil
+	isGlobalIPv6 := !isIPv4 && !isNonGlobalIPv6(ip)
+
+	if !isWindows && !isIPv4 && !isGlobalIPv6 {
+		return ""
+	}
+
+	matchedStacks := findMatchingStacks(stacks, device, isIPv4)
+
+	if isIPv4 {
+		if len(matchedStacks) > 0 {
+			return matchedStacks[0].Gateway
+		}
+		return ""
+	}
+
+	return selectIPv6Gateway(matchedStacks, isGlobalIPv6)
+}
+
+// shouldIncludeNetwork filters link-local addresses for all OSes.
+// Linux: all origins included. Windows: only manual origins are preserved.
+func shouldIncludeNetwork(network vsphere.GuestNetwork, isWindows bool) bool {
+	if ip := net.ParseIP(network.IP); ip != nil && ip.IsLinkLocalUnicast() {
+		return false
+	}
+	if !isWindows {
+		return true
+	}
+	return network.Origin == string(types.NetIpConfigInfoIpAddressOriginManual)
+}
+
+func formatNetworkConfig(network vsphere.GuestNetwork, gateway string) string {
+	dnsString := strings.Join(network.DNS, ",")
+	config := fmt.Sprintf("%s:ip:%s,%s,%d,%s",
+		network.MAC, network.IP, gateway, network.PrefixLength, dnsString)
+	return strings.TrimSuffix(config, ",")
+}
+
 func (r *Builder) mapMacStaticIps(vm *model.VM) (ipMap string, err error) {
-	// on windows machines we check if the interface origin is manual
-	// on linux we collect all networks.
 	isWindowsFlag := isWindows(vm)
+	sortedNetworks := planbase.SortedIPv4First(vm.GuestNetworks, func(gn vsphere.GuestNetwork) string { return gn.IP })
 
 	var configurations []string
-	for _, guestNetwork := range vm.GuestNetworks {
-		if !isWindowsFlag || guestNetwork.Origin == string(types.NetIpConfigInfoIpAddressOriginManual) {
-			gateway := ""
-			isIpv4 := net.IP.To4(net.ParseIP(guestNetwork.IP)) != nil
-			for _, ipStack := range vm.GuestIpStacks {
-				gwIpv4 := net.IP.To4(net.ParseIP(ipStack.Gateway)) != nil
-				if gwIpv4 && !isIpv4 || !gwIpv4 && isIpv4 {
-					// not the right IPv4 / IPv6 correlation
-					continue
-				}
-				if ipStack.Device != guestNetwork.Device {
-					continue
-				}
-				if ipStack.Network != "0.0.0.0" {
-					continue
-				}
-				gateway = ipStack.Gateway
-			}
-			dnsString := strings.Join(guestNetwork.DNS, ",")
-			configurationString := fmt.Sprintf("%s:ip:%s,%s,%d,%s", guestNetwork.MAC, guestNetwork.IP, gateway, guestNetwork.PrefixLength, dnsString)
-
-			// if DNS is "", we get configurationString with trailing comma, use TrimSuffix to remove it.
-			configurations = append(configurations, strings.TrimSuffix(configurationString, ","))
+	for _, guestNetwork := range sortedNetworks {
+		if !shouldIncludeNetwork(guestNetwork, isWindowsFlag) {
+			continue
 		}
+		gateway := selectGateway(guestNetwork.IP, guestNetwork.Device, vm.GuestIpStacks, isWindowsFlag)
+		configurations = append(configurations, formatNetworkConfig(guestNetwork, gateway))
 	}
 	return strings.Join(configurations, "_"), nil
 }
@@ -489,6 +573,43 @@ func (r *Builder) buildDatastoreMap() (map[string]*api.StoragePair, error) {
 	return dsMap, nil
 }
 
+// Check destination CDI version to see if we can use instance UUIDs instead of
+// BIOS UUIDs, which can be duplicated.
+func (r *Builder) canUseInstanceUUID() bool {
+	cdiList := &cdi.CDIList{}
+	err := r.Destination.List(context.TODO(), cdiList)
+	if err != nil {
+		r.Log.Error(err, "Failed to get destination CDI version, assuming use of BIOS UUIDs")
+		return false
+	}
+	if len(cdiList.Items) < 1 {
+		r.Log.Info("No CDI installations found on destination")
+		return false
+	}
+
+	cdiCDI := cdiList.Items[0]
+	cdiVersion, err := version.ParseSemantic(cdiCDI.Status.ObservedVersion)
+	if err != nil {
+		r.Log.Error(err, "Failed to parse destination CDI version, assuming use of BIOS UUIDs")
+		return false
+	}
+
+	// Minimum CNV versions supporting instance UUIDs: 4.22.1, 4.21.9, 4.20.16
+	// This can be removed when these versions fall off the support list.
+	if cdiVersion.AtLeast(version.MustParse("v4.22.0")) &&
+		cdiVersion.LessThan(version.MustParse("v4.22.1")) {
+		return false
+	} else if cdiVersion.AtLeast(version.MustParse("v4.21.0")) &&
+		cdiVersion.LessThan(version.MustParse("v4.21.9")) {
+		return false
+	} else if cdiVersion.AtLeast(version.MustParse("v4.0.0")) &&
+		cdiVersion.LessThan(version.MustParse("v4.20.16")) {
+		return false // Cover all real OpenShift versions below 4.20.16, but try not to touch upstream CDI versions (1.65 etc.)
+	}
+
+	return true
+}
+
 // Create DataVolume specs for the VM.
 func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.ConfigMap, dvTemplate *cdi.DataVolume, vddkConfigMap *core.ConfigMap) (dvs []cdi.DataVolume, err error) {
 	vm := &model.VM{}
@@ -508,29 +629,27 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 		return
 	}
 
+	canUseInstanceUUID := r.canUseInstanceUUID()
+
 	// Build datastore map for more efficient lookups
 	dsMap, err := r.buildDatastoreMap()
 	if err != nil {
 		return
 	}
-
 	// For storage offload warm migrations, match this DataVolume to the
 	// existing PVC via the backing file name.
 	var pvcMap map[string]core.PersistentVolumeClaim
 	if r.Plan.IsWarm() && r.SupportsVolumePopulators() {
-		pvcMap = make(map[string]core.PersistentVolumeClaim)
 		pvcs := &core.PersistentVolumeClaimList{}
-		pvcLabels := map[string]string{
-			"vmID":      vmRef.ID,
-			"migration": string(r.Migration.UID),
-		}
-
 		err = r.Context.Destination.Client.List(
 			context.TODO(),
 			pvcs,
 			&client.ListOptions{
-				Namespace:     r.Plan.Spec.TargetNamespace,
-				LabelSelector: labels.SelectorFromSet(pvcLabels),
+				Namespace: r.Plan.Spec.TargetNamespace,
+				LabelSelector: labels.SelectorFromSet(map[string]string{
+					"vmID":      vmRef.ID,
+					"migration": string(r.Migration.UID),
+				}),
 			},
 		)
 		if err != nil {
@@ -538,6 +657,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 			return
 		}
 
+		pvcMap = make(map[string]core.PersistentVolumeClaim)
 		for _, pvc := range pvcs.Items {
 			if copyOffload, present := pvc.Annotations["copy-offload"]; present && copyOffload != "" {
 				pvcMap[baseVolume(copyOffload, r.Plan.IsWarm())] = pvc
@@ -568,10 +688,14 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 		// the disks and virt-v2v is reduced to in-place conversion, so VDDK is a
 		// hard requirement for vSphere migrations.
 		vddkImage := settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
+		uuid := vm.UUID
+		if canUseInstanceUUID && vm.InstanceUUID != "" {
+			uuid = vm.InstanceUUID
+		}
 		dvSource := cdi.DataVolumeSource{
 			VDDK: &cdi.DataVolumeSourceVDDK{
 				BackingFile:  baseVolume(disk.File, r.Plan.IsWarm()),
-				UUID:         vm.UUID,
+				UUID:         uuid,
 				URL:          url,
 				SecretRef:    secret.Name,
 				Thumbprint:   thumbprint,
@@ -751,7 +875,7 @@ func (r *Builder) findInterfaceIps(vm *model.VM, nic vsphere.NIC) []string {
 func (r *Builder) mapNetworks(vm *model.VM, object *cnv.VirtualMachineSpec) (err error) {
 	var kNetworks []cnv.Network
 	var kInterfaces []cnv.Interface
-	var staticIpInterfaces = make(map[string][]string)
+	staticIpInterfaces := make(map[string][]string)
 
 	numNetworks := 0
 	hasUDN := r.Plan.DestinationHasUdnNetwork(r.Destination)
@@ -795,6 +919,11 @@ func (r *Builder) mapNetworks(vm *model.VM, object *cnv.VirtualMachineSpec) (err
 		if !hasUDN || settings.Settings.UdnSupportsMac {
 			kInterface.MacAddress = nic.MAC
 		}
+
+		if nic.PciAddress != "" {
+			kInterface.PciAddress = nic.PciAddress
+		}
+
 		switch mapped.Destination.Type {
 		case Pod:
 			kNetwork.Pod = &cnv.PodNetwork{}
@@ -924,7 +1053,8 @@ func (r *Builder) mapFirmware(vm *model.VM, object *cnv.VirtualMachineSpec) {
 		firmware.Bootloader = &cnv.Bootloader{
 			EFI: &cnv.EFI{
 				SecureBoot: &vm.SecureBoot,
-			}}
+			},
+		}
 		// SecureBoot requires SMM or the KubeVirt webhook rejects the VM.
 		// Upstream replaces Features wholesale here, discarding anything set
 		// earlier; only set the SMM field.
@@ -1022,9 +1152,13 @@ func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims [
 			Disk: &cnv.DiskTarget{Bus: bus},
 		}
 		if disk.RDM && r.shouldRDMAsLun(vm) {
-			diskDevice = cnv.DiskDevice{
-				LUN: &cnv.LunTarget{Bus: cnv.DiskBusSCSI},
+			lun := &cnv.LunTarget{
+				Bus: cnv.DiskBusSCSI,
 			}
+			if disk.Shared && r.shouldSCSIReservation(vm) {
+				lun.Reservation = true
+			}
+			diskDevice = cnv.DiskDevice{LUN: lun}
 		}
 		kubevirtDisk := cnv.Disk{
 			Name:       volumeName,
@@ -1033,6 +1167,9 @@ func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims [
 		if disk.Shared {
 			kubevirtDisk.Shareable = ptr.To(true)
 			kubevirtDisk.Cache = cnv.CacheNone
+			if disk.RDM && r.shouldRDMAsLun(vm) {
+				kubevirtDisk.ErrorPolicy = ptr.To(cnv.DiskErrorPolicyReport)
+			}
 		}
 		// Disk serial numbers are only presented to the source guest if
 		// the disk is connected with SCSI and disk.EnableUUID is set to
@@ -1298,10 +1435,9 @@ func (r *Builder) SupportsVolumePopulators() bool {
 			return false
 		}
 
-		if m.OffloadPlugin != nil && m.OffloadPlugin.VSphereXcopyPluginConfig != nil {
-			klog.V(2).Infof("found offload plugin: config %+v on ds map  %+v", m.OffloadPlugin.VSphereXcopyPluginConfig, dsMapIn)
+		if m.OffloadPlugin != nil && (m.OffloadPlugin.VSphereXcopyPluginConfig != nil || m.OffloadPlugin.CsiVolumeImport != nil) {
+			klog.V(2).Infof("found offload plugin on ds map %+v", dsMapIn)
 			return true
-
 		}
 	}
 	return false
@@ -1315,6 +1451,10 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 	if err != nil {
 		err = liberr.Wrap(err, "vm", vmRef.String())
 		return
+	}
+	uuid := vm.UUID
+	if r.canUseInstanceUUID() && vm.InstanceUUID != "" {
+		uuid = vm.InstanceUUID
 	}
 
 	// Get a list of existing PVCs to avoid creating duplicates
@@ -1344,6 +1484,46 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 	dsMapIn := r.Context.Map.Storage.Spec.Map
 	naaPrefixes := loadNAAPrefixes(r.Client)
 	dsNaaMap := make(map[string]string)
+
+	// Pre-pass: resolve RDM disks by NAA vendor prefix.
+	// Builds a map from disk index to the storage map entry whose offload
+	// plugin matches the RDM's vendor. Disks that fail NAA resolution are
+	// left out and will fall back to datastore-based matching in the main loop.
+	rdmMapped := make(map[int]*api.StoragePair)
+	for diskIndex, disk := range sortedDisks {
+		if !disk.RDM || disk.DeviceName == "" {
+			continue
+		}
+		rdmVendor, matched := vendorFromNAA(disk.DeviceName, naaPrefixes)
+		if !matched {
+			r.Log.Info("RDM disk NAA prefix not recognized, falling back to datastore matching",
+				"diskKey", disk.Key, "deviceName", disk.DeviceName)
+			continue
+		}
+		candidates := findStorageMapEntriesForVendor(dsMapIn, rdmVendor)
+		switch len(candidates) {
+		case 0:
+			r.Log.Info("No storage map entry found for RDM vendor, falling back to datastore matching",
+				"diskKey", disk.Key, "vendor", rdmVendor)
+		case 1:
+			rdmMapped[diskIndex] = candidates[0]
+			r.Log.Info("RDM disk resolved to storage vendor by NAA",
+				"diskKey", disk.Key, "deviceName", disk.DeviceName,
+				"vendor", rdmVendor, "storageClass", candidates[0].Destination.StorageClass)
+		default:
+			entry, disambigErr := disambiguateRDMByNAA(r.Source.Inventory, candidates, disk.DeviceName, naaPrefixes)
+			if disambigErr != nil {
+				r.Log.Info("RDM NAA disambiguation failed, falling back to datastore matching",
+					"diskKey", disk.Key, "vendor", rdmVendor, "error", disambigErr)
+			} else {
+				rdmMapped[diskIndex] = entry
+				r.Log.Info("RDM disk resolved to storage vendor by NAA",
+					"diskKey", disk.Key, "deviceName", disk.DeviceName,
+					"vendor", rdmVendor, "storageClass", entry.Destination.StorageClass)
+			}
+		}
+	}
+
 	for i := range dsMapIn {
 		mapped := &dsMapIn[i]
 		sourceRef := mapped.Source
@@ -1356,41 +1536,30 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 
 		pvblock := core.PersistentVolumeBlock
 		for diskIndex, disk := range sortedDisks {
-			// Resolve the effective storage map entry for this disk.
-			// RDM disks are matched by NAA vendor prefix (not datastore)
-			// because the RDM's backing LUN may reside on a different
-			// storage array than the VM's datastore.
 			var effectiveMapped *api.StoragePair
 			if disk.RDM && disk.DeviceName != "" {
-				if i > 0 {
-					continue // RDM disks are processed once, in the first outer iteration
-				}
-				rdmVendor, matched := vendorFromNAA(disk.DeviceName, naaPrefixes)
-				if !matched {
-					return nil, fmt.Errorf(
-						"RDM disk (key=%d) has device name %q that does not match any known storage vendor NAA prefix",
-						disk.Key, disk.DeviceName)
-				}
-				candidates := findStorageMapEntriesForVendor(dsMapIn, rdmVendor)
-				switch len(candidates) {
-				case 0:
-					return nil, fmt.Errorf(
-						"no storage map entry with offload plugin found for vendor %q; "+
-							"add a storage map entry with an offload plugin for this vendor", rdmVendor)
-				case 1:
-					effectiveMapped = candidates[0]
-				default:
-					effectiveMapped, err = disambiguateRDMByNAA(r.Source.Inventory, candidates, disk.DeviceName, naaPrefixes)
-					if err != nil {
-						return nil, err
+				if entry, ok := rdmMapped[diskIndex]; ok {
+					if mapped != entry {
+						continue
 					}
+					effectiveMapped = entry
+				} else if disk.Datastore.ID == ds.ID {
+					effectiveMapped = mapped
+					r.Log.Info("RDM disk matched by datastore fallback",
+						"diskKey", disk.Key, "deviceName", disk.DeviceName,
+						"datastoreID", ds.ID)
+				} else {
+					continue
 				}
-				r.Log.Info("RDM disk resolved to storage vendor by NAA",
-					"diskKey", disk.Key, "deviceName", disk.DeviceName,
-					"vendor", rdmVendor, "storageClass", effectiveMapped.Destination.StorageClass)
 			} else if disk.Datastore.ID == ds.ID {
 				effectiveMapped = mapped
 			} else {
+				continue
+			}
+
+			diskSource := baseVolume(disk.File, r.Plan.IsWarm())
+			if r.diskHandledByCsiImport(pvcList, diskSource) {
+				r.Log.Info("Skipping disk in PopulatorVolumes (already handled by CSI import)", "disk", disk.File, "key", disk.Key)
 				continue
 			}
 
@@ -1436,7 +1605,7 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 					labels[TemplateNAALabel] = naa
 				}
 				if errs := k8svalidation.IsValidLabelValue(vm.Host); vm.Host != "" && len(errs) == 0 {
-					labels["sourceHost"] = vm.Host
+					labels[api.LabelSourceHost] = vm.Host
 				}
 
 				if disk.Shared {
@@ -1503,7 +1672,7 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 
 					pvc.Annotations[planbase.AnnEndpoint] = url
 					pvc.Annotations[planbase.AnnImportBackingFile] = baseVolume(disk.File, r.Plan.IsWarm())
-					pvc.Annotations[planbase.AnnUUID] = vm.UUID
+					pvc.Annotations[planbase.AnnUUID] = uuid
 					pvc.Annotations[planbase.AnnThumbprint] = thumbprint
 					pvc.Annotations[planbase.AnnVddkInitImageURL] = settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
 					pvc.Annotations[planbase.AnnPodPhase] = "Succeeded"
@@ -1632,17 +1801,175 @@ func (r *Builder) lookupDatastoreNAA(ds *model.Datastore, cache map[string]strin
 	return naa
 }
 
+// buildCsiImportPVC creates a PVC with CSI import annotations for VVol/RDM disks.
+// The CSI driver reads the annotation and clones the named source array volume; no
+// populator pod, CR, or service account is created.
+func (r *Builder) buildCsiImportPVC(
+	ctx context.Context,
+	vmRef ref.Ref,
+	vm *model.VM,
+	disk vsphere.Disk,
+	diskIndex int,
+	mapped *api.StoragePair,
+	annotations map[string]string,
+) (*core.PersistentVolumeClaim, error) {
+	if mapped.OffloadPlugin == nil || mapped.OffloadPlugin.CsiVolumeImport == nil {
+		return nil, liberr.New("CSI import plugin not configured for storage pair")
+	}
+
+	csiCfg := mapped.OffloadPlugin.CsiVolumeImport
+	r.Log.V(2).Info("CSI import: processing disk", "disk", disk.File, "vendor", csiCfg.StorageVendorProduct, "secretRef", csiCfg.SecretRef)
+
+	if mapped.Destination.StorageClass == "" {
+		return nil, liberr.New("CSI import requires a destination StorageClass to be specified in the storage mapping")
+	}
+
+	if r.Plan.IsWarm() {
+		r.Log.Info("CSI import: warm migration not supported, falling through", "disk", disk.File)
+		return nil, nil //nolint:nilnil
+	}
+
+	vsphereClient := &Client{Context: r.Context}
+	if err := vsphereClient.connect(); err != nil {
+		return nil, liberr.Wrap(err, "failed to connect to vSphere for disk backing detection")
+	}
+	defer vsphereClient.Close()
+
+	backing, err := vsphereClient.getDiskBacking(ctx, vmRef.ID, disk.File)
+	if err != nil {
+		return nil, liberr.Wrap(err, "disk", disk.File)
+	}
+	diskType := resolver.DetectDiskType(backing)
+	r.Log.V(2).Info("CSI import: detected disk backing", "disk", disk.File, "type", diskType, "vvolId", backing.VVolID, "isRDM", backing.IsRDM, "deviceName", backing.DeviceName)
+
+	if diskType == resolver.DiskTypeVMDK {
+		r.Log.Info("CSI import: VMDK disk, falling through", "disk", disk.File)
+		return nil, nil //nolint:nilnil
+	}
+
+	// Read storage credentials from the secret in the source provider's namespace
+	storageSecret := &core.Secret{}
+	if err = r.Destination.Get(ctx, client.ObjectKey{
+		Name:      csiCfg.SecretRef,
+		Namespace: r.Source.Provider.Namespace,
+	}, storageSecret); err != nil {
+		return nil, liberr.Wrap(err, "secretRef", csiCfg.SecretRef)
+	}
+	host := string(storageSecret.Data["STORAGE_HOSTNAME"])
+	user := string(storageSecret.Data["STORAGE_USERNAME"])
+	pass := string(storageSecret.Data["STORAGE_PASSWORD"])
+	skipSSL, err := strconv.ParseBool(string(storageSecret.Data["STORAGE_SKIP_SSL_VERIFICATION"]))
+	if err != nil {
+		r.Log.Error(err, "CSI import: invalid STORAGE_SKIP_SSL_VERIFICATION value, defaulting to false", "secretRef", csiCfg.SecretRef)
+		skipSSL = false
+	}
+
+	var missing []string
+	if host == "" {
+		missing = append(missing, "hostname")
+	}
+	if user == "" {
+		missing = append(missing, "username")
+	}
+	if pass == "" {
+		missing = append(missing, "password")
+	}
+	if len(missing) > 0 {
+		return nil, liberr.New(
+			fmt.Sprintf("storage secret %q is missing required keys: %s", csiCfg.SecretRef, strings.Join(missing, ", ")),
+		)
+	}
+
+	// Instantiate vendor plugin (xcopy pattern: switch in newCsiImportPlugin creates concrete type)
+	plugin, err := newCsiImportPlugin(csiCfg.StorageVendorProduct, host, user, pass, skipSSL)
+	if err != nil {
+		return nil, liberr.Wrap(err, "vendor", string(csiCfg.StorageVendorProduct))
+	}
+
+	r.Log.V(2).Info("CSI import: resolving vendor annotations", "disk", disk.File, "type", diskType, "deviceName", backing.DeviceName)
+	vendorAnnotations, err := plugin.Resolve(backing)
+	if err != nil {
+		return nil, liberr.Wrap(err, "disk", disk.File)
+	}
+	r.Log.V(2).Info("CSI import: vendor resolution succeeded", "annotations", vendorAnnotations)
+
+	// Merge annotations: forklift tracking first, then vendor (vendor wins on collision)
+	// AnnDiskSource must match the task name (vSphere disk file) for GetPopulatorTaskName
+	pvcAnnotations := map[string]string{
+		planbase.AnnDiskSource:  baseVolume(disk.File, r.Plan.IsWarm()),
+		planbase.AnnCopyMethod:  planbase.CopyMethodCsiImport,
+		planbase.AnnCopyOffload: baseVolume(disk.File, r.Plan.IsWarm()),
+	}
+	for k, v := range annotations {
+		pvcAnnotations[k] = v
+	}
+	for k, v := range vendorAnnotations {
+		pvcAnnotations[k] = v
+	}
+
+	namespace := r.Plan.Spec.TargetNamespace
+	storageClass := mapped.Destination.StorageClass
+	pvblock := core.PersistentVolumeBlock
+	pvcLabels := map[string]string{
+		"migration": string(r.Migration.UID),
+		"vmdkKey":   fmt.Sprint(disk.Key),
+		"vmID":      vmRef.ID,
+	}
+
+	pvc := &core.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   namespace,
+			Labels:      pvcLabels,
+			Annotations: pvcAnnotations,
+		},
+		Spec: core.PersistentVolumeClaimSpec{
+			StorageClassName: &storageClass,
+			VolumeMode:       &pvblock,
+			AccessModes:      []core.PersistentVolumeAccessMode{core.ReadWriteMany},
+			Resources: core.VolumeResourceRequirements{
+				Requests: core.ResourceList{
+					core.ResourceStorage: *resource.NewQuantity(disk.Capacity, resource.BinarySI),
+				},
+			},
+			// No DataSourceRef — CSI driver handles provisioning via import annotation
+		},
+	}
+	if mapped.Destination.AccessMode != "" {
+		pvc.Spec.AccessModes = []core.PersistentVolumeAccessMode{mapped.Destination.AccessMode}
+	}
+
+	if err = r.setColdMigrationDefaultPVCName(&pvc.ObjectMeta, vm, diskIndex, disk); err != nil {
+		return nil, liberr.Wrap(err)
+	}
+
+	return pvc, nil
+}
+
 func (r *Builder) PrePopulateActions(c planbase.Client, vmRef ref.Ref) (ready bool, err error) {
 	err = planbase.VolumePopulatorNotSupportedError
 	return
 }
 
-func (r *Builder) PopulatorTransferredBytes(pvc *core.PersistentVolumeClaim) (transferredBytes int64, err error) {
+func (r *Builder) getPopulatorForPVC(pvc *core.PersistentVolumeClaim) (api.VSphereXcopyVolumePopulator, error) {
 	vmdkKey := pvc.Labels["vmdkKey"]
 	vmId := pvc.Labels["vmID"]
-	populatorCr, err := r.getVolumePopulator(vmId, vmdkKey)
+	return r.getVolumePopulator(vmId, vmdkKey)
+}
+
+func (r *Builder) PopulatorTransferredBytes(pvc *core.PersistentVolumeClaim) (transferredBytes int64, err error) {
+	if pvc.Annotations[planbase.AnnCopyMethod] == planbase.CopyMethodCsiImport {
+		pvcSize := pvc.Spec.Resources.Requests[core.ResourceStorage]
+		if pvc.Status.Phase == core.ClaimBound {
+			transferredBytes = pvcSize.Value()
+		} else {
+			transferredBytes = 0
+		}
+		return transferredBytes, nil
+	}
+
+	populatorCr, err := r.getPopulatorForPVC(pvc)
 	if err != nil {
-		return
+		return 0, err
 	}
 
 	if populatorCr.Status.Progress == "" {
@@ -1653,15 +1980,34 @@ func (r *Builder) PopulatorTransferredBytes(pvc *core.PersistentVolumeClaim) (tr
 	progressPercentage, err := strconv.ParseInt(populatorCr.Status.Progress, 10, 64)
 	if err != nil {
 		r.Log.Error(err, "Couldn't parse the progress percentage.", "pvcName", pvc.Name, "progressPercentage", progressPercentage)
-		transferredBytes = 0
-		err = nil
-		return
+		return 0, nil
 	}
 
 	pvcSize := pvc.Spec.Resources.Requests["storage"]
-	transferredBytes = (progressPercentage * pvcSize.Value()) / 100
+	return (progressPercentage * pvcSize.Value()) / 100, nil
+}
 
-	return
+func (r *Builder) PopulatorOffloadInfo(pvc *core.PersistentVolumeClaim) (map[string]string, error) {
+	populatorCr, err := r.getPopulatorForPVC(pvc)
+	if err != nil {
+		return nil, err
+	}
+	info := make(map[string]string)
+	for key, value := range map[string]string{
+		"xcopyUsed":           populatorCr.Status.XcopyUsed,
+		"copyDurationSeconds": populatorCr.Status.CopyDurationSeconds,
+		"result":              populatorCr.Status.Result,
+		"storageVendor":       populatorCr.Status.StorageVendor,
+		"cloneMethod":         populatorCr.Status.CloneMethod,
+		"storageProtocol":     populatorCr.Status.StorageProtocol,
+		"provisionedBytes":    populatorCr.Status.ProvisionedBytes,
+		"allocatedBytes":      populatorCr.Status.AllocatedBytes,
+	} {
+		if value != "" {
+			info[key] = value
+		}
+	}
+	return info, nil
 }
 
 func (r *Builder) getVolumePopulator(vmId, vmdkKey string) (api.VSphereXcopyVolumePopulator, error) {
@@ -1749,6 +2095,16 @@ func (r *Builder) shouldRDMAsLun(vm *model.VM) bool {
 		return *planVM.RDMAsLun
 	}
 	return r.Context.Plan.Spec.RDMAsLun
+}
+
+// shouldSCSIReservation returns whether SCSI persistent reservation should be
+// enabled for shared RDM LUN disks on the given VM.
+// VM-level setting takes precedence; falls back to plan-level setting.
+func (r *Builder) shouldSCSIReservation(vm *model.VM) bool {
+	if planVM := r.getPlanVM(vm); planVM != nil && planVM.SCSIReservation != nil {
+		return *planVM.SCSIReservation
+	}
+	return r.Plan.Spec.SCSIReservation
 }
 
 // getPlanVMStatus get the plan VM status for the given vsphere VM
@@ -1845,8 +2201,11 @@ func (r *Builder) setColdMigrationDefaultPVCName(objectMeta *metav1.ObjectMeta, 
 		rootDiskIndex = utils.GetBootDiskNumber(planVM.RootDisk)
 	}
 
+	targetVmName := planbase.ResolveTargetVmName(r.Plan, vm.ID, vm.Name)
+
 	templateData := api.VSpherePVCNameTemplateData{
-		VmName:         r.getPlanVMSafeName(vm),
+		VmName:         vm.Name,
+		TargetVmName:   targetVmName,
 		PlanName:       r.Plan.Name,
 		DiskIndex:      diskIndex,
 		RootDiskIndex:  rootDiskIndex,
@@ -1862,7 +2221,6 @@ func (r *Builder) setColdMigrationDefaultPVCName(objectMeta *metav1.ObjectMeta, 
 	}
 
 	return r.setObjectNameFromTemplate(objectMeta, templateConfig, &templateData)
-
 }
 
 // setPVCNameFromTemplate sets PVC name/generateName using the PVC template
@@ -2036,7 +2394,8 @@ func (r *Builder) mergeSecrets(migrationSecret, migrationSecretNS, storageVendor
 	baseMigrationSecret := &core.Secret{}
 	if err := r.Destination.Get(context.Background(), client.ObjectKey{
 		Name:      migrationSecret,
-		Namespace: migrationSecretNS}, baseMigrationSecret); err != nil {
+		Namespace: migrationSecretNS,
+	}, baseMigrationSecret); err != nil {
 		return fmt.Errorf("failed to get base migration secret: %w", err)
 	}
 
@@ -2058,7 +2417,8 @@ func (r *Builder) mergeSecrets(migrationSecret, migrationSecretNS, storageVendor
 	src := &core.Secret{}
 	if err := r.Destination.Get(context.Background(), client.ObjectKey{
 		Name:      storageVendorSecret,
-		Namespace: storageVendorSecretNS},
+		Namespace: storageVendorSecretNS,
+	},
 		src); err != nil {
 		return fmt.Errorf("failed to get storage secret: %w", err)
 	}
@@ -2272,7 +2632,6 @@ func (r *Builder) ensurePopulatorServiceAccount(namespace string) error {
 			}
 			return nil
 		})
-
 	if err != nil {
 		return err
 	}
@@ -2405,6 +2764,17 @@ func (r *Builder) findExistingPVCInList(pvc *core.PersistentVolumeClaim, pvcList
 	return nil
 }
 
+func (r *Builder) diskHandledByCsiImport(pvcList *core.PersistentVolumeClaimList, diskSource string) bool {
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if pvc.Annotations[planbase.AnnDiskSource] == diskSource &&
+			pvc.Annotations[planbase.AnnCopyMethod] == planbase.CopyMethodCsiImport {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Builder) generatePopulatorSuffix(migrationUID, vmID string, diskKey int32, diskFile string, diskIndex int) string {
 	input := fmt.Sprintf("%s-%s-%d-%s-%d", migrationUID, vmID, diskKey, diskFile, diskIndex)
 	hash := sha256.Sum256([]byte(input))
@@ -2431,6 +2801,45 @@ func (r *Builder) ensureXCopyVolumePopulator(vp *api.VSphereXcopyVolumePopulator
 		r.Log.Info("Populator already exists", "populator", vp.Name, "namespace", vp.Namespace)
 	}
 	return nil
+}
+
+// CsiImportPVCs creates PVCs for disks that have CsiVolumeImport configured.
+// VMDK disks are skipped (handled by DataVolumes via VDDK or PopulatorVolumes via xcopy).
+func (r *Builder) CsiImportPVCs(vmRef ref.Ref, pvcLabels map[string]string) (pvcs []core.PersistentVolumeClaim, err error) {
+	vm := &model.VM{}
+	if err = r.Source.Inventory.Find(vm, vmRef); err != nil {
+		err = liberr.Wrap(err, "vm", vmRef.String())
+		return
+	}
+	if !r.shouldMigrateSharedDisks(vm) {
+		vm.RemoveSharedDisks()
+	}
+
+	dsMap, err := r.buildDatastoreMap()
+	if err != nil {
+		return
+	}
+
+	disks := vm.SortedDisksAsVmware()
+	for diskIndex, disk := range disks {
+		mapped, found := dsMap[disk.Datastore.ID]
+		if !found {
+			continue
+		}
+		if mapped.OffloadPlugin == nil || mapped.OffloadPlugin.CsiVolumeImport == nil {
+			continue
+		}
+
+		pvc, pErr := r.buildCsiImportPVC(context.TODO(), vmRef, vm, disk, diskIndex, mapped, nil)
+		if pErr != nil {
+			err = pErr
+			return
+		}
+		if pvc != nil {
+			pvcs = append(pvcs, *pvc)
+		}
+	}
+	return
 }
 
 // ConversionPodConfig returns provider-specific configuration for the virt-v2v conversion pod.

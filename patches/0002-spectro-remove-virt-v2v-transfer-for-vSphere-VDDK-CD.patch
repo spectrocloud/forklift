@@ -1,7 +1,8 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shphadnis <134159681+shphadnis@users.noreply.github.com>
 Date: Wed, 26 Aug 2026 14:10:13 -0700
-Subject: [PATCH] spectro: remove virt-v2v transfer for vSphere - VDDK+CDI is
- compulsory
+Subject: [PATCH 2/9] spectro: remove virt-v2v transfer for vSphere - VDDK+CDI
+ is compulsory
 
 Re-derived on upstream v2.12.1. Replaces 58efb0e46 + 4d3702189 + cb469fa97
 + ea6ee1f36 from the 2.9.2 line, which hand-rolled an itinerary and
@@ -23,16 +24,17 @@ OVA and HyperV keep upstream behaviour, matching the 2.9.2 fork where
 CopyDisksVirtV2V stayed gated on OvaImageMigration.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 30df156145ba7645fd97c54355da642a53168859)
 ---
- pkg/apis/forklift/v1beta1/plan.go             | 35 ++++++----------
- .../plan/adapter/vsphere/builder.go           | 40 +++++++------------
- 2 files changed, 26 insertions(+), 49 deletions(-)
+ pkg/apis/forklift/v1beta1/plan.go             | 29 +++++------
+ .../plan/adapter/vsphere/builder.go           | 48 +++++++------------
+ 2 files changed, 30 insertions(+), 47 deletions(-)
 
 diff --git a/pkg/apis/forklift/v1beta1/plan.go b/pkg/apis/forklift/v1beta1/plan.go
-index 0000000..0000000 100644
+index 029914915..623222715 100644
 --- a/pkg/apis/forklift/v1beta1/plan.go
 +++ b/pkg/apis/forklift/v1beta1/plan.go
-@@ -450,29 +450,18 @@ func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref, destinationClient k8sclien
+@@ -465,23 +465,18 @@ func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref) (bool, error) {
  
  	switch source.Type() {
  	case VSphere:
@@ -46,14 +48,8 @@ index 0000000..0000000 100644
 -			p.Spec.SkipGuestConversion || p.Spec.Type == MigrationOnlyConversion {
 -			return false, nil
 -		}
--		if p.Map.Storage != nil {
--			hasNetAppShift, err := p.Map.Storage.HasNetAppShiftDestination(destinationClient)
--			if err != nil {
--				return false, err
--			}
--			if hasNetAppShift {
--				return false, nil
--			}
+-		if p.HasNetAppShiftDestination() {
+-			return false, nil
 -		}
 -		if p.IsUsingOffloadPlugin() {
 -			return false, nil
@@ -75,15 +71,15 @@ index 0000000..0000000 100644
  		return true, nil
  	default:
 diff --git a/pkg/controller/plan/adapter/vsphere/builder.go b/pkg/controller/plan/adapter/vsphere/builder.go
-index 0000000..0000000 100644
+index a239ab9b9..c49afd96d 100644
 --- a/pkg/controller/plan/adapter/vsphere/builder.go
 +++ b/pkg/controller/plan/adapter/vsphere/builder.go
-@@ -564,31 +564,19 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
+@@ -684,35 +684,23 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
  		}
  
  		storageClass := mapped.Destination.StorageClass
 -		var dvSource cdi.DataVolumeSource
--		useV2vForTransfer, vErr := r.Context.Plan.ShouldUseV2vForTransfer(vmRef, r.Context.Destination.Client)
+-		useV2vForTransfer, vErr := r.Plan.ShouldUseV2vForTransfer(vmRef)
 -		if vErr != nil {
 -			err = vErr
 -			return
@@ -95,12 +91,16 @@ index 0000000..0000000 100644
 -			}
 -		} else {
 -			vddkImage := settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
+-			uuid := vm.UUID
+-			if canUseInstanceUUID && vm.InstanceUUID != "" {
+-				uuid = vm.InstanceUUID
+-			}
 -
 -			// Let CDI do the copying
 -			dvSource = cdi.DataVolumeSource{
 -				VDDK: &cdi.DataVolumeSourceVDDK{
 -					BackingFile:  baseVolume(disk.File, r.Plan.IsWarm()),
--					UUID:         vm.UUID,
+-					UUID:         uuid,
 -					URL:          url,
 -					SecretRef:    secret.Name,
 -					Thumbprint:   thumbprint,
@@ -111,10 +111,14 @@ index 0000000..0000000 100644
 +		// the disks and virt-v2v is reduced to in-place conversion, so VDDK is a
 +		// hard requirement for vSphere migrations.
 +		vddkImage := settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
++		uuid := vm.UUID
++		if canUseInstanceUUID && vm.InstanceUUID != "" {
++			uuid = vm.InstanceUUID
++		}
 +		dvSource := cdi.DataVolumeSource{
 +			VDDK: &cdi.DataVolumeSourceVDDK{
 +				BackingFile:  baseVolume(disk.File, r.Plan.IsWarm()),
-+				UUID:         vm.UUID,
++				UUID:         uuid,
 +				URL:          url,
 +				SecretRef:    secret.Name,
 +				Thumbprint:   thumbprint,
@@ -123,7 +127,7 @@ index 0000000..0000000 100644
  		}
  		alignedCapacity := utils.RoundUp(disk.Capacity, utils.DefaultAlignBlockSize)
  		dvSpec := cdi.DataVolumeSpec{
-@@ -639,7 +627,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
+@@ -763,7 +751,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
  			}
  		}
  

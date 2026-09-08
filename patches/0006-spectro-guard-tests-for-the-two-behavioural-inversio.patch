@@ -1,6 +1,7 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shphadnis <134159681+shphadnis@users.noreply.github.com>
 Date: Wed, 26 Aug 2026 14:17:37 -0700
-Subject: [PATCH] spectro: guard tests for the two behavioural inversions
+Subject: [PATCH 6/9] spectro: guard tests for the two behavioural inversions
 
 Upstream has no coverage for RequiresConversion() or
 ShouldUseV2vForTransfer(), so nothing catches an upstream refactor that
@@ -11,6 +12,7 @@ Kept in a separate _test.go named for the fork, following the
 *_spectro_test.go convention from the 2.9.2 line.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit e7985435af9cc0137c6420913df94636403a607e)
 ---
  .../forklift/v1beta1/spectro_fork_test.go     | 70 +++++++++++++++++++
  1 file changed, 70 insertions(+)
@@ -18,7 +20,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 
 diff --git a/pkg/apis/forklift/v1beta1/spectro_fork_test.go b/pkg/apis/forklift/v1beta1/spectro_fork_test.go
 new file mode 100644
-index 0000000..0000000
+index 000000000..35fd27927
 --- /dev/null
 +++ b/pkg/apis/forklift/v1beta1/spectro_fork_test.go
 @@ -0,0 +1,70 @@

@@ -443,36 +443,27 @@ func hasMultipleStaticIPsPerNIC(vm *model.VM) bool {
 	if !isWindows(vm) {
 		return false
 	}
-	macIPCount := make(map[string]int)
+	var manualMACs []string
 	for _, gn := range vm.GuestNetworks {
-		if gn.Origin == hyperv.OriginManual && net.ParseIP(gn.IP).To4() != nil {
-			macIPCount[gn.MAC]++
+		if gn.Origin == hyperv.OriginManual {
+			manualMACs = append(manualMACs, gn.MAC)
 		}
 	}
-	for _, count := range macIPCount {
-		if count > 1 {
-			return true
-		}
-	}
-	return false
+	return planbase.HasMultipleIPsPerMAC(manualMACs)
 }
 
 func (r *Builder) mapMacStaticIps(vm *model.VM) string {
 	isWin := isWindows(vm)
+	networks := planbase.SortedIPv4First(vm.GuestNetworks, func(gn hyperv.GuestNetwork) string { return gn.IP })
 
 	var configurations []string
-	for _, gn := range vm.GuestNetworks {
+	for _, gn := range networks {
 		if !isWin || gn.Origin == hyperv.OriginManual {
 			ip := net.ParseIP(gn.IP)
 			if ip == nil {
 				continue
 			}
-			// Skip link-local addresses
 			if ip.IsLinkLocalUnicast() {
-				continue
-			}
-			// For Windows, skip IPv6
-			if isWin && ip.To4() == nil {
 				continue
 			}
 
@@ -520,6 +511,10 @@ func (r *Builder) PopulatorTransferredBytes(_ *core.PersistentVolumeClaim) (int6
 	return 0, planbase.VolumePopulatorNotSupportedError
 }
 
+func (r *Builder) PopulatorOffloadInfo(_ *core.PersistentVolumeClaim) (map[string]string, error) {
+	return map[string]string{}, nil
+}
+
 func (r *Builder) SetPopulatorDataSourceLabels(_ ref.Ref, _ []*core.PersistentVolumeClaim) error {
 	return nil
 }
@@ -547,6 +542,10 @@ func (r *Builder) ConversionPodConfig(_ ref.Ref) (*planbase.ConversionPodConfigR
 }
 
 func (r *Builder) NetAppShiftPVCs(vmRef ref.Ref, labels map[string]string) ([]core.PersistentVolumeClaim, error) {
+	return nil, nil
+}
+
+func (r *Builder) CsiImportPVCs(_ ref.Ref, _ map[string]string) ([]core.PersistentVolumeClaim, error) {
 	return nil, nil
 }
 

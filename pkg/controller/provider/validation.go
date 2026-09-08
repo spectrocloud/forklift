@@ -39,6 +39,7 @@ const (
 	SettingsNotValid        = "SettingsNotValid"
 	Validated               = "Validated"
 	ConnectionAuthFailed    = "ConnectionAuthFailed"
+	ConnectionAuthRetry     = "ConnectionAuthRetry"
 	ConnectionTestSucceeded = "ConnectionTestSucceeded"
 	ConnectionTestFailed    = "ConnectionTestFailed"
 	InventoryCreated        = "InventoryCreated"
@@ -134,6 +135,12 @@ func (r *Reconciler) validate(provider *api.Provider) error {
 
 	// Validate SMB CSI driver for HyperV providers
 	err = r.validateSMBCSI(provider)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+
+	// Validate Hyper-V settings (managementType)
+	err = r.validateHyperVSettings(provider)
 	if err != nil {
 		return liberr.Wrap(err)
 	}
@@ -247,6 +254,7 @@ func (r *Reconciler) validateTLSConnection(provider *api.Provider, secret *core.
 
 	_, err := base.VerifyTLSConnection(tlsURL, secret)
 	if err != nil {
+		provider.Status.Phase = ConnectionFailed
 		provider.Status.SetCondition(libcnd.Condition{
 			Type:     ConnectionTestFailed,
 			Status:   True,
@@ -467,17 +475,7 @@ func (r *Reconciler) testConnection(provider *api.Provider, secret *core.Secret)
 		// When the status is unauthorized controller stops the reconciliation, so the user account does not get locked.
 		// Providing bad credentials when requesting the token results in 400, and not 401.
 		if status == http.StatusUnauthorized || status == http.StatusBadRequest {
-			provider.Status.Phase = ConnectionFailed
-			provider.Status.SetCondition(
-				libcnd.Condition{
-					Type:     ConnectionAuthFailed,
-					Status:   True,
-					Reason:   Tested,
-					Category: Critical,
-					Message: fmt.Sprintf(
-						"Connection auth failed, error: %s",
-						err.Error()),
-				})
+			setAuthFailureConditions(provider, err)
 			return nil
 		}
 		log.Info(
@@ -1300,4 +1298,58 @@ func (r *Reconciler) validateSMBCSI(provider *api.Provider) error {
 	// SMB CSI driver is installed - remove any previous condition
 	provider.Status.DeleteCondition(SMBCSIDriverNotReady)
 	return nil
+}
+
+func (r *Reconciler) validateHyperVSettings(provider *api.Provider) error {
+	if provider.Type() != api.HyperV {
+		return nil
+	}
+	if provider.Status.HasBlockerCondition() {
+		return nil
+	}
+
+	mt := provider.Spec.Settings[api.ManagementType]
+	if mt != "" && mt != api.HyperVStandalone && mt != api.HyperVCluster {
+		provider.Status.Phase = ValidationFailed
+		provider.Status.SetCondition(libcnd.Condition{
+			Type:     SettingsNotValid,
+			Status:   True,
+			Category: Critical,
+			Reason:   "InvalidManagementType",
+			Message: fmt.Sprintf(
+				"Invalid managementType '%s'. Allowed values: '%s', '%s', or empty (defaults to standalone).",
+				mt, api.HyperVStandalone, api.HyperVCluster),
+		})
+		return nil
+	}
+
+	provider.Status.DeleteCondition(SettingsNotValid)
+	return nil
+}
+
+// setAuthFailureConditions sets ConnectionAuthFailed on the provider.
+// For HyperV, it also sets ConnectionAuthRetry because a 401 may indicate
+// disabled WinRM Basic auth rather than wrong credentials.
+func setAuthFailureConditions(provider *api.Provider, connErr error) {
+	provider.Status.Phase = ConnectionFailed
+	provider.Status.SetCondition(
+		libcnd.Condition{
+			Type:     ConnectionAuthFailed,
+			Status:   True,
+			Reason:   Tested,
+			Category: Critical,
+			Message: fmt.Sprintf(
+				"Connection auth failed, error: %s",
+				connErr.Error()),
+		})
+	if provider.Type() == api.HyperV {
+		provider.Status.SetCondition(
+			libcnd.Condition{
+				Type:     ConnectionAuthRetry,
+				Status:   True,
+				Reason:   Tested,
+				Category: Advisory,
+				Message:  "HyperV auth failure may be a host-side WinRM configuration issue, periodic retry enabled.",
+			})
+	}
 }

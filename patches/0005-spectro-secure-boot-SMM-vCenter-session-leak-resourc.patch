@@ -1,6 +1,7 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shphadnis <134159681+shphadnis@users.noreply.github.com>
 Date: Wed, 26 Aug 2026 14:15:16 -0700
-Subject: [PATCH] spectro: secure boot SMM, vCenter session leak, resource
+Subject: [PATCH 5/9] spectro: secure boot SMM, vCenter session leak, resource
  limits
 
 Re-derived on upstream v2.12.1. All three were checked against v2.12.1
@@ -27,6 +28,7 @@ VirtV2vContainerRequests/Limits settings, so hardcoding would override
 configuration that now works properly.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 492273215c2ff1ccaa66d6eaf9516f07aa464c26)
 ---
  .../forkliftcontroller/defaults/main.yml      |  6 +++--
  .../roles/forkliftcontroller/tasks/main.yml   | 11 ++++++++
@@ -37,7 +39,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  6 files changed, 55 insertions(+), 19 deletions(-)
 
 diff --git a/operator/roles/forkliftcontroller/defaults/main.yml b/operator/roles/forkliftcontroller/defaults/main.yml
-index 0000000..0000000 100644
+index 8daf84fae..d26d76da4 100644
 --- a/operator/roles/forkliftcontroller/defaults/main.yml
 +++ b/operator/roles/forkliftcontroller/defaults/main.yml
 @@ -78,8 +78,10 @@ inventory_container_name: "{{ app_name }}-inventory"
@@ -54,7 +56,7 @@ index 0000000..0000000 100644
  inventory_container_requests_memory: "500Mi"
  inventory_tls_secret_name: "{{ inventory_service_name }}-serving-cert"
 diff --git a/operator/roles/forkliftcontroller/tasks/main.yml b/operator/roles/forkliftcontroller/tasks/main.yml
-index 0000000..0000000 100644
+index 280a24ebb..31b197ce0 100644
 --- a/operator/roles/forkliftcontroller/tasks/main.yml
 +++ b/operator/roles/forkliftcontroller/tasks/main.yml
 @@ -63,10 +63,21 @@
@@ -80,13 +82,13 @@ index 0000000..0000000 100644
    - name: "Setup inventory service"
      k8s:
 diff --git a/pkg/controller/plan/adapter/vsphere/builder.go b/pkg/controller/plan/adapter/vsphere/builder.go
-index 0000000..0000000 100644
+index c49afd96d..91ed0ac0e 100644
 --- a/pkg/controller/plan/adapter/vsphere/builder.go
 +++ b/pkg/controller/plan/adapter/vsphere/builder.go
-@@ -925,11 +925,15 @@ func (r *Builder) mapFirmware(vm *model.VM, object *cnv.VirtualMachineSpec) {
- 			EFI: &cnv.EFI{
+@@ -1055,11 +1055,15 @@ func (r *Builder) mapFirmware(vm *model.VM, object *cnv.VirtualMachineSpec) {
  				SecureBoot: &vm.SecureBoot,
- 			}}
+ 			},
+ 		}
 +		// SecureBoot requires SMM or the KubeVirt webhook rejects the VM.
 +		// Upstream replaces Features wholesale here, discarding anything set
 +		// earlier; only set the SMM field.
@@ -104,7 +106,7 @@ index 0000000..0000000 100644
  		}
  	default:
 diff --git a/pkg/controller/plan/adapter/vsphere/host.go b/pkg/controller/plan/adapter/vsphere/host.go
-index 0000000..0000000 100644
+index f06705277..3a234481d 100644
 --- a/pkg/controller/plan/adapter/vsphere/host.go
 +++ b/pkg/controller/plan/adapter/vsphere/host.go
 @@ -34,10 +34,9 @@ func (r *EsxHost) TestConnection() (err error) {
@@ -138,7 +140,7 @@ index 0000000..0000000 100644
  	}
  
 diff --git a/pkg/controller/provider/container/vsphere/collector.go b/pkg/controller/provider/container/vsphere/collector.go
-index 0000000..0000000 100644
+index ebb22f02f..036c76ab7 100644
 --- a/pkg/controller/provider/container/vsphere/collector.go
 +++ b/pkg/controller/provider/container/vsphere/collector.go
 @@ -359,7 +359,14 @@ func (r *Collector) Follow(moRef interface{}, p []string, dst interface{}) error
@@ -190,10 +192,10 @@ index 0000000..0000000 100644
  }
  
 diff --git a/pkg/settings/migration.go b/pkg/settings/migration.go
-index 0000000..0000000 100644
+index c5836a183..9cc1bb1d1 100644
 --- a/pkg/settings/migration.go
 +++ b/pkg/settings/migration.go
-@@ -328,7 +328,9 @@ func (r *Migration) Load() (err error) {
+@@ -312,7 +312,9 @@ func (r *Migration) Load() (err error) {
  	if val, found := os.LookupEnv(VirtV2vContainerLimitsMemory); found {
  		r.VirtV2vContainerLimitsMemory = val
  	} else {

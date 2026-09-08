@@ -6,6 +6,7 @@ import (
 
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
+	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	utils "github.com/kubev2v/forklift/pkg/controller/plan/util"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	libitr "github.com/kubev2v/forklift/pkg/lib/itinerary"
@@ -114,6 +115,10 @@ func (r *Builder) SetPopulatorDataSourceLabels(vmRef ref.Ref, pvcs []*core.Persi
 // without relying on the volume populator controller.
 func (r *Builder) SupportsVolumePopulators() bool {
 	return false
+}
+
+func (r *Builder) PopulatorOffloadInfo(_ *core.PersistentVolumeClaim) (map[string]string, error) {
+	return map[string]string{}, nil
 }
 
 // PopulatorTransferredBytes is a no-op for EC2 - direct volume creation doesn't use populators.
@@ -280,6 +285,7 @@ func (r *Builder) BuildDirectPVC(vmRef ref.Ref, volumeInfo *VolumeInfo, index in
 	pvcLabels["forklift.konveyor.io/volume-id"] = volumeInfo.OriginalVolumeID
 
 	pvcAnnotations := map[string]string{
+		planbase.AnnDiskSource:                    volumeInfo.OriginalVolumeID,
 		"forklift.konveyor.io/original-volume-id": volumeInfo.OriginalVolumeID,
 		"forklift.konveyor.io/ebs-volume-id":      volumeInfo.EBSVolumeID,
 		"forklift.konveyor.io/snapshot-id":        volumeInfo.SnapshotID,

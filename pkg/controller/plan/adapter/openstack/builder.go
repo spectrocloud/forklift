@@ -2,6 +2,7 @@ package openstack
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -546,6 +547,7 @@ func (r *Builder) mapDisks(vm *model.Workload, persistentVolumeClaims []*core.Pe
 func (r *Builder) mapNetworks(vm *model.Workload, object *cnv.VirtualMachineSpec) (err error) {
 	var kNetworks []cnv.Network
 	var kInterfaces []cnv.Interface
+	staticIpInterfaces := make(map[string][]string)
 
 	hasUDN := r.Plan.DestinationHasUdnNetwork(r.Destination)
 	numNetworks := 0
@@ -627,6 +629,11 @@ func (r *Builder) mapNetworks(vm *model.Workload, object *cnv.VirtualMachineSpec
 						kInterface.Binding = &cnv.PluginBinding{
 							Name: planbase.UdnL2bridge,
 						}
+						if r.Plan.Spec.PreserveStaticIPs {
+							if ip := getFixedIPv4ForNetwork(vm, vmNetworkName); ip != "" {
+								staticIpInterfaces[networkName] = append(staticIpInterfaces[networkName], ip)
+							}
+						}
 					} else {
 						kInterface.Masquerade = &cnv.InterfaceMasquerade{}
 					}
@@ -647,6 +654,18 @@ func (r *Builder) mapNetworks(vm *model.Workload, object *cnv.VirtualMachineSpec
 
 	object.Template.Spec.Networks = kNetworks
 	object.Template.Spec.Domain.Devices.Interfaces = kInterfaces
+
+	if settings.Settings.StaticUdnIpAddresses && hasUDN && r.Plan.Spec.PreserveStaticIPs && len(staticIpInterfaces) > 0 {
+		var staticIpInterfacesAnnotation []byte
+		staticIpInterfacesAnnotation, err = json.Marshal(staticIpInterfaces)
+		if err != nil {
+			return err
+		}
+		if object.Template.ObjectMeta.Annotations == nil {
+			object.Template.ObjectMeta.Annotations = make(map[string]string)
+		}
+		object.Template.ObjectMeta.Annotations[planbase.AnnStaticUdnIp] = string(staticIpInterfacesAnnotation)
+	}
 
 	var vifMultiQueueEnabled *bool
 	if imageVifMultiQueueEnabled, ok := vm.Image.Properties[VifMultiQueueEnabled]; ok {
@@ -1301,6 +1320,10 @@ func (r *Builder) getImageFromPVC(pvc *core.PersistentVolumeClaim) (image *model
 	return
 }
 
+func (r *Builder) PopulatorOffloadInfo(_ *core.PersistentVolumeClaim) (map[string]string, error) {
+	return map[string]string{}, nil
+}
+
 func (r *Builder) SetPopulatorDataSourceLabels(vmRef ref.Ref, pvcs []*core.PersistentVolumeClaim) (err error) {
 	workload := &model.Workload{}
 	err = r.Source.Inventory.Find(workload, vmRef)
@@ -1385,6 +1408,10 @@ func (r *Builder) ConversionPodConfig(_ ref.Ref) (*planbase.ConversionPodConfigR
 }
 
 func (r *Builder) NetAppShiftPVCs(vmRef ref.Ref, labels map[string]string) ([]core.PersistentVolumeClaim, error) {
+	return nil, nil
+}
+
+func (r *Builder) CsiImportPVCs(_ ref.Ref, _ map[string]string) ([]core.PersistentVolumeClaim, error) {
 	return nil, nil
 }
 

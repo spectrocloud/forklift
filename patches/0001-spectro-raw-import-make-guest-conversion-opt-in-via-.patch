@@ -1,6 +1,7 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shphadnis <134159681+shphadnis@users.noreply.github.com>
 Date: Wed, 26 Aug 2026 14:06:22 -0700
-Subject: [PATCH] spectro: raw import - make guest conversion opt-in via
+Subject: [PATCH 1/9] spectro: raw import - make guest conversion opt-in via
  convertDisk
 
 Re-derived on upstream v2.12.1 (was 8178bc0d7 on the 2.9.2 line).
@@ -13,6 +14,7 @@ so raw disk import is the default.
 - Plan.IsSourceProviderOVA() helper used by the migration predicates
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit ac4ff8f4a12e5eeef0f72b8533c70763ff2be7ef)
 ---
  .../crd/bases/forklift.konveyor.io_providers.yaml      |  3 +++
  pkg/apis/forklift/v1beta1/plan.go                      |  4 ++++
@@ -21,7 +23,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  4 files changed, 21 insertions(+), 1 deletion(-)
 
 diff --git a/operator/config/crd/bases/forklift.konveyor.io_providers.yaml b/operator/config/crd/bases/forklift.konveyor.io_providers.yaml
-index 0000000..0000000 100644
+index d62ff9efd..5184e66d0 100644
 --- a/operator/config/crd/bases/forklift.konveyor.io_providers.yaml
 +++ b/operator/config/crd/bases/forklift.konveyor.io_providers.yaml
 @@ -60,6 +60,9 @@ spec:
@@ -35,10 +37,10 @@ index 0000000..0000000 100644
                  description: |-
                    References a secret containing credentials and
 diff --git a/pkg/apis/forklift/v1beta1/plan.go b/pkg/apis/forklift/v1beta1/plan.go
-index 0000000..0000000 100644
+index e47a2482f..029914915 100644
 --- a/pkg/apis/forklift/v1beta1/plan.go
 +++ b/pkg/apis/forklift/v1beta1/plan.go
-@@ -536,6 +536,10 @@ func (r *Plan) IsSourceProviderOCP() bool {
+@@ -549,6 +549,10 @@ func (r *Plan) IsSourceProviderOCP() bool {
  
  func (r *Plan) IsSourceProviderVSphere() bool { return r.Provider.Source.Type() == VSphere }
  
@@ -50,10 +52,10 @@ index 0000000..0000000 100644
  	return r.IsSourceProviderVSphere() &&
  		r.IsWarm() &&
 diff --git a/pkg/apis/forklift/v1beta1/provider.go b/pkg/apis/forklift/v1beta1/provider.go
-index 0000000..0000000 100644
+index 0440580a3..41484c4c3 100644
 --- a/pkg/apis/forklift/v1beta1/provider.go
 +++ b/pkg/apis/forklift/v1beta1/provider.go
-@@ -101,6 +101,8 @@ type ProviderSpec struct {
+@@ -108,6 +108,8 @@ type ProviderSpec struct {
  	Secret core.ObjectReference `json:"secret" ref:"Secret"`
  	// Provider settings.
  	Settings map[string]string `json:"settings,omitempty"`
@@ -62,7 +64,7 @@ index 0000000..0000000 100644
  }
  
  // ProviderStatus defines the observed state of Provider
-@@ -185,7 +187,13 @@ func (p *Provider) HasReconciled() bool {
+@@ -192,7 +194,13 @@ func (p *Provider) HasReconciled() bool {
  
  // This provider requires VM guest conversion.
  func (p *Provider) RequiresConversion() bool {
@@ -78,10 +80,10 @@ index 0000000..0000000 100644
  
  // This provider support the vddk aio parameters.
 diff --git a/pkg/apis/forklift/v1beta1/zz_generated.deepcopy.go b/pkg/apis/forklift/v1beta1/zz_generated.deepcopy.go
-index 0000000..0000000 100644
+index c69fdd1a5..69e578411 100644
 --- a/pkg/apis/forklift/v1beta1/zz_generated.deepcopy.go
 +++ b/pkg/apis/forklift/v1beta1/zz_generated.deepcopy.go
-@@ -1505,6 +1505,11 @@ func (in *ProviderSpec) DeepCopyInto(out *ProviderSpec) {
+@@ -1525,6 +1525,11 @@ func (in *ProviderSpec) DeepCopyInto(out *ProviderSpec) {
  			(*out)[key] = val
  		}
  	}

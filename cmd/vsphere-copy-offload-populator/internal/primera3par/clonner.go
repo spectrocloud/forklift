@@ -2,6 +2,7 @@ package primera3par
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 
@@ -11,6 +12,8 @@ import (
 	"github.com/kubev2v/forklift/cmd/vsphere-copy-offload-populator/internal/populator"
 	"github.com/kubev2v/forklift/cmd/vsphere-copy-offload-populator/internal/vmware"
 )
+
+const maxHostSetNameLen = 27
 
 const PROVIDER_ID = "60002ac"
 
@@ -56,8 +59,17 @@ func NewPrimera3ParClonner(storageHostname, storageUsername, storagePassword str
 	return clonner, nil
 }
 
+func sanitizeHostSetName(name string) string {
+	if len(name) <= maxHostSetNameLen {
+		return name
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(name)))
+	return fmt.Sprintf("xcopy-%s", hash[:maxHostSetNameLen-len("xcopy-")])
+}
+
 // EnsureClonnerIgroup creates or update an initiator group with the clonnerIqn
 func (c *Primera3ParClonner) EnsureClonnerIgroup(initiatorGroup string, adapterIds []string) (populator.MappingContext, error) {
+	initiatorGroup = sanitizeHostSetName(initiatorGroup)
 	c.log.Info("ensuring initiator group", "group", initiatorGroup, "adapters", adapterIds)
 
 	c.initiatorGroup = initiatorGroup
@@ -147,15 +159,15 @@ func (c *Primera3ParClonner) VvolCopy(vsphereClient vmware.Client, vmId string, 
 		return fmt.Errorf("failed to get VVol disk backing info: %w", err)
 	}
 
-	if backing.VVolId == "" {
+	if backing.VVolID == "" {
 		return fmt.Errorf("disk %s is not a VVol disk", sourceVMDKFile)
 	}
 
-	c.log.Info("found VVol backing", "vvol_id", backing.VVolId)
+	c.log.Info("found VVol backing", "vvol_id", backing.VVolID)
 
-	sourceVolumeName, err := c.findVolumeByVVolID(backing.VVolId)
+	sourceVolumeName, err := c.findVolumeByVVolID(backing.VVolID)
 	if err != nil {
-		return fmt.Errorf("failed to find source volume by VVol ID %s: %w", backing.VVolId, err)
+		return fmt.Errorf("failed to find source volume by VVol ID %s: %w", backing.VVolID, err)
 	}
 
 	c.log.Info("resolving target PV to LUN", "pv", persistentVolume.Name)

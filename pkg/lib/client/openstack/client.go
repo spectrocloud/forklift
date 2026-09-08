@@ -33,6 +33,7 @@ import (
 	"github.com/gophercloud/utils/openstack/clientconfig"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
+	"github.com/kubev2v/forklift/pkg/lib/util"
 	core "k8s.io/api/core/v1"
 )
 
@@ -72,6 +73,7 @@ type Client struct {
 	URL                 string
 	Options             map[string]string
 	Log                 logging.LevelLogger
+	secret              *core.Secret
 	provider            *gophercloud.ProviderClient
 	identityService     *gophercloud.ServiceClient
 	computeService      *gophercloud.ServiceClient
@@ -81,6 +83,7 @@ type Client struct {
 }
 
 func (c *Client) LoadOptionsFromSecret(secret *core.Secret) {
+	c.secret = secret
 	c.Options = make(map[string]string)
 	for key, value := range secret.Data {
 		c.Options[key] = string(value)
@@ -179,9 +182,14 @@ func (c *Client) getTLSConfig() (tlsConfig *tls.Config, err error) {
 		if c.getBoolFromOptions(InsecureSkipVerify) {
 			tlsConfig = &tls.Config{InsecureSkipVerify: true}
 		} else {
-			cacert := []byte(c.getStringFromOptions(CACert))
+			var cacert []byte
+			if c.secret != nil {
+				cacert, _ = util.GetCACert(c.secret)
+			} else {
+				cacert = []byte(c.getStringFromOptions(CACert))
+			}
 			if len(cacert) == 0 {
-				c.Log.Info("CA certificate was not provided,system CA cert pool is used")
+				c.Log.Info("CA certificate was not provided, system CA cert pool is used")
 			} else {
 				roots := x509.NewCertPool()
 				ok := roots.AppendCertsFromPEM(cacert)

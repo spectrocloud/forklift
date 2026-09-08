@@ -14,6 +14,7 @@ import (
 	reflect "reflect"
 
 	vmware "github.com/kubev2v/forklift/cmd/vsphere-copy-offload-populator/internal/vmware"
+	resolver "github.com/kubev2v/forklift/pkg/storage/resolver"
 	esx "github.com/vmware/govmomi/cli/esx"
 	object "github.com/vmware/govmomi/object"
 	gomock "go.uber.org/mock/gomock"
@@ -59,18 +60,18 @@ func (mr *MockClientMockRecorder) GetDatastore(ctx, dc, datastore any) *gomock.C
 }
 
 // GetDatastoreActiveAdapters mocks base method.
-func (m *MockClient) GetDatastoreActiveAdapters(ctx context.Context, host *object.HostSystem, datastoreName string) ([]vmware.HostAdapter, error) {
+func (m *MockClient) GetDatastoreActiveAdapters(ctx context.Context, host *object.HostSystem, datastoreName string, destinationRequiresScini bool) ([]vmware.HostAdapter, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetDatastoreActiveAdapters", ctx, host, datastoreName)
+	ret := m.ctrl.Call(m, "GetDatastoreActiveAdapters", ctx, host, datastoreName, destinationRequiresScini)
 	ret0, _ := ret[0].([]vmware.HostAdapter)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // GetDatastoreActiveAdapters indicates an expected call of GetDatastoreActiveAdapters.
-func (mr *MockClientMockRecorder) GetDatastoreActiveAdapters(ctx, host, datastoreName any) *gomock.Call {
+func (mr *MockClientMockRecorder) GetDatastoreActiveAdapters(ctx, host, datastoreName, destinationRequiresScini any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetDatastoreActiveAdapters", reflect.TypeOf((*MockClient)(nil).GetDatastoreActiveAdapters), ctx, host, datastoreName)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetDatastoreActiveAdapters", reflect.TypeOf((*MockClient)(nil).GetDatastoreActiveAdapters), ctx, host, datastoreName, destinationRequiresScini)
 }
 
 // GetEsxByVm mocks base method.
@@ -89,10 +90,10 @@ func (mr *MockClientMockRecorder) GetEsxByVm(ctx, vmName any) *gomock.Call {
 }
 
 // GetVMDiskBacking mocks base method.
-func (m *MockClient) GetVMDiskBacking(ctx context.Context, vmId, vmdkPath string) (*vmware.DiskBacking, error) {
+func (m *MockClient) GetVMDiskBacking(ctx context.Context, vmId, vmdkPath string) (*resolver.DiskBacking, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetVMDiskBacking", ctx, vmId, vmdkPath)
-	ret0, _ := ret[0].(*vmware.DiskBacking)
+	ret0, _ := ret[0].(*resolver.DiskBacking)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
@@ -104,12 +105,12 @@ func (mr *MockClientMockRecorder) GetVMDiskBacking(ctx, vmId, vmdkPath any) *gom
 }
 
 // GetVirtualDiskSizes mocks base method.
-func (m *MockClient) GetVirtualDiskSizes(ctx context.Context, vmId, vmdkPath string) (int64, int64, *vmware.DiskBacking, error) {
+func (m *MockClient) GetVirtualDiskSizes(ctx context.Context, vmId, vmdkPath string) (int64, int64, *resolver.DiskBacking, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetVirtualDiskSizes", ctx, vmId, vmdkPath)
 	ret0, _ := ret[0].(int64)
 	ret1, _ := ret[1].(int64)
-	ret2, _ := ret[2].(*vmware.DiskBacking)
+	ret2, _ := ret[2].(*resolver.DiskBacking)
 	ret3, _ := ret[3].(error)
 	return ret0, ret1, ret2, ret3
 }

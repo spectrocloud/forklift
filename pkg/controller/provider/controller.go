@@ -60,10 +60,8 @@ import (
 )
 
 const (
-	// Name.
-	Name               = "provider"
-	OvaTimeout         = 10 * time.Minute
-	OvaReconcilerRetry = 5 * time.Second
+	Name         = "provider"
+	AuthRetryReQ = 3 * time.Minute
 )
 
 // Package logger.
@@ -194,7 +192,11 @@ func (r Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (r
 	}()
 
 	defer func() {
-		// Stop reconciliation when auth fails
+		if provider.Status.HasCondition(ConnectionAuthRetry) {
+			result.RequeueAfter = AuthRetryReQ
+			err = nil
+			return
+		}
 		if provider.Status.HasCondition(ConnectionAuthFailed) {
 			result.RequeueAfter = 0
 			err = nil
@@ -337,6 +339,13 @@ func (r *Reconciler) updateContainer(provider *api.Provider) (err error) {
 	}
 	secretChanged := secret.ResourceVersion != provider.Status.SecretResourceVersion
 
+	if provider.Status.HasBlockerCondition() ||
+		!provider.Status.HasCondition(ConnectionTestSucceeded) {
+		r.Log.V(1).Info(
+			"Provider not ready, postponing.")
+		return
+	}
+
 	if !secretChanged {
 		if _, found := r.container.Get(provider); found {
 			// Don't update if provider hasn't changed
@@ -346,15 +355,6 @@ func (r *Reconciler) updateContainer(provider *api.Provider) (err error) {
 				return
 			}
 		}
-
-		// Only build a new collector if connection test succeeded
-		if provider.Status.HasBlockerCondition() ||
-			!provider.Status.HasCondition(ConnectionTestSucceeded) {
-			r.Log.V(1).Info(
-				"Provider not ready, postponing.")
-			return
-		}
-
 	} else {
 		r.Log.V(1).Info(
 			"Detected Secret change.",

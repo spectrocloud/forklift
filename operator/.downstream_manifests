@@ -5322,6 +5322,14 @@ spec:
                     rootDisk:
                       description: Choose the primary disk the VM boots from
                       type: string
+                    scsiReservation:
+                      description: |-
+                        SCSIReservation controls whether SCSI persistent reservation is enabled for
+                        shared RDM LUN disks on this VM. Requires rdmAsLun=true to have any effect.
+                        When nil (default), the plan-level scsiReservation value is used.
+                        When explicitly set to true, shared RDM LUNs for this VM get lun.reservation=true.
+                        When explicitly set to false, shared RDM LUNs for this VM get lun.reservation=false.
+                      type: boolean
                     started:
                       description: Started timestamp.
                       format: date-time
@@ -7534,6 +7542,15 @@ spec:
                   - true (default): Inspection step runs before transferring any disks and may fail if it detects the migration would fail.
                   - false: No inspection is performed before disk transfer.
                 type: boolean
+              scsiReservation:
+                description: |-
+                  SCSIReservation controls whether SCSI persistent reservation is enabled for
+                  shared RDM LUN disks. Requires rdmAsLun=true to have any effect.
+                  When false (default), shared RDM LUNs are migrated without persistent reservation.
+                  When true, shared RDM LUNs are configured with KubeVirt lun.reservation=true,
+                  which is required for workloads that use SCSI PR-based fencing (e.g. shared-disk clusters).
+                  Can be overridden per VM via spec.vms[].scsiReservation.
+                type: boolean
               serviceAccount:
                 description: |-
                   ServiceAccount is the name of the ServiceAccount to use for migration
@@ -8841,6 +8858,14 @@ spec:
                     rootDisk:
                       description: Choose the primary disk the VM boots from
                       type: string
+                    scsiReservation:
+                      description: |-
+                        SCSIReservation controls whether SCSI persistent reservation is enabled for
+                        shared RDM LUN disks on this VM. Requires rdmAsLun=true to have any effect.
+                        When nil (default), the plan-level scsiReservation value is used.
+                        When explicitly set to true, shared RDM LUNs for this VM get lun.reservation=true.
+                        When explicitly set to false, shared RDM LUNs for this VM get lun.reservation=false.
+                      type: boolean
                     targetName:
                       description: |-
                         TargetName specifies a custom name for the VM in the target cluster.
@@ -9636,6 +9661,14 @@ spec:
                         rootDisk:
                           description: Choose the primary disk the VM boots from
                           type: string
+                        scsiReservation:
+                          description: |-
+                            SCSIReservation controls whether SCSI persistent reservation is enabled for
+                            shared RDM LUN disks on this VM. Requires rdmAsLun=true to have any effect.
+                            When nil (default), the plan-level scsiReservation value is used.
+                            When explicitly set to true, shared RDM LUNs for this VM get lun.reservation=true.
+                            When explicitly set to false, shared RDM LUNs for this VM get lun.reservation=false.
+                          type: boolean
                         started:
                           description: Started timestamp.
                           format: date-time
@@ -9731,6 +9764,11 @@ spec:
                       type: object
                     type: array
                 type: object
+              netAppShiftDestination:
+                description: |-
+                  NetAppShiftDestination indicates whether the plan's storage map resolves to a NetApp
+                  Shift/Trident destination StorageClass.
+                type: boolean
               observedGeneration:
                 description: The most recent generation observed by the controller.
                 format: int64
@@ -10051,6 +10089,26 @@ spec:
                     offloadPlugin:
                       description: Offload Plugin
                       properties:
+                        csiVolumeImport:
+                          description: |-
+                            CsiVolumeImport uses the CSI driver's native import capability to migrate VVol/RDM disks.
+                            The controller creates a PVC with import annotations; the CSI driver clones the source array
+                            volume directly — no populator pod, no CR, no service account is launched.
+                          properties:
+                            secretRef:
+                              description: SecretRef is the name of the secret with
+                                storage credentials, in the source provider's namespace.
+                              type: string
+                            storageVendorProduct:
+                              description: StorageVendorProduct identifies the storage
+                                array vendor.
+                              enum:
+                              - primera3par
+                              type: string
+                          required:
+                          - secretRef
+                          - storageVendorProduct
+                          type: object
                         vsphereXcopyConfig:
                           description: |-
                             VSphereXcopyPluginConfig works with the Vsphere Xcopy Volume Populator
@@ -10079,8 +10137,6 @@ spec:
                           - secretRef
                           - storageVendorProduct
                           type: object
-                      required:
-                      - vsphereXcopyConfig
                       type: object
                     source:
                       description: Source storage.
@@ -10357,7 +10413,25 @@ spec:
             type: object
           status:
             properties:
+              allocatedBytes:
+                type: string
+              cloneMethod:
+                type: string
+              copyDurationSeconds:
+                type: string
               progress:
+                type: string
+              provisionedBytes:
+                type: string
+              result:
+                type: string
+              storageProtocol:
+                type: string
+              storageVendor:
+                type: string
+              vibVersion:
+                type: string
+              xcopyUsed:
                 type: string
             type: object
         required:
@@ -10668,6 +10742,12 @@ rules:
   - update
   - patch
   - delete
+- apiGroups:
+  - cdi.kubevirt.io
+  resources:
+  - cdis
+  verbs:
+  - list
 - apiGroups:
   - security.openshift.io
   resourceNames:

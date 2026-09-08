@@ -686,6 +686,10 @@ func (r *Builder) PopulatorTransferredBytes(persistentVolumeClaim *core.Persiste
 	return
 }
 
+func (r *Builder) PopulatorOffloadInfo(_ *core.PersistentVolumeClaim) (map[string]string, error) {
+	return map[string]string{}, nil
+}
+
 func (r *Builder) SetPopulatorDataSourceLabels(vmRef ref.Ref, pvcs []*core.PersistentVolumeClaim) (err error) {
 	err = planbase.VolumePopulatorNotSupportedError
 	return
@@ -715,6 +719,10 @@ func (r *Builder) ConversionPodConfig(_ ref.Ref) (*planbase.ConversionPodConfigR
 }
 
 func (r *Builder) NetAppShiftPVCs(vmRef ref.Ref, labels map[string]string) ([]v1.PersistentVolumeClaim, error) {
+	return nil, nil
+}
+
+func (r *Builder) CsiImportPVCs(_ ref.Ref, _ map[string]string) ([]v1.PersistentVolumeClaim, error) {
 	return nil, nil
 }
 

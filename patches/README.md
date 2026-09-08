@@ -5,11 +5,11 @@ rather than a permanently diverged branch. Modelled on
 `thirdparty-builder/images/mongodb-enterprise`, which applies a patch just
 before building and reverts it afterwards.
 
-**Baseline: `v2.12.1`** — patches apply to a pristine checkout of that tag.
+**Baseline: `v2.12.7`** — patches apply to a pristine checkout of that tag.
 
 ## Why
 
-A merge-based fork makes the delta unreviewable. Merging upstream `v2.12.1`
+A merge-based fork makes the delta unreviewable. Merging upstream `v2.12.7`
 into `spectro-main` produces a 20,826-file diff that GitHub truncates at 3,000
 files, so the 17 files that actually matter are never rendered. The same delta
 as patches is 906 lines across 8 files, each one reviewable on its own.
@@ -34,7 +34,7 @@ It also makes the next upgrade mechanical: check out the new tag, run
 
 Typical build, mirroring the mongodb-enterprise pattern:
 
-    git checkout v2.12.1
+    git checkout v2.12.7
     make -C patches apply
     make build-all-images REGISTRY=... REGISTRY_ORG=... REGISTRY_TAG=...
     make -C patches restore
@@ -52,7 +52,7 @@ Typical build, mirroring the mongodb-enterprise pattern:
 | 0007 | fedora virt-v2v + nbdkit | Adds `build-virt-v2v-fedora-image`, bumps the Fedora base 41 -> 43 and virtio-win to 1.9.45-1.el10 (the nbdkit fix the VMO appliance needs). |
 | 0008 | virt-v2v tag suffix | The operator bundle passes `VIRT_V2V_IMAGE + PLATFORM_SUFFIX`, so the tag must carry the suffix or the CSV points at an image that does not exist. |
 
-Patches 0002-0004 replace six commits from the 2.9.2 line. v2.12.1 ships the
+Patches 0002-0004 replace six commits from the 2.9.2 line. v2.12.7 ships the
 itinerary/predicate framework the old fork hand-rolled, so the behaviour now
 falls out of one change instead of commented-out branches across five files.
 
@@ -62,8 +62,8 @@ falls out of one change instead of commented-out branches across five files.
   A patch whose lines a later patch rewrites (0007, rewritten by 0008) reports
   `CONFLICT` when checked out of order — that is expected, not a defect.
   `make verify` is the authoritative test.
-- Verified: applying all 8 to pristine `v2.12.1` yields a tree byte-identical
-  to `spectro-main-v2.12.1-upgrade` @ `888c0eccd` — 17 files, +348/-75.
+- Verified: applying all 8 to pristine `v2.12.7` yields a tree byte-identical
+  to `spectro-main-v2.12.7-upgrade` @ `888c0eccd` — 17 files, +348/-75.
 - Dropped on the move to 2.12.1 because upstream absorbed them: NVMe support
   and its blocking rego, and the dependency downgrades (2.12.1 ships newer
   govmomi/gin/gophercloud than the 2.9.2 line pinned).

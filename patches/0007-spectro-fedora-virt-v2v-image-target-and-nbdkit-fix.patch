@@ -1,6 +1,7 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shphadnis <134159681+shphadnis@users.noreply.github.com>
 Date: Wed, 26 Aug 2026 16:59:49 -0700
-Subject: [PATCH 7/8] spectro: fedora virt-v2v image target and nbdkit fix
+Subject: [PATCH 7/9] spectro: fedora virt-v2v image target and nbdkit fix
 
 Re-derived on upstream v2.12.1 (was 51f4b6625/8053d5635 PR #29, and
 59eb19619 + eb91d63cd/bdd3b674b PR #46 on the 2.9.2 line).
@@ -20,13 +21,14 @@ Deliberately NOT carried from the 2.9.2 version:
     overrides the image default where we need it.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 2805216284aaca0d68888fe98e6f3dcdd06549a3)
 ---
  Makefile                                     | 7 +++++++
  build/virt-v2v/Containerfile-upstream-fedora | 4 ++--
  2 files changed, 9 insertions(+), 2 deletions(-)
 
 diff --git a/Makefile b/Makefile
-index 0000000..0000000 100644
+index 58c2149df..780c0d067 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -358,6 +358,13 @@ push-virt-v2v-xfs-image: build-virt-v2v-xfs-image
@@ -44,7 +46,7 @@ index 0000000..0000000 100644
  	$(CONTAINER_CMD) build $(PLATFORM_FLAG) $(BUILD_LABEL_ARGS) \
  		-t $(OPERATOR_BUNDLE_IMAGE)$(PLATFORM_SUFFIX) \
 diff --git a/build/virt-v2v/Containerfile-upstream-fedora b/build/virt-v2v/Containerfile-upstream-fedora
-index 0000000..0000000 100644
+index 65d919dd2..39b12df75 100644
 --- a/build/virt-v2v/Containerfile-upstream-fedora
 +++ b/build/virt-v2v/Containerfile-upstream-fedora
 @@ -13,7 +13,7 @@ RUN go build -buildvcs=false -ldflags="-w -s" -o virt-v2v-wrapper ./cmd/virt-v2v

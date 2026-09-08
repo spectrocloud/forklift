@@ -1,6 +1,7 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shphadnis <134159681+shphadnis@users.noreply.github.com>
 Date: Wed, 26 Aug 2026 14:12:06 -0700
-Subject: [PATCH] spectro: clear stale disk data before virt-v2v-in-place
+Subject: [PATCH 3/9] spectro: clear stale disk data before virt-v2v-in-place
 
 Re-derived on upstream v2.12.1 (was d23ed9e49 on the 2.9.2 line).
 
@@ -19,6 +20,7 @@ Also drops the local min() helper (builtin since Go 1.21) and moves the
 file read into a helper so the handle is not deferred inside a loop.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 4e96afa2307906f8dd34c42255c58b61c6705eec)
 ---
  pkg/virt-v2v/conversion/conversion.go         |  5 ++
  pkg/virt-v2v/conversion/conversion_spectro.go | 79 +++++++++++++++++++
@@ -26,7 +28,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  create mode 100644 pkg/virt-v2v/conversion/conversion_spectro.go
 
 diff --git a/pkg/virt-v2v/conversion/conversion.go b/pkg/virt-v2v/conversion/conversion.go
-index 0000000..0000000 100644
+index 710b7d960..1c1c46aef 100644
 --- a/pkg/virt-v2v/conversion/conversion.go
 +++ b/pkg/virt-v2v/conversion/conversion.go
 @@ -144,6 +144,11 @@ func (c *Conversion) RunVirtV2VInspection() error {
@@ -43,7 +45,7 @@ index 0000000..0000000 100644
  		AddFlag("-x").
 diff --git a/pkg/virt-v2v/conversion/conversion_spectro.go b/pkg/virt-v2v/conversion/conversion_spectro.go
 new file mode 100644
-index 0000000..0000000
+index 000000000..36501cf73
 --- /dev/null
 +++ b/pkg/virt-v2v/conversion/conversion_spectro.go
 @@ -0,0 +1,79 @@

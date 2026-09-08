@@ -49,7 +49,7 @@ func TestSpectroShouldUseV2vForTransfer(t *testing.T) {
 	}
 
 	t.Run("vsphere never uses virt-v2v for transfer", func(t *testing.T) {
-		got, err := newPlan(VSphere).ShouldUseV2vForTransfer(ref.Ref{}, nil)
+		got, err := newPlan(VSphere).ShouldUseV2vForTransfer(ref.Ref{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -59,7 +59,7 @@ func TestSpectroShouldUseV2vForTransfer(t *testing.T) {
 	})
 
 	t.Run("ova keeps upstream behaviour", func(t *testing.T) {
-		got, err := newPlan(Ova).ShouldUseV2vForTransfer(ref.Ref{}, nil)
+		got, err := newPlan(Ova).ShouldUseV2vForTransfer(ref.Ref{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
