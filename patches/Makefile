@@ -19,18 +19,20 @@ apply: ## Apply every patch in series order
 	@echo "all patches applied on top of $(UPSTREAM_TAG)"
 
 .PHONY: check
-check: ## Dry-run: verify every patch still applies, change nothing
-	@cd $(REPO_ROOT) && ok=0; done_=0; bad=0; \
+check: ## Dry-run on a pristine UPSTREAM_TAG checkout, cumulatively in series order
+	@tmp=$$(mktemp -d); \
+	cd $(REPO_ROOT) && git worktree add -q --detach $$tmp $(UPSTREAM_TAG) || exit 1; \
+	bad=0; n=0; \
 	for p in $(PATCHES); do \
-		if git apply --check $(PATCH_DIR)/$$p 2>/dev/null; then \
-			echo "  applies    $$p"; ok=$$((ok+1)); \
-		elif git apply --check -R $(PATCH_DIR)/$$p 2>/dev/null; then \
-			echo "  already-in $$p"; done_=$$((done_+1)); \
+		n=$$((n+1)); \
+		if git -C $$tmp apply --whitespace=nowarn $(PATCH_DIR)/$$p 2>/dev/null; then \
+			echo "  applies    $$p"; \
 		else \
 			echo "  CONFLICT   $$p"; bad=$$((bad+1)); \
 		fi; \
 	done; \
-	echo "applies: $$ok  already applied: $$done_  conflicting: $$bad"; \
+	git worktree remove --force --force $$tmp 2>/dev/null || true; \
+	echo "checked: $$n against $(UPSTREAM_TAG)  conflicting: $$bad"; \
 	[ $$bad -eq 0 ]
 
 .PHONY: reverse

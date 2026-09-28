@@ -66,11 +66,12 @@ per upgrade.
 
 ## Notes
 
-- `make check` tests each patch *independently* against the tree it is run in,
-  so it is only meaningful against a pristine `UPSTREAM_TAG` checkout. A patch
-  whose lines a later patch rewrites reports `CONFLICT` even when the series is
-  correct — currently 0007 (rewritten by 0008) and 0006 (rewritten by 0009).
-  That is expected, not a defect. `make verify` is the authoritative test.
+- `make check` replays the series *cumulatively* onto a throwaway worktree of
+  `UPSTREAM_TAG` and changes nothing in your own tree, so it reports the
+  patches that genuinely conflict in series order. Testing each patch
+  independently instead would flag the earlier member of every dependent pair
+  (0006/0009, 0007/0008) even when the series is correct. `make verify` is the
+  stronger test: it proves the applied result is byte-identical to a branch.
 - Verified: applying all 10 to pristine `v2.12.9` yields a tree byte-identical
   to `wip-2129` @ `509a0a85d` — 18 files, +363/-80.
 - Dropped on the move to 2.12.1 because upstream absorbed them: NVMe support
