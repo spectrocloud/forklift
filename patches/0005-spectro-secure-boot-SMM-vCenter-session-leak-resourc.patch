@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shphadnis <134159681+shphadnis@users.noreply.github.com>
 Date: Wed, 26 Aug 2026 14:15:16 -0700
-Subject: [PATCH 5/9] spectro: secure boot SMM, vCenter session leak, resource
- limits
+Subject: [PATCH 05/10] spectro: secure boot SMM, vCenter session leak,
+ resource limits
 
 Re-derived on upstream v2.12.1. All three were checked against v2.12.1
 first and are still needed there.
@@ -82,10 +82,10 @@ index 280a24ebb..31b197ce0 100644
    - name: "Setup inventory service"
      k8s:
 diff --git a/pkg/controller/plan/adapter/vsphere/builder.go b/pkg/controller/plan/adapter/vsphere/builder.go
-index c49afd96d..91ed0ac0e 100644
+index a878801fe..3ec3aa317 100644
 --- a/pkg/controller/plan/adapter/vsphere/builder.go
 +++ b/pkg/controller/plan/adapter/vsphere/builder.go
-@@ -1055,11 +1055,15 @@ func (r *Builder) mapFirmware(vm *model.VM, object *cnv.VirtualMachineSpec) {
+@@ -1058,11 +1058,15 @@ func (r *Builder) mapFirmware(vm *model.VM, object *cnv.VirtualMachineSpec) {
  				SecureBoot: &vm.SecureBoot,
  			},
  		}
@@ -140,10 +140,10 @@ index f06705277..3a234481d 100644
  	}
  
 diff --git a/pkg/controller/provider/container/vsphere/collector.go b/pkg/controller/provider/container/vsphere/collector.go
-index ebb22f02f..036c76ab7 100644
+index f7fee4549..377afbfc1 100644
 --- a/pkg/controller/provider/container/vsphere/collector.go
 +++ b/pkg/controller/provider/container/vsphere/collector.go
-@@ -359,7 +359,14 @@ func (r *Collector) Follow(moRef interface{}, p []string, dst interface{}) error
+@@ -380,7 +380,14 @@ func (r *Collector) Follow(moRef interface{}, p []string, dst interface{}) error
  	if err != nil {
  		return err
  	}
@@ -159,7 +159,7 @@ index ebb22f02f..036c76ab7 100644
  	return client.RetrieveOne(ctx, ref, p, dst)
  }
  
-@@ -368,11 +375,9 @@ func (r *Collector) Test() (status int, err error) {
+@@ -389,11 +396,9 @@ func (r *Collector) Test() (status int, err error) {
  	ctx := context.Background()
  	ctx, cancel := context.WithTimeout(ctx, ConnectionTimeout)
  	defer cancel()
@@ -173,7 +173,7 @@ index ebb22f02f..036c76ab7 100644
  	return
  }
  
-@@ -821,8 +826,15 @@ func (r *Collector) buildClient(ctx context.Context) (*govmomi.Client, error) {
+@@ -862,8 +867,15 @@ func (r *Collector) buildClient(ctx context.Context) (*govmomi.Client, error) {
  		SessionManager: session.NewManager(vimClient),
  		Client:         vimClient,
  	}

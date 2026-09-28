@@ -5,7 +5,7 @@
 # so the source tree stays upstream and the fork delta lives in review-sized
 # files rather than a permanently diverged branch.
 
-UPSTREAM_TAG ?= v2.12.7
+UPSTREAM_TAG ?= v2.12.9
 PATCH_DIR    ?= $(CURDIR)
 REPO_ROOT    ?= $(CURDIR)/..
 PATCHES      := $(shell grep -v '^\#' $(PATCH_DIR)/series | grep -v '^$$')

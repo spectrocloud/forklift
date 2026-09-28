@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shphadnis <134159681+shphadnis@users.noreply.github.com>
 Date: Wed, 26 Aug 2026 14:13:35 -0700
-Subject: [PATCH 4/9] spectro: relax virt-v2v confinement outside OpenShift
+Subject: [PATCH 04/10] spectro: relax virt-v2v confinement outside OpenShift
 
 Re-derived on upstream v2.12.1 (was b8695747e + 29b534580, and part of
 cb469fa97, on the 2.9.2 line). Upstream moved the conversion pod into
@@ -25,10 +25,10 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  2 files changed, 83 insertions(+), 4 deletions(-)
 
 diff --git a/pkg/controller/conversion/builder.go b/pkg/controller/conversion/builder.go
-index 72fe3a44c..49ecaf2d6 100644
+index 04c708103..b8fc889c0 100644
 --- a/pkg/controller/conversion/builder.go
 +++ b/pkg/controller/conversion/builder.go
-@@ -230,9 +230,51 @@ func (b *Builder) BuildVirtV2vConversionPod(pod *core.Pod, environment []core.En
+@@ -240,9 +240,51 @@ func (b *Builder) BuildVirtV2vConversionPod(pod *core.Pod, environment []core.En
  	pod.Labels[convctx.LabelApp] = "virt-v2v"
  	pod.Spec.Containers[0].Name = "virt-v2v"
  	pod.Spec.Containers[0].Env = environment

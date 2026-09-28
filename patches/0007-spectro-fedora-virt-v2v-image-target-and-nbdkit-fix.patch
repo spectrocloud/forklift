@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shphadnis <134159681+shphadnis@users.noreply.github.com>
 Date: Wed, 26 Aug 2026 16:59:49 -0700
-Subject: [PATCH 7/9] spectro: fedora virt-v2v image target and nbdkit fix
+Subject: [PATCH 07/10] spectro: fedora virt-v2v image target and nbdkit fix
 
 Re-derived on upstream v2.12.1 (was 51f4b6625/8053d5635 PR #29, and
 59eb19619 + eb91d63cd/bdd3b674b PR #46 on the 2.9.2 line).

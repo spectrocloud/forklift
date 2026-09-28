@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shphadnis <134159681+shphadnis@users.noreply.github.com>
 Date: Tue, 8 Sep 2026 16:53:42 -0700
-Subject: [PATCH 9/9] spectro: update guard test for v2.12.7
+Subject: [PATCH 09/10] spectro: update guard test for v2.12.7
  ShouldUseV2vForTransfer signature
 
 Upstream dropped the destinationClient parameter; the NetApp-shift check

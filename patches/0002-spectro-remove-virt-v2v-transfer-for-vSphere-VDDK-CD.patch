@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shphadnis <134159681+shphadnis@users.noreply.github.com>
 Date: Wed, 26 Aug 2026 14:10:13 -0700
-Subject: [PATCH 2/9] spectro: remove virt-v2v transfer for vSphere - VDDK+CDI
- is compulsory
+Subject: [PATCH 02/10] spectro: remove virt-v2v transfer for vSphere -
+ VDDK+CDI is compulsory
 
 Re-derived on upstream v2.12.1. Replaces 58efb0e46 + 4d3702189 + cb469fa97
 + ea6ee1f36 from the 2.9.2 line, which hand-rolled an itinerary and
@@ -26,26 +26,31 @@ CopyDisksVirtV2V stayed gated on OvaImageMigration.
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 (cherry picked from commit 30df156145ba7645fd97c54355da642a53168859)
 ---
- pkg/apis/forklift/v1beta1/plan.go             | 29 +++++------
+ pkg/apis/forklift/v1beta1/plan.go             | 38 +++++++--------
  .../plan/adapter/vsphere/builder.go           | 48 +++++++------------
- 2 files changed, 30 insertions(+), 47 deletions(-)
+ 2 files changed, 34 insertions(+), 52 deletions(-)
 
 diff --git a/pkg/apis/forklift/v1beta1/plan.go b/pkg/apis/forklift/v1beta1/plan.go
-index 029914915..623222715 100644
+index a5b839aa3..8cad6cedf 100644
 --- a/pkg/apis/forklift/v1beta1/plan.go
 +++ b/pkg/apis/forklift/v1beta1/plan.go
-@@ -465,23 +465,18 @@ func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref) (bool, error) {
+@@ -475,28 +475,22 @@ func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref) (bool, error) {
  
  	switch source.Type() {
  	case VSphere:
 -		// The virt-v2v transfers all disks attached to the VM. If we want to skip the shared disks so we don't transfer
 -		// them multiple times we need to manage the transfer using KubeVirt CDI DataVolumes and v2v-in-place.
 -		migrateSharedDisks := p.Spec.MigrateSharedDisks
--		if vm, found := p.Spec.FindVM(vmRef); found && vm.MigrateSharedDisks != nil {
--			migrateSharedDisks = *vm.MigrateSharedDisks
+-		planVM, found := p.Spec.FindVM(vmRef)
+-		if found && planVM.MigrateSharedDisks != nil {
+-			migrateSharedDisks = *planVM.MigrateSharedDisks
 -		}
 -		if p.IsWarm() || !destination.IsHost() || !migrateSharedDisks ||
 -			p.Spec.SkipGuestConversion || p.Spec.Type == MigrationOnlyConversion {
+-			return false, nil
+-		}
+-		if found && len(planVM.ExcludeDisks) > 0 {
+-			// virt-v2v copies every attached disk; skip excluded disks via CDI instead.
 -			return false, nil
 -		}
 -		if p.HasNetAppShiftDestination() {
@@ -65,16 +70,20 @@ index 029914915..623222715 100644
 +		//   VirtV2vDiskCopy  -> false (PhaseAllocateDisks + PhaseCopyDisksVirtV2V skipped)
 +		// and, via KubeVirt.ResolveConversionType, api.InPlace (V2V_inPlace=1).
 +		//
++		// Upstream v2.12.9 added an ExcludeDisks check to this branch; it is
++		// unreachable here because Spectro always returns false, so the disk
++		// exclusion is handled by the CDI path instead.
++		//
 +		// OVA/HyperV deliberately keep upstream behaviour below.
 +		return false, nil
  	case Ova, HyperV:
  		return true, nil
  	default:
 diff --git a/pkg/controller/plan/adapter/vsphere/builder.go b/pkg/controller/plan/adapter/vsphere/builder.go
-index a239ab9b9..c49afd96d 100644
+index 596544834..a878801fe 100644
 --- a/pkg/controller/plan/adapter/vsphere/builder.go
 +++ b/pkg/controller/plan/adapter/vsphere/builder.go
-@@ -684,35 +684,23 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
+@@ -686,35 +686,23 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
  		}
  
  		storageClass := mapped.Destination.StorageClass
@@ -127,7 +136,7 @@ index a239ab9b9..c49afd96d 100644
  		}
  		alignedCapacity := utils.RoundUp(disk.Capacity, utils.DefaultAlignBlockSize)
  		dvSpec := cdi.DataVolumeSpec{
-@@ -763,7 +751,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
+@@ -765,7 +753,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
  			}
  		}
  
