@@ -174,7 +174,7 @@ type PlanSpec struct {
 	//   - .SourcePVCNamespace: namespace of the PVC in the source cluster
 	//
 	// Default behavior when not set:
-	//   - VMware: generates names like "{{trunc 4 .PlanName}}-{{trunc 4 .VmName}}-disk-{{.DiskIndex}}"
+	//   - VMware: generates names like "{{trunc 15 .PlanName}}-{{trunc 15 .TargetVmName}}-disk-{{.DiskIndex}}"
 	//   - OpenShift: uses the original source PVC name ("{{.SourcePVCName}}")
 	//
 	// Note:
@@ -264,6 +264,16 @@ type PlanSpec struct {
 	// Can be overridden per VM via spec.vms[].scsiReservation.
 	// +optional
 	SCSIReservation bool `json:"scsiReservation,omitempty"`
+	// SelinuxRelabelAtBoot defers SELinux relabeling until the guest's first boot after conversion.
+	// Passed to virt-v2v as --selinux-relabel-at-boot. Can be overridden per VM via spec.vms[].selinuxRelabelAtBoot.
+	// +optional
+	SelinuxRelabelAtBoot bool `json:"selinuxRelabelAtBoot,omitempty"`
+	// SelinuxRelabelExclude lists guest directories excluded from SELinux relabeling during conversion.
+	// Passed to virt-v2v as --selinux-relabel-exclude. Can be overridden per VM via spec.vms[].selinuxRelabelExclude.
+	// Use carefully: changes made inside excluded directories during customization may retain incorrect
+	// SELinux labels and cause failures later. Only exclude directories that are known not to need relabeling.
+	// +optional
+	SelinuxRelabelExclude []string `json:"selinuxRelabelExclude,omitempty"`
 	// DeleteGuestConversionPod determines if the guest conversion pod should be deleted after successful migration.
 	// Note:
 	//   - If this option is enabled and migration succeeds then the pod will get deleted. However the VM could still not boot and the virt-v2v logs, with additional information, will be deleted alongside guest conversion pod.
@@ -474,6 +484,10 @@ func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref) (bool, error) {
 		//   CDIDiskCopy      -> true  (PhaseCopyDisks runs)
 		//   VirtV2vDiskCopy  -> false (PhaseAllocateDisks + PhaseCopyDisksVirtV2V skipped)
 		// and, via KubeVirt.ResolveConversionType, api.InPlace (V2V_inPlace=1).
+		//
+		// Upstream v2.12.9 added an ExcludeDisks check to this branch; it is
+		// unreachable here because Spectro always returns false, so the disk
+		// exclusion is handled by the CDI path instead.
 		//
 		// OVA/HyperV deliberately keep upstream behaviour below.
 		return false, nil

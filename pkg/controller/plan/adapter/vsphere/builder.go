@@ -208,6 +208,7 @@ func (r *Builder) PodEnvironment(vmRef ref.Ref, sourceSecret *core.Secret) (env 
 	if !r.shouldMigrateSharedDisks(vm) {
 		vm.RemoveSharedDisks()
 	}
+	r.removeExcludedDisks(vm)
 	macsToIps := ""
 	if r.Plan.Spec.PreserveStaticIPs {
 		macsToIps, err = r.mapMacStaticIps(vm)
@@ -621,6 +622,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 	if !r.shouldMigrateSharedDisks(vm) {
 		vm.RemoveSharedDisks()
 	}
+	r.removeExcludedDisks(vm)
 
 	url := r.Source.Provider.Spec.URL
 	thumbprint := r.Source.Provider.Status.Fingerprint
@@ -813,6 +815,7 @@ func (r *Builder) VirtualMachine(vmRef ref.Ref, object *cnv.VirtualMachineSpec, 
 				vmRef.String()))
 		return
 	}
+	r.removeExcludedDisks(vm)
 	if !r.shouldMigrateSharedDisks(vm) {
 		sharedPVCs, missingDiskPVCs, err := findSharedPVCs(r.Destination.Client, vm, r.Plan.Spec.TargetNamespace)
 		if err != nil {
@@ -1171,14 +1174,7 @@ func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims [
 				kubevirtDisk.ErrorPolicy = ptr.To(cnv.DiskErrorPolicyReport)
 			}
 		}
-		// Disk serial numbers are only presented to the source guest if
-		// the disk is connected with SCSI and disk.EnableUUID is set to
-		// TRUE, so only save the serial number for those disks. If the
-		// destination VM is configured with VirtIO or SATA, the resulting
-		// serial number will be truncated to 20 characters.
-		if vm.DiskEnableUuid && cnv.DiskBus(disk.Bus) == cnv.DiskBusSCSI {
-			kubevirtDisk.Serial = disk.Serial
-		}
+		kubevirtDisk.Serial = planbase.DiskSerial(disk.Serial, vm.ID, int(disk.Key))
 		kVolumes = append(kVolumes, volume)
 		kDisks = append(kDisks, kubevirtDisk)
 	}
@@ -1226,6 +1222,7 @@ func (r *Builder) Tasks(vmRef ref.Ref) (list []*plan.Task, err error) {
 	if !r.shouldMigrateSharedDisks(vm) {
 		vm.RemoveSharedDisks()
 	}
+	r.removeExcludedDisks(vm)
 	for _, disk := range vm.Disks {
 		mB := utils.RoundUp(disk.Capacity, 0x100000) / 0x100000
 		list = append(
@@ -1478,6 +1475,7 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 	if !r.shouldMigrateSharedDisks(vm) {
 		vm.RemoveSharedDisks()
 	}
+	r.removeExcludedDisks(vm)
 	// Get sorted disks to maintain consistent indexing with other parts of the system
 	sortedDisks := vm.SortedDisksAsVmware()
 
@@ -2088,6 +2086,12 @@ func (r *Builder) shouldMigrateSharedDisks(vm *model.VM) bool {
 	return r.Context.Plan.Spec.MigrateSharedDisks
 }
 
+func (r *Builder) removeExcludedDisks(vm *model.VM) {
+	if planVM := r.getPlanVM(vm); planVM != nil && len(planVM.ExcludeDisks) > 0 {
+		vm.RemoveExcludedDisks(planVM.ExcludeDisks)
+	}
+}
+
 // shouldRDMAsLun returns whether RDM disks should be mapped as LUN devices for the given VM.
 // VM-level setting takes precedence; falls back to plan-level setting.
 func (r *Builder) shouldRDMAsLun(vm *model.VM) bool {
@@ -2192,7 +2196,7 @@ func (r *Builder) setObjectNameFromTemplate(objectMeta *metav1.ObjectMeta, templ
 func (r *Builder) setColdMigrationDefaultPVCName(objectMeta *metav1.ObjectMeta, vm *model.VM, diskIndex int, disk vsphere.Disk) error {
 	pvcNameTemplate := r.getPVCNameTemplate(vm)
 	if pvcNameTemplate == "" {
-		pvcNameTemplate = "{{trunc 4 .PlanName}}-{{trunc 4 .VmName}}-disk-{{.DiskIndex}}"
+		pvcNameTemplate = "{{trunc 15 .PlanName}}-{{trunc 15 .TargetVmName}}-disk-{{.DiskIndex}}"
 	}
 
 	planVM := r.getPlanVM(vm)
@@ -2321,40 +2325,6 @@ func (r *Builder) getPVCNameTemplate(vm *model.VM) string {
 	}
 
 	return ""
-}
-
-// getPlanVMSafeName returns a safe name for the VM
-// that can be used in the template output
-// The name is sanitized to be a valid k8s label
-func (r *Builder) getPlanVMSafeName(vm *model.VM) string {
-	// Default to vm name
-	newName := vm.Name
-
-	// Get plan VM
-	planVM := r.getPlanVMStatus(vm)
-
-	// if plan VM status has a new name, use it
-	if planVM != nil && planVM.NewName != "" {
-		newName = planVM.NewName
-	}
-
-	// New name is a valid subdomain name,
-	// but we need to check if it is a valid k8s label
-
-	// Check if new vm name is valid k8s label
-	if len(newName) > 63 {
-		// if the new name is longer then 63 characters, trancate it
-		newName = newName[:63]
-	}
-
-	// Validate that template output is a valid k8s label
-	errs := k8svalidation.IsDNS1123Label(newName)
-	if len(errs) > 0 {
-		// if the new name replace "." with "-"
-		newName = strings.ReplaceAll(newName, ".", "-")
-	}
-
-	return newName
 }
 
 // getVolumeNameTemplate returns the volume name template
@@ -2814,6 +2784,7 @@ func (r *Builder) CsiImportPVCs(vmRef ref.Ref, pvcLabels map[string]string) (pvc
 	if !r.shouldMigrateSharedDisks(vm) {
 		vm.RemoveSharedDisks()
 	}
+	r.removeExcludedDisks(vm)
 
 	dsMap, err := r.buildDatastoreMap()
 	if err != nil {
@@ -2860,6 +2831,7 @@ func (r *Builder) NetAppShiftPVCs(vmRef ref.Ref, labels map[string]string) (pvcs
 	if !r.shouldMigrateSharedDisks(vm) {
 		vm.RemoveSharedDisks()
 	}
+	r.removeExcludedDisks(vm)
 
 	dsMap, err := r.buildDatastoreMap()
 	if err != nil {
@@ -2882,21 +2854,27 @@ func (r *Builder) NetAppShiftPVCs(vmRef ref.Ref, labels map[string]string) (pvcs
 			continue
 		}
 
+		volumeMode := core.PersistentVolumeFilesystem
 		storageClass := mapped.Destination.StorageClass
-
-		capacity, cErr := utils.CalculateSpaceWithCDIOverhead(
-			r.Destination.Client, storageClass, disk.Capacity)
-		if cErr != nil {
-			err = liberr.Wrap(cErr, "CDIConfig overhead", storageClass)
-			return
+		if mapped.Destination.VolumeMode != "" {
+			volumeMode = mapped.Destination.VolumeMode
+		}
+		var capacity int64
+		if volumeMode == core.PersistentVolumeFilesystem {
+			capacity, err = utils.CalculateSpaceWithCDIOverhead(
+				r.Destination.Client, storageClass, disk.Capacity)
+			if err != nil {
+				err = liberr.Wrap(err, "CDIConfig overhead", storageClass)
+				return
+			}
+		} else {
+			capacity = disk.Capacity
 		}
 
-		fsMode := core.PersistentVolumeFilesystem
 		accessModes := []core.PersistentVolumeAccessMode{core.ReadWriteMany}
 		if mapped.Destination.AccessMode != "" {
 			accessModes = []core.PersistentVolumeAccessMode{mapped.Destination.AccessMode}
 		}
-
 		pvc := &core.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace:    r.Plan.Spec.TargetNamespace,
@@ -2906,7 +2884,7 @@ func (r *Builder) NetAppShiftPVCs(vmRef ref.Ref, labels map[string]string) (pvcs
 			},
 			Spec: core.PersistentVolumeClaimSpec{
 				AccessModes:      accessModes,
-				VolumeMode:       &fsMode,
+				VolumeMode:       &volumeMode,
 				StorageClassName: &storageClass,
 				Resources: core.VolumeResourceRequirements{
 					Requests: core.ResourceList{
@@ -3007,32 +2985,44 @@ func (r *Builder) SourceVMLabelsAndAnnotations(vmRef ref.Ref, tagMapping *api.Ta
 
 	// Custom attributes to annotations
 	annotationOriginalKeys := make(map[string]string)
+	customDefs := []model.CustomFieldDef{}
+	err = r.Source.Inventory.List(&customDefs, web.Param{
+		Key:   web.DetailParam,
+		Value: "all",
+	})
+	if err != nil {
+		err = liberr.Wrap(err, "custom field definitions")
+		return
+	}
+	customDefByKey := make(map[int32]model.CustomFieldDef, len(customDefs))
+	for _, def := range customDefs {
+		customDefByKey[def.Key] = def
+	}
 	for _, cv := range vm.CustomValues {
-		for _, def := range vm.CustomDef {
-			if def.Key == cv.Key {
-				originalName := def.Name
-				sanitizedName := sanitizeForK8sMetadata(originalName)
-				if sanitizedName == "" {
-					break
-				}
-				if sanitizedName != originalName {
-					sanitizationReport[fmt.Sprintf("customAttribute.name.%s", originalName)] = sanitizedName
-				}
-
-				key := fmt.Sprintf("vsphere.forklift.konveyor.io/%s", sanitizedName)
-				if existingOriginal, exists := annotationOriginalKeys[key]; exists {
-					r.Log.Info("Custom attribute key collision, later attribute overwrites earlier",
-						"sanitizedKey", key,
-						"previousAttribute", existingOriginal,
-						"currentAttribute", originalName)
-					sanitizationReport[fmt.Sprintf("customAttribute.collision.%s", sanitizedName)] = fmt.Sprintf("%s overwrites %s", originalName, existingOriginal)
-				}
-				annotationOriginalKeys[key] = originalName
-
-				annotations[key] = cv.Value
-				break
-			}
+		def, ok := customDefByKey[cv.Key]
+		if !ok {
+			continue
 		}
+		originalName := def.Name
+		sanitizedName := sanitizeForK8sMetadata(originalName)
+		if sanitizedName == "" {
+			continue
+		}
+		if sanitizedName != originalName {
+			sanitizationReport[fmt.Sprintf("customAttribute.name.%s", originalName)] = sanitizedName
+		}
+
+		key := fmt.Sprintf("vsphere.forklift.konveyor.io/%s", sanitizedName)
+		if existingOriginal, exists := annotationOriginalKeys[key]; exists {
+			r.Log.Info("Custom attribute key collision, later attribute overwrites earlier",
+				"sanitizedKey", key,
+				"previousAttribute", existingOriginal,
+				"currentAttribute", originalName)
+			sanitizationReport[fmt.Sprintf("customAttribute.collision.%s", sanitizedName)] = fmt.Sprintf("%s overwrites %s", originalName, existingOriginal)
+		}
+		annotationOriginalKeys[key] = originalName
+
+		annotations[key] = cv.Value
 	}
 
 	return
