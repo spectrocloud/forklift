@@ -21,6 +21,7 @@ file read into a helper so the handle is not deferred inside a loop.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 (cherry picked from commit 4e96afa2307906f8dd34c42255c58b61c6705eec)
+(cherry picked from commit 14d870d5decad62255f421e85c3b8fbb3eac3874)
 ---
  pkg/virt-v2v/conversion/conversion.go         |  5 ++
  pkg/virt-v2v/conversion/conversion_spectro.go | 79 +++++++++++++++++++

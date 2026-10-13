@@ -29,6 +29,7 @@ configuration that now works properly.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 (cherry picked from commit 492273215c2ff1ccaa66d6eaf9516f07aa464c26)
+(cherry picked from commit bd9c79889ee710a792eb17e56b4ccf6f4631135c)
 ---
  .../forkliftcontroller/defaults/main.yml      |  6 +++--
  .../roles/forkliftcontroller/tasks/main.yml   | 11 ++++++++

@@ -22,6 +22,7 @@ Deliberately NOT carried from the 2.9.2 version:
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 (cherry picked from commit 2805216284aaca0d68888fe98e6f3dcdd06549a3)
+(cherry picked from commit 8222a56b186e8a3b0e5fe383f0f3b6dfc97f70f4)
 ---
  Makefile                                     | 7 +++++++
  build/virt-v2v/Containerfile-upstream-fedora | 4 ++--

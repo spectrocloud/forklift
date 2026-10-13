@@ -13,6 +13,7 @@ Kept in a separate _test.go named for the fork, following the
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 (cherry picked from commit e7985435af9cc0137c6420913df94636403a607e)
+(cherry picked from commit 936881764eeaa78796bb226b7648f333a616f77a)
 ---
  .../forklift/v1beta1/spectro_fork_test.go     | 70 +++++++++++++++++++
  1 file changed, 70 insertions(+)

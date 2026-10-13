@@ -1,7 +1,7 @@
 # Spectro Cloud patches applied on top of upstream kubev2v/forklift.
 # Order matters: apply top to bottom.
 #
-# Baseline: v2.12.9
+# Baseline: v2.12.10
 0001-spectro-raw-import-make-guest-conversion-opt-in-via-.patch
 0002-spectro-remove-virt-v2v-transfer-for-vSphere-VDDK-CD.patch
 0003-spectro-clear-stale-disk-data-before-virt-v2v-in-pla.patch

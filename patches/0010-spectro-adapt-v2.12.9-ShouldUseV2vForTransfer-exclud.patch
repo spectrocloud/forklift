@@ -10,6 +10,7 @@ premise this fork inverts, so the assertion is updated to the CDI path.
 The excludeDisks-set case already expected false and is unchanged.
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>
+(cherry picked from commit 509a0a85df26c4b464b0f52f72a486738637a0aa)
 ---
  pkg/apis/forklift/v1beta1/plan_transfer_test.go | 9 +++++++--
  1 file changed, 7 insertions(+), 2 deletions(-)

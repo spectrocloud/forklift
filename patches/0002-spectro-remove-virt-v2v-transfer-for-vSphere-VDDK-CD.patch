@@ -25,6 +25,7 @@ CopyDisksVirtV2V stayed gated on OvaImageMigration.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 (cherry picked from commit 30df156145ba7645fd97c54355da642a53168859)
+(cherry picked from commit d38220af285425cb10f0d6d32b190546db7eff9e)
 ---
  pkg/apis/forklift/v1beta1/plan.go             | 38 +++++++--------
  .../plan/adapter/vsphere/builder.go           | 48 +++++++------------

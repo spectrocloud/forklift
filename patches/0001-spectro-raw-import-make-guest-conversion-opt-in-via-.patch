@@ -15,6 +15,7 @@ so raw disk import is the default.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 (cherry picked from commit ac4ff8f4a12e5eeef0f72b8533c70763ff2be7ef)
+(cherry picked from commit bd68e18d490e573a092b3fc74d379477a2f43e52)
 ---
  .../crd/bases/forklift.konveyor.io_providers.yaml      |  3 +++
  pkg/apis/forklift/v1beta1/plan.go                      |  4 ++++
