@@ -5,15 +5,17 @@ rather than a permanently diverged branch. Modelled on
 `thirdparty-builder/images/mongodb-enterprise`, which applies a patch just
 before building and reverts it afterwards.
 
-**Baseline: `v2.12.9`** — patches apply to a pristine checkout of that tag.
+**Baseline: `v2.12.10`** — patches apply to a pristine checkout of that tag.
 
 ## Why
 
-A merge-based fork makes the delta unreviewable. Merging upstream `v2.12.9`
-into `spectro-main` produces a 20,826-file diff that GitHub truncates at 3,000
-files, so the 18 files that actually matter are never rendered. The same delta
-as patches is ~450 changed lines across 10 patches, each one reviewable on its
-own.
+A merge-based fork buries the delta. On the 2.9.2 line, diffing the fork against
+the upstream tag produced 20,826 files of mostly vendor churn, which GitHub
+truncates at 3,000 — so the 18 files that actually mattered were never rendered.
+The same delta as patches is ~360 changed lines across 10 review-sized files,
+and it is checkable in two directions: `make check` proves each patch still
+applies to a pristine tag, and `make verify` proves the series reproduces the
+fork tree byte-for-byte.
 
 It also makes the next upgrade mechanical: check out the new tag, run
 `make check`, and only the patches that genuinely conflict need attention.
@@ -35,7 +37,7 @@ It also makes the next upgrade mechanical: check out the new tag, run
 
 Typical build, mirroring the mongodb-enterprise pattern:
 
-    git checkout v2.12.9
+    git checkout v2.12.10
     make -C patches apply
     make build-all-images REGISTRY=... REGISTRY_ORG=... REGISTRY_TAG=...
     make -C patches restore
@@ -72,27 +74,43 @@ per upgrade.
   independently instead would flag the earlier member of every dependent pair
   (0006/0009, 0007/0008) even when the series is correct. `make verify` is the
   stronger test: it proves the applied result is byte-identical to a branch.
-- Verified: applying all 10 to pristine `v2.12.9` yields a tree byte-identical
-  to `wip-2129` @ `509a0a85d` — 18 files, +363/-80.
+- Verified: applying all 10 to pristine `v2.12.10` yields a tree byte-identical
+  to `wip-21210` @ `7a3c0d8b3` — 18 files, +363/-80.
+- `v2.12.10` is the first upgrade that needed **no new adaptation patch**. The
+  45 files it changed (`.tekton`/`.konflux` SHA and rpm-lock churn,
+  `build/release.conf`, `Containerfile-downstream`, and MTV-6912's netplan
+  `--root-dir` probe) are disjoint from the 18 files this series touches, so
+  every patch — 0002 included — replayed clean. Don't read that as the pattern
+  changing: it is still `ShouldUseV2vForTransfer` that decides whether an
+  upgrade is interesting.
 - Dropped on the move to 2.12.1 because upstream absorbed them: NVMe support
   and its blocking rego, and the dependency downgrades (2.12.1 ships newer
   govmomi/gin/gophercloud than the 2.9.2 line pinned).
 
 ## Upgrading to a new upstream tag
 
-1. `git checkout <new-tag>`
-2. Replay the series onto the new tag (`git cherry-pick <old-tag>..<chain-tip>`
-   from the previous `wip-*` chain) — this is what actually finds conflicts;
-   `make check` only reports them for the patches run against a pristine tree.
+1. `git merge <new-tag>` into the fork branch. Releases from v2.12.7 on are real
+   ancestry, so this is a plain 3-way merge past the previous tag. Resolve
+   nothing by hand unless the intersection below is non-empty. Commit it, and
+   note the merge commit — step 4 checks against it.
+2. Replay the series onto the new tag to build a fresh `wip-<ver>` chain:
+   `git branch -f wip-<ver> <new-tag>` then
+   `git cherry-pick <old-tag>..<old-chain-tip>`. This is what actually finds
+   conflicts; `make check` only reports them for patches run against a pristine
+   tree.
 3. Fix conflicts by editing the patch, or re-derive it from intent. 0002 is
    the one to watch: it depends on `ShouldUseV2vForTransfer`, `CDIDiskCopy`,
    `VirtV2vDiskCopy` and `ResolveConversionType` keeping their shape. Upstream
-   has hit it in every release so far, and each time it also adds a test that
-   asserts its own default — expect a new adaptation patch (as 0010).
-4. Regenerate and prove it:
-   `make -C patches regenerate BRANCH=<chain> UPSTREAM_TAG=<new-tag>` then
-   `make -C patches verify BRANCH=<chain> UPSTREAM_TAG=<new-tag>`
+   has hit it in almost every release so far — v2.12.10 is the exception — and
+   when it does it also adds a test asserting its own default, so expect a new
+   adaptation patch (as 0010).
+4. Regenerate and prove it, in this order:
+   `make -C patches regenerate BRANCH=wip-<ver> UPSTREAM_TAG=<new-tag>` then
+   `make -C patches check UPSTREAM_TAG=<new-tag>` (expect zero `CONFLICT`) and
+   `make -C patches verify BRANCH=wip-<ver> UPSTREAM_TAG=<new-tag>` (expect
+   `IDENTICAL`). Then diff the two trees you now have:
+   `git diff wip-<ver> <merge-commit> -- . ':(exclude)patches'` must be
+   **empty** — that is the proof the merged branch and the regenerated series
+   encode the same delta.
 5. Update `UPSTREAM_TAG` in the Makefile, the `series` baseline comment and the
    baseline noted here.
-6. `make check` against a pristine new-tag checkout should then report zero
-   `CONFLICT` for patches no later patch rewrites.
