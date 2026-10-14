@@ -251,7 +251,10 @@ func (b *Builder) BuildVirtV2vConversionPod(pod *core.Pod, environment []core.En
 // libguestfs needs to create user namespaces and remount the guest root; with
 // RuntimeDefault seccomp and an AppArmor profile applied it fails to start the
 // appliance. LIBGUESTFS_BACKEND=direct avoids libvirt, but some operations
-// still require CAP_SYS_ADMIN.
+// still require CAP_SYS_ADMIN. Since libguestfs 1.52 the appliance's network is
+// provided by passt, which must also build a user+network namespace sandbox and
+// then drop to an unprivileged user, so the container has to be root with
+// CAP_SETUID/CAP_SETGID as well.
 func applySpectroConversionPodRelaxations(pod *core.Pod) {
 	container := &pod.Spec.Containers[0]
 
@@ -282,7 +285,23 @@ func applySpectroConversionPodRelaxations(pod *core.Pod) {
 		container.SecurityContext.Capabilities = &core.Capabilities{}
 	}
 	container.SecurityContext.Capabilities.Add = append(
-		container.SecurityContext.Capabilities.Add, core.Capability("SYS_ADMIN"))
+		container.SecurityContext.Capabilities.Add,
+		core.Capability("SYS_ADMIN"),
+		core.Capability("SETUID"),
+		core.Capability("SETGID"))
+
+	// A non-root container receives capabilities.add in its bounding set only:
+	// CapEff stays empty and every addition is a no-op, so passt's sandbox setup
+	// fails with EPERM. Run the container as root, where the requested
+	// capabilities become effective and passt can create its namespaces and drop
+	// to nobody. RunAsNonRoot must be cleared together with RunAsUser, or the
+	// kubelet rejects the pod.
+	if pod.Spec.SecurityContext != nil {
+		zero := int64(0)
+		runAsNonRoot := false
+		pod.Spec.SecurityContext.RunAsUser = &zero
+		pod.Spec.SecurityContext.RunAsNonRoot = &runAsNonRoot
+	}
 }
 
 // BuildVirtV2vInspectionPod applies inspection-specific settings to a pod.
