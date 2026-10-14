@@ -12,3 +12,4 @@
 0008-spectro-append-PLATFORM_SUFFIX-to-fedora-virt-v2v-im.patch
 0009-spectro-update-guard-test-for-v2.12.7-ShouldUseV2vFo.patch
 0010-spectro-adapt-v2.12.9-ShouldUseV2vForTransfer-exclud.patch
+0011-spectro-keep-passt-as-root-in-the-virt-v2v-images.patch

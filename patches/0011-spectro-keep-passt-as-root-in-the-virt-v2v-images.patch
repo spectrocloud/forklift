@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 18:24:08 -0700
+Subject: [PATCH] spectro: keep passt as root in the virt-v2v images
+
+---
+ build/virt-v2v/Containerfile-upstream        | 22 +++++++++++
+ build/virt-v2v/Containerfile-upstream-fedora | 22 +++++++++++
+ build/virt-v2v/Containerfile-upstream-xfs    | 22 +++++++++++
+ build/virt-v2v/passt_wrapper.sh              | 40 ++++++++++++++++++++
+ 4 files changed, 106 insertions(+)
+ create mode 100755 build/virt-v2v/passt_wrapper.sh
+
+diff --git a/build/virt-v2v/Containerfile-upstream b/build/virt-v2v/Containerfile-upstream
+index ffaaaec97..3c9d5a135 100644
+--- a/build/virt-v2v/Containerfile-upstream
++++ b/build/virt-v2v/Containerfile-upstream
+@@ -55,6 +55,28 @@ RUN cp /usr/sbin/xfs_repair /usr/sbin/xfs_repair.original && \
+     chmod 755 /usr/sbin/xfs_repair && \
+     echo '/usr/sbin/xfs_repair.original' >> /usr/lib64/guestfs/supermin.d/hostfiles
+ 
++# libguestfs >= 1.52 gives the appliance its network via passt, which sandboxes
++# itself by dropping to "nobody" before creating its namespaces -- and the kernel
++# clears capabilities on that setuid(), so the sandbox setup fails with EPERM and
++# the appliance never gets its network. The wrapper keeps uid 0 so it succeeds;
++# see the file for the full explanation.
++#
++# /usr/bin/passt is the generic build, which re-execs "<its own path>.avx2" on an
++# AVX2-capable CPU, so the original we move aside needs its .avx2 beside it too --
++# otherwise passt keeps its generic code path and logs "Can't run AVX2 build,
++# using non-AVX2 version" on every run.
++COPY build/virt-v2v/passt_wrapper.sh /tmp/passt_wrapper.sh
++RUN if [ -x /usr/bin/passt ]; then \
++        mv /usr/bin/passt /usr/bin/passt.orig && \
++        cp /tmp/passt_wrapper.sh /usr/bin/passt && \
++        chmod 755 /usr/bin/passt && \
++        if [ -x /usr/bin/passt.avx2 ]; then \
++            ln -sf /usr/bin/passt.avx2 /usr/bin/passt.orig.avx2; \
++        fi; \
++    else \
++        echo 'passt is not installed, no wrapper needed'; \
++    fi
++
+ # This prevents libvirt from attempting to create files in the root directory,
+ # which would lead to permission errors.
+ # Refer to: https://issues.redhat.com/browse/RHEL-105490
+diff --git a/build/virt-v2v/Containerfile-upstream-fedora b/build/virt-v2v/Containerfile-upstream-fedora
+index 39b12df75..a1d1941ef 100644
+--- a/build/virt-v2v/Containerfile-upstream-fedora
++++ b/build/virt-v2v/Containerfile-upstream-fedora
+@@ -53,6 +53,28 @@ RUN cp /usr/sbin/xfs_repair /usr/sbin/xfs_repair.original && \
+     chmod 755 /usr/sbin/xfs_repair && \
+     echo '/usr/sbin/xfs_repair.original' >> /usr/lib64/guestfs/supermin.d/hostfiles
+ 
++# libguestfs >= 1.52 gives the appliance its network via passt, which sandboxes
++# itself by dropping to "nobody" before creating its namespaces -- and the kernel
++# clears capabilities on that setuid(), so the sandbox setup fails with EPERM and
++# the appliance never gets its network. The wrapper keeps uid 0 so it succeeds;
++# see the file for the full explanation.
++#
++# /usr/bin/passt is the generic build, which re-execs "<its own path>.avx2" on an
++# AVX2-capable CPU, so the original we move aside needs its .avx2 beside it too --
++# otherwise passt keeps its generic code path and logs "Can't run AVX2 build,
++# using non-AVX2 version" on every run.
++COPY build/virt-v2v/passt_wrapper.sh /tmp/passt_wrapper.sh
++RUN if [ -x /usr/bin/passt ]; then \
++        mv /usr/bin/passt /usr/bin/passt.orig && \
++        cp /tmp/passt_wrapper.sh /usr/bin/passt && \
++        chmod 755 /usr/bin/passt && \
++        if [ -x /usr/bin/passt.avx2 ]; then \
++            ln -sf /usr/bin/passt.avx2 /usr/bin/passt.orig.avx2; \
++        fi; \
++    else \
++        echo 'passt is not installed, no wrapper needed'; \
++    fi
++
+ # This prevents libvirt from attempting to create files in the root directory,
+ # which would lead to permission errors.
+ # Refer to: https://issues.redhat.com/browse/RHEL-105490
+diff --git a/build/virt-v2v/Containerfile-upstream-xfs b/build/virt-v2v/Containerfile-upstream-xfs
+index 8bbae1ab1..35b48b146 100644
+--- a/build/virt-v2v/Containerfile-upstream-xfs
++++ b/build/virt-v2v/Containerfile-upstream-xfs
+@@ -56,6 +56,28 @@ RUN cp /usr/sbin/xfs_repair /usr/sbin/xfs_repair.original && \
+     chmod 755 /usr/sbin/xfs_repair && \
+     echo '/usr/sbin/xfs_repair.original' >> /usr/lib64/guestfs/supermin.d/hostfiles
+ 
++# libguestfs >= 1.52 gives the appliance its network via passt, which sandboxes
++# itself by dropping to "nobody" before creating its namespaces -- and the kernel
++# clears capabilities on that setuid(), so the sandbox setup fails with EPERM and
++# the appliance never gets its network. The wrapper keeps uid 0 so it succeeds;
++# see the file for the full explanation.
++#
++# /usr/bin/passt is the generic build, which re-execs "<its own path>.avx2" on an
++# AVX2-capable CPU, so the original we move aside needs its .avx2 beside it too --
++# otherwise passt keeps its generic code path and logs "Can't run AVX2 build,
++# using non-AVX2 version" on every run.
++COPY build/virt-v2v/passt_wrapper.sh /tmp/passt_wrapper.sh
++RUN if [ -x /usr/bin/passt ]; then \
++        mv /usr/bin/passt /usr/bin/passt.orig && \
++        cp /tmp/passt_wrapper.sh /usr/bin/passt && \
++        chmod 755 /usr/bin/passt && \
++        if [ -x /usr/bin/passt.avx2 ]; then \
++            ln -sf /usr/bin/passt.avx2 /usr/bin/passt.orig.avx2; \
++        fi; \
++    else \
++        echo 'passt is not installed, no wrapper needed'; \
++    fi
++
+ # This prevents libvirt from attempting to create files in the root directory,
+ # which would lead to permission errors.
+ # Refer to: https://issues.redhat.com/browse/RHEL-105490
+diff --git a/build/virt-v2v/passt_wrapper.sh b/build/virt-v2v/passt_wrapper.sh
+new file mode 100755
+index 000000000..13bcc5ad4
+--- /dev/null
++++ b/build/virt-v2v/passt_wrapper.sh
+@@ -0,0 +1,40 @@
++#!/bin/sh
++#
++# libguestfs >= 1.52 gives the appliance its network via passt, which libguestfs
++# starts on the host side, as root, and which sandboxes itself: it builds its own
++# mount/UTS/IPC/PID namespaces, chroots into an empty tmpfs and installs a seccomp
++# filter. To do that it first drops to "nobody" -- but the kernel clears
++# capabilities on that setuid(), so the unshare() that follows cannot create the
++# namespaces and the appliance never gets its network:
++#
++#     You can now start qemu (>= 7.2, with commit 13c6be96618c):
++#     Failed to detach isolating namespaces: Operation not permitted
++#     Failed to sandbox process, exiting
++#     virt-v2v-in-place: error: libguestfs error: passt exited with status 1
++#
++# Adding CAP_SYS_ADMIN to the container does not help: passt drops the capability
++# itself, so the failure is identical for a fully privileged pod. Keeping uid 0
++# does help -- --runas 0 makes passt's setuid() a no-op, so the capability is still
++# there when the namespaces are created and the sandbox completes. libguestfs
++# passes no --runas of its own, so the default (nobody) is what breaks.
++#
++# The extra argument is only added when we are already root; any other caller is
++# passed through untouched, so a pod that runs as a non-root uid (an
++# OpenShift-assigned one, say) behaves exactly as it did before. passt still
++# sandboxes in every case -- only the uid it ends up as changes.
++#
++# /usr/bin/passt is the generic passt build, which re-execs "<argv0>.avx2" when the
++# CPU supports AVX2, so the original is kept beside this wrapper as passt.orig --
++# with a passt.orig.avx2 symlink to passt.avx2 so that dispatch keeps working.
++# (Without it passt still runs, but takes its generic code path and logs "Can't run
++# AVX2 build, using non-AVX2 version" on every invocation.)
++#
++case " $* " in
++    *" --runas "*) exec /usr/bin/passt.orig "$@" ;;
++esac
++
++if [ "$(id -u)" = 0 ]; then
++    exec /usr/bin/passt.orig --runas 0 "$@"
++fi
++
++exec /usr/bin/passt.orig "$@"
