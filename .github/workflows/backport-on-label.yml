@@ -12,6 +12,8 @@ jobs:
       github.event.pull_request.merged == true &&
       (contains(toJSON(github.event.pull_request.labels.*.name), 'backport-rc-') ||
        contains(toJSON(github.event.pull_request.labels.*.name), 'backport-release-'))
+    permissions:
+      contents: read
     outputs:
       branches: ${{ steps.detect.outputs.branches }}
     steps:
