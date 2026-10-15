@@ -6,6 +6,9 @@ on:
       - "operator/roles/forkliftcontroller/**"
       - "hack/validate_forklift_controller_crd.py"
 
+permissions:
+  contents: read
+
 jobs:
   validate:
     runs-on: ubuntu-latest
