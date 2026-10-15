@@ -1,0 +1,160 @@
+# Configures static IP on Windows network interfaces via registry.
+# Registry writes don't depend on RPC or DHCP Client service.
+# Changes take effect after reboot.
+# Network configurations are rendered by the Go template engine from typed data.
+
+$adapterWaitMinutes = 5
+
+# Lookup table avoids [Convert]::ToInt32() which is blocked in Constrained Language Mode
+$PrefixToMaskTable = @(
+    "0.0.0.0",         "128.0.0.0",       "192.0.0.0",       "224.0.0.0",
+    "240.0.0.0",       "248.0.0.0",       "252.0.0.0",       "254.0.0.0",
+    "255.0.0.0",       "255.128.0.0",     "255.192.0.0",     "255.224.0.0",
+    "255.240.0.0",     "255.248.0.0",     "255.252.0.0",     "255.254.0.0",
+    "255.255.0.0",     "255.255.128.0",   "255.255.192.0",   "255.255.224.0",
+    "255.255.240.0",   "255.255.248.0",   "255.255.252.0",   "255.255.254.0",
+    "255.255.255.0",   "255.255.255.128", "255.255.255.192", "255.255.255.224",
+    "255.255.255.240", "255.255.255.248", "255.255.255.252", "255.255.255.254",
+    "255.255.255.255"
+)
+
+function Convert-PrefixToMask($prefix) {
+    return $PrefixToMaskTable[[int]$prefix]
+}
+
+function Find-AdapterByMAC($mac) {
+    $startTime = Get-Date
+    $deadline = $startTime.AddMinutes($adapterWaitMinutes)
+    Write-Host "[INFO] Waiting for adapter with MAC $mac..."
+
+    while ((Get-Date) -lt $deadline) {
+        $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue
+        foreach ($a in $adapters) {
+            if ($a.MacAddress -and ($a.MacAddress.ToUpper().Replace(":", "-") -eq $mac)) {
+                $elapsed = ((Get-Date) - $startTime).TotalSeconds
+                Write-Host "[INFO] Found adapter '$($a.Name)' (GUID=$($a.InterfaceGuid)) after $([int]$elapsed)s"
+                return $a
+            }
+        }
+        Start-Sleep -Seconds 2
+    }
+    return $null
+}
+
+Write-Host "=============================================="
+Write-Host "[INFO] MTV Network Configuration Script (Registry)"
+Write-Host "=============================================="
+
+# Network configurations populated by Go template (MAC -> IPs with gateway/prefix/DNS)
+$networkConfigs = @(
+{{- range $i, $cfg := . }}
+    @{
+        MAC = '{{ lower $cfg.MAC }}'
+        IPs = @{{ formatIPs $cfg.IPs }}
+        DNS = @{{ formatDNS $cfg }}
+    }{{ if ne (add $i 1) (len $) }},{{ end }}
+{{- end }}
+)
+
+$successCount = 0
+$failCount = 0
+
+foreach ($config in $networkConfigs) {
+    $mac = $config.MAC.ToUpper() -replace '[:-]', '-'
+    Write-Host ""
+    Write-Host "--- Adapter MAC=$mac ---"
+
+    $adapter = Find-AdapterByMAC $mac
+    if (-not $adapter) {
+        Write-Warning "[FAIL] Adapter with MAC $mac not found after waiting ${adapterWaitMinutes}m"
+        $failCount++
+        continue
+    }
+
+    $guid = $adapter.InterfaceGuid
+    $ifIdx = $adapter.InterfaceIndex
+    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$guid"
+
+    # Separate IPv4 (registry) and IPv6 (cmdlet) entries
+    $ipv4Addrs = @()
+    $ipv4Masks = @()
+    $ipv4Gateway = ''
+
+    foreach ($ip in $config.IPs) {
+        if ($ip.IPAddress -match ':') {
+            # IPv6: use New-NetIPAddress/New-NetRoute (Tcpip registry is IPv4-only).
+            $v6Failed = $false
+            try {
+                New-NetIPAddress -InterfaceIndex $ifIdx -IPAddress $ip.IPAddress -PrefixLength ([int]$ip.PrefixLength) -ErrorAction Stop | Out-Null
+            } catch {
+                Write-Warning "[FAIL] Failed to set IPv6 address $($ip.IPAddress): $_"
+                $v6Failed = $true
+            }
+            if ($ip.Gateway -and $ip.Gateway -ne '') {
+                $existingRoute = Get-NetRoute -DestinationPrefix "::/0" -InterfaceIndex $ifIdx -NextHop $ip.Gateway -ErrorAction SilentlyContinue
+                if (-not $existingRoute) {
+                    try {
+                        New-NetRoute -DestinationPrefix "::/0" -InterfaceIndex $ifIdx -NextHop $ip.Gateway -ErrorAction Stop | Out-Null
+                    } catch {
+                        Write-Warning "[FAIL] Failed to add IPv6 route via $($ip.Gateway): $_"
+                        $v6Failed = $true
+                    }
+                }
+            }
+            if ($v6Failed) { $failCount++ }
+            else { Write-Host "[OK] IPv6 configured: $($ip.IPAddress)/$($ip.PrefixLength)" }
+            continue
+        }
+
+        # IPv4: collect for registry write
+        $mask = Convert-PrefixToMask ([int]$ip.PrefixLength)
+        $ipv4Addrs += $ip.IPAddress
+        $ipv4Masks += $mask
+        if ($ipv4Gateway -eq '' -and $ip.Gateway -ne '') {
+            $ipv4Gateway = $ip.Gateway
+        }
+    }
+
+    # Write IPv4 configuration to registry
+    if ($ipv4Addrs.Count -gt 0) {
+        if (-not (Test-Path $regPath)) {
+            Write-Warning "[FAIL] Registry path not found: $regPath"
+            $failCount++
+            continue
+        }
+
+        Write-Host "[INFO] Writing IPv4 to registry: $regPath"
+        try {
+            Set-ItemProperty -Path $regPath -Name "EnableDHCP" -Value 0 -Type DWord
+            Set-ItemProperty -Path $regPath -Name "IPAddress" -Value ([string[]]$ipv4Addrs) -Type MultiString
+            Set-ItemProperty -Path $regPath -Name "SubnetMask" -Value ([string[]]$ipv4Masks) -Type MultiString
+            Set-ItemProperty -Path $regPath -Name "DefaultGateway" -Value @($ipv4Gateway) -Type MultiString
+            Set-ItemProperty -Path $regPath -Name "DefaultGatewayMetric" -Value @("0") -Type MultiString
+
+            # DNS: filter blanks, join IPv4 DNS for registry NameServer
+            $dnsServers = @()
+            if ($config.DNS) {
+                $dnsServers = @($config.DNS | Where-Object { $_ -and $_.Trim() -ne '' })
+            }
+            if ($dnsServers.Count -gt 0) {
+                $dnsString = $dnsServers -join ","
+                Set-ItemProperty -Path $regPath -Name "NameServer" -Value $dnsString -Type String
+            }
+
+            Write-Host "[OK] Registry updated: IPs=($($ipv4Addrs -join ', ')) GW=$ipv4Gateway"
+            $successCount++
+        } catch {
+            Write-Error "[FAIL] Registry write failed for MAC=$mac at ${regPath}: $_"
+            $failCount++
+        }
+    }
+}
+
+Write-Host ""
+Write-Host "=============================================="
+Write-Host "[INFO] Network configuration complete"
+Write-Host "[INFO] Adapters configured: $successCount"
+if ($failCount -gt 0) {
+    Write-Warning "[WARN] Failed: $failCount"
+}
+Write-Host "=============================================="

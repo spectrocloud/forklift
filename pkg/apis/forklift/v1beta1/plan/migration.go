@@ -30,6 +30,30 @@ func (e *Error) Add(reason ...string) {
 	}
 }
 
+// Warning.
+type Warning struct {
+	Phase   string   `json:"phase"`
+	Reasons []string `json:"reasons"`
+}
+
+// Add.
+func (e *Warning) Add(reason ...string) {
+	find := func(reason string) (found bool) {
+		for _, r := range e.Reasons {
+			if r == reason {
+				found = true
+				break
+			}
+		}
+		return
+	}
+	for _, r := range reason {
+		if !find(r) {
+			e.Reasons = append(e.Reasons, r)
+		}
+	}
+}
+
 // Migration status.
 type MigrationStatus struct {
 	Timed `json:",inline,omitempty"`
@@ -70,7 +94,15 @@ func (r *MigrationStatus) NewSnapshot(snapshot Snapshot) {
 // Find a VM status.
 func (r *MigrationStatus) FindVM(ref ref.Ref) (v *VMStatus, found bool) {
 	for _, vm := range r.VMs {
-		if vm.ID == ref.ID {
+		if vm.ID != "" && vm.ID == ref.ID {
+			found = true
+			v = vm
+			return
+		}
+	}
+	// Fallback: match by Name when the status VM has no ID
+	for _, vm := range r.VMs {
+		if vm.ID == "" && vm.Name != "" && vm.Name == ref.Name {
 			found = true
 			v = vm
 			return
@@ -142,6 +174,8 @@ type Task struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 	// Error.
 	Error *Error `json:"error,omitempty"`
+	// Warning.
+	Warning *Warning `json:"warning,omitempty"`
 }
 
 // Add an error.
@@ -155,4 +189,17 @@ func (r *Task) AddError(reason ...string) {
 // Return whether the task has an error.
 func (r *Task) HasError() bool {
 	return r.Error != nil
+}
+
+// Add a warning.
+func (r *Task) AddWarning(reason ...string) {
+	if r.Warning == nil {
+		r.Warning = &Warning{Phase: r.Phase}
+	}
+	r.Warning.Add(reason...)
+}
+
+// Return whether the task has an warning.
+func (r *Task) HasWarning() bool {
+	return r.Warning != nil
 }

@@ -4,12 +4,14 @@ import (
 	"github.com/gin-gonic/gin"
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web/base"
+	"github.com/kubev2v/forklift/pkg/controller/provider/web/hyperv"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web/ocp"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web/openstack"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web/ova"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web/ovirt"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web/vsphere"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
+	ec2web "github.com/kubev2v/forklift/pkg/provider/ec2/inventory/web"
 
 	"net/http"
 )
@@ -130,6 +132,7 @@ func (h ProviderHandler) List(ctx *gin.Context) {
 		Handler: base.Handler{
 			Container: h.Container,
 		},
+		Config: ova.Config,
 	}
 	status, err = ovaHandler.Prepare(ctx)
 	if status != http.StatusOK {
@@ -146,12 +149,57 @@ func (h ProviderHandler) List(ctx *gin.Context) {
 		ctx.Status(http.StatusInternalServerError)
 		return
 	}
+	// EC2
+	ec2Handler := &ec2web.ProviderHandler{
+		Handler: base.Handler{
+			Container: h.Container,
+		},
+	}
+	status, err = ec2Handler.Prepare(ctx)
+	if status != http.StatusOK {
+		ctx.Status(status)
+		base.SetForkliftError(ctx, err)
+		return
+	}
+	ec2List, err := ec2Handler.ListContent(ctx)
+	if err != nil {
+		log.Trace(
+			err,
+			"url",
+			ctx.Request.URL)
+		ctx.Status(http.StatusInternalServerError)
+		return
+	}
+	// HyperV
+	hypervHandler := &hyperv.ProviderHandler{
+		Handler: base.Handler{
+			Container: h.Container,
+		},
+		Config: hyperv.DefaultConfig,
+	}
+	status, err = hypervHandler.Prepare(ctx)
+	if status != http.StatusOK {
+		ctx.Status(status)
+		base.SetForkliftError(ctx, err)
+		return
+	}
+	hypervList, err := hypervHandler.ListContent(ctx)
+	if err != nil {
+		log.Trace(
+			err,
+			"url",
+			ctx.Request.URL)
+		ctx.Status(http.StatusInternalServerError)
+		return
+	}
 	r := Provider{
 		string(api.OpenShift): ocpList,
 		string(api.VSphere):   vSphereList,
 		string(api.OVirt):     oVirtList,
 		string(api.OpenStack): openStackList,
 		string(api.Ova):       ovaList,
+		string(api.EC2):       ec2List,
+		string(api.HyperV):    hypervList,
 	}
 
 	content := r

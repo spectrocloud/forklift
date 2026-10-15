@@ -18,6 +18,16 @@ type HookRef struct {
 	Hook core.ObjectReference `json:"hook" ref:"Hook"`
 }
 
+// TargetPowerState defines the desired power state of the target VM after migration
+type TargetPowerState string
+
+const (
+	// Target power state constants
+	TargetPowerStateOn   TargetPowerState = "on"
+	TargetPowerStateOff  TargetPowerState = "off"
+	TargetPowerStateAuto TargetPowerState = "auto"
+)
+
 func (r *HookRef) String() string {
 	return fmt.Sprintf(
 		"%s @%s",
@@ -33,6 +43,13 @@ type VM struct {
 	// Disk decryption LUKS keys
 	// +optional
 	LUKS core.ObjectReference `json:"luks" ref:"Secret"`
+	// Attempt passphrase-less unlocking for all devices with Clevis, over the network.
+	// Conversion pod running on target cluster will attempt to connect to a TANG server, make sure TANG
+	// server is available on target network.
+	// https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/security_hardening/configuring-automated-unlocking-of-encrypted-volumes-using-policy-based-decryption_security-hardening
+	// If both nbdeClevis and LUKS are configured, nbdeClevis takes precedence.
+	// +optional
+	NbdeClevis bool `json:"nbdeClevis,omitempty"`
 	// Choose the primary disk the VM boots from
 	// +optional
 	RootDisk string `json:"rootDisk,omitempty"`
@@ -40,27 +57,47 @@ type VM struct {
 	// +optional
 	InstanceType string `json:"instanceType,omitempty"`
 	// PVCNameTemplate is a template for generating PVC names for VM disks.
-	// It follows Go template syntax and has access to the following variables:
-	//   - .VmName: name of the VM
+	// Generated names must be valid DNS-1123 labels (lowercase alphanumerics, '-' allowed, max 63 chars).
+	// It follows Go template syntax and has access to provider-specific variables.
+	//
+	// Common variables (all providers):
+	//   - .VmName: name of the VM in the source cluster (original source name)
+	//   - .TargetVmName: final VM name in the target cluster (may equal .VmName if no rename/normalization)
 	//   - .PlanName: name of the migration plan
 	//   - .DiskIndex: initial volume index of the disk
+	//
+	// VMware (vSphere) specific variables:
+	//   - .WinDriveLetter: Windows drive letter (lowercase, if applicable, e.g. "c", requires guest agent)
 	//   - .RootDiskIndex: index of the root disk
 	//   - .Shared: true if the volume is shared by multiple VMs, false otherwise
+	//   - .FileName: name of the file in the source provider (filename includes the .vmdk suffix)
+	//
+	// OpenShift specific variables:
+	//   - .SourcePVCName: name of the PVC in the source cluster
+	//   - .SourcePVCNamespace: namespace of the PVC in the source cluster
+	//
 	// Note:
 	//   This template overrides the plan level template.
 	// Examples:
-	//   "{{.VmName}}-disk-{{.DiskIndex}}"
-	//   "{{if eq .DiskIndex .RootDiskIndex}}root{{else}}data{{end}}-{{.DiskIndex}}"
-	//   "{{if .Shared}}shared-{{end}}{{.VmName}}-{{.DiskIndex}}"
+	//   "{{.TargetVmName}}-disk-{{.DiskIndex}}"
+	//   "{{if eq .DiskIndex .RootDiskIndex}}root{{else}}data{{end}}-{{.DiskIndex}}" (VMware)
+	//   "{{.TargetVmName}}-{{.SourcePVCName}}" (OpenShift)
+	// See:
+	// 	 https://github.com/kubev2v/forklift/tree/main/pkg/templateutil for template functions.
 	// +optional
 	PVCNameTemplate string `json:"pvcNameTemplate,omitempty"`
 	// VolumeNameTemplate is a template for generating volume interface names in the target virtual machine.
 	// It follows Go template syntax and has access to the following variables:
 	//   - .PVCName: name of the PVC mounted to the VM using this volume
 	//   - .VolumeIndex: sequential index of the volume interface (0-based)
+	//
+	// Provider support:
+	//   - VMware (vSphere): Supported. Default naming is "vol-{index}".
+	//   - OpenShift: Not supported. Volume names are preserved from the source VM.
+	//
 	// Note:
 	//   - This template will override at the plan level template
-	//   - If not specified on VM level and on Plan leverl, default naming conventions will be used
+	//   - If not specified on VM level and on Plan level, default naming conventions will be used
 	// Examples:
 	//   "disk-{{.VolumeIndex}}"
 	//   "pvc-{{.PVCName}}"
@@ -73,9 +110,14 @@ type VM struct {
 	//   - .NetworkType: type of the network ("Multus" or "Pod")
 	//   - .NetworkIndex: sequential index of the network interface (0-based)
 	// The template can be used to customize network interface names based on target network configuration.
+	//
+	// Provider support:
+	//   - VMware (vSphere): Supported. Network interface names can be customized.
+	//   - OpenShift: Not supported. Network interface names are preserved from the source VM.
+	//
 	// Note:
 	//   - This template will override at the plan level template
-	//   - If not specified on VM level and on Plan leverl, default naming conventions will be used
+	//   - If not specified on VM level and on Plan level, default naming conventions will be used
 	// Examples:
 	//   "net-{{.NetworkIndex}}"
 	//   "{{if eq .NetworkType "Pod"}}pod{{else}}multus-{{.NetworkIndex}}{{end}}"
@@ -86,6 +128,80 @@ type VM struct {
 	// If provided, this exact name will be used instead. The migration will fail if the name is not unique or already in use.
 	// +optional
 	TargetName string `json:"targetName,omitempty"`
+	// TargetPowerState specifies the desired power state of the target VM after migration.
+	// - "on": Target VM will be powered on after migration
+	// - "off": Target VM will be powered off after migration
+	// - "auto" or nil (default): Target VM will match the source VM's power state
+	// +optional
+	// +kubebuilder:validation:Enum=on;off;auto
+	TargetPowerState TargetPowerState `json:"targetPowerState,omitempty"`
+	// DeleteVmOnFailMigration controls whether the target VM created by this Plan is deleted when a migration fails.
+	// When true and the migration fails after the target VM has been created, the controller
+	// will delete the target VM (and related target-side resources) during failed-migration cleanup
+	// and when the Plan is deleted. When false (default), the target VM is preserved to aid
+	// troubleshooting. The source VM is never modified.
+	//
+	// Note: If the Plan-level option is set to true, the VM-level option will be ignored.
+	//
+	// +optional
+	DeleteVmOnFailMigration bool `json:"deleteVmOnFailMigration,omitempty"`
+	// MigrateSharedDisks controls whether shared disks are included in the migration for this VM.
+	// When nil (default), the plan-level migrateSharedDisks value is used.
+	// When explicitly set to true, shared disks are migrated for this VM.
+	// When explicitly set to false, shared disks are skipped for this VM.
+	//
+	// +optional
+	MigrateSharedDisks *bool `json:"migrateSharedDisks,omitempty"`
+	// EnableNestedVirtualization controls whether nested virtualization CPU features (vmx/svm)
+	// are requested on the target VM. This overrides both the plan-level setting and the
+	// source VM's configuration.
+	//
+	// - nil (default): Falls back to the plan-level enableNestedVirtualization value.
+	// - true: Request nested virtualization for this VM. CPU features vmx and svm are added
+	//   with policy "optional" -- the VM will have nested virtualization only if the host
+	//   hardware supports it. This is a best-effort hint, not a guarantee.
+	// - false: Explicitly disable nested virtualization for this VM. CPU features vmx and svm
+	//   are added with policy "disable", preventing nested virtualization regardless of host
+	//   capability.
+	//
+	// Both vmx and svm are added together so the VM is portable across Intel and AMD hosts.
+	// The "optional" policy activates only the feature the host CPU supports; the other is ignored.
+	//
+	// +optional
+	EnableNestedVirtualization *bool `json:"enableNestedVirtualization,omitempty"`
+	// RDMAsLun controls whether RDM (Raw Device Mapping) disks from VMware should be
+	// mapped as LUN devices in the target KubeVirt VM instead of regular disk devices.
+	// When nil (default), the plan-level rdmAsLun value is used.
+	// When explicitly set to true, RDM disks are attached using lun: {} for this VM.
+	// When explicitly set to false, RDM disks are attached as regular disks for this VM.
+	//
+	// +optional
+	RDMAsLun *bool `json:"rdmAsLun,omitempty"`
+	// SCSIReservation controls whether SCSI persistent reservation is enabled for
+	// shared RDM LUN disks on this VM. Requires rdmAsLun=true to have any effect.
+	// When nil (default), the plan-level scsiReservation value is used.
+	// When explicitly set to true, shared RDM LUNs for this VM get lun.reservation=true.
+	// When explicitly set to false, shared RDM LUNs for this VM get lun.reservation=false.
+	//
+	// +optional
+	SCSIReservation *bool `json:"scsiReservation,omitempty"`
+	// SelinuxRelabelAtBoot overrides the plan-level selinuxRelabelAtBoot for this VM.
+	// When nil (default), the plan-level value is used.
+	// +optional
+	SelinuxRelabelAtBoot *bool `json:"selinuxRelabelAtBoot,omitempty"`
+	// SelinuxRelabelExclude overrides the plan-level selinuxRelabelExclude for this VM.
+	// When nil (default), the plan-level value is used.
+	// Use carefully: changes made inside excluded directories during customization may retain incorrect
+	// SELinux labels and cause failures later. Only exclude directories that are known not to need relabeling.
+	// +optional
+	SelinuxRelabelExclude []string `json:"selinuxRelabelExclude,omitempty"`
+	// ExcludeDisks lists vSphere bus addresses to skip during migration (e.g. "scsi0:1").
+	// Empty or omitted: migrate all disks (subject to migrateSharedDisks).
+	// When set, matching disks are not imported and are not attached to the target VM.
+	// Excluding every disk is rejected. Excluding the root/boot disk is allowed with a warning.
+	// vSphere only; other providers ignore this field.
+	// +optional
+	ExcludeDisks []string `json:"excludeDisks,omitempty"`
 }
 
 // Find a Hook for the specified step.
@@ -119,6 +235,8 @@ type VMStatus struct {
 	Firmware string `json:"firmware,omitempty"`
 	// The Operating System detected by virt-v2v.
 	OperatingSystem string `json:"operatingSystem,omitempty"`
+	// Boot disk index (0-based) detected by virt-v2v. nil means undetected.
+	DetectedBootDisk *int `json:"detectedBootDisk,omitempty"`
 	// The new name of the VM after matching DNS1123 requirements.
 	NewName string `json:"newName,omitempty"`
 

@@ -1,0 +1,65 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ cli_download_deployment_name }}
+  namespace: "{{ app_namespace }}"
+  labels:
+    app: {{ app_name }}
+    service: {{ cli_download_service_name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ app_name }}
+      service: {{ cli_download_service_name }}
+  template:
+    metadata:
+      labels:
+        app: {{ app_name }}
+        service: {{ cli_download_service_name }}
+    spec:
+      containers:
+        - name: "{{ cli_download_container_name }}"
+          image: "{{ cli_download_image_fqin or lookup('env', 'CLI_DOWNLOAD_IMAGE') or lookup('env', 'RELATED_IMAGE_CLI_DOWNLOAD') }}"
+          ports:
+            - containerPort: 8443
+              protocol: TCP
+          imagePullPolicy: "{{ image_pull_policy }}"
+          resources:
+            limits:
+              cpu: "{{ cli_download_container_limits_cpu }}"
+              memory: "{{ cli_download_container_limits_memory }}"
+            requests:
+              cpu: "{{ cli_download_container_requests_cpu }}"
+              memory: "{{ cli_download_container_requests_memory }}"
+          readinessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: cli-serving-cert
+              readOnly: true
+              mountPath: /var/cli-serving-cert
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: cli-serving-cert
+          secret:
+            secretName: {{ cli_download_tls_secret_name }}
+            defaultMode: 420
+      restartPolicy: Always
+      dnsPolicy: ClusterFirst
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%
+      maxSurge: 25%

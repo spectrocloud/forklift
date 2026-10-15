@@ -42,8 +42,15 @@ rules:
   - console.openshift.io
   resources:
   - consoleplugins
+  - consoleclidownloads
   verbs:
   - '*'
+- apiGroups:
+  - route.openshift.io
+  resources:
+    - routes
+  verbs:
+    - '*'
 - apiGroups:
   - operator.openshift.io
   resources:
@@ -75,6 +82,24 @@ rules:
   verbs:
   - create
   - delete
+  - get
+  - list
+  - watch
+  - update
+  - patch
+- apiGroups:
+  - k8s.cni.cncf.io
+  resources:
+  - network-attachment-definitions
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ols.openshift.io
+  resources:
+  - olsconfigs
+  verbs:
   - get
   - list
   - watch

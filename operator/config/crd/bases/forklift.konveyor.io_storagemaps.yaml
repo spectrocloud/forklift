@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.17.0
+    controller-gen.kubebuilder.io/version: v0.17.3
   name: storagemaps.forklift.konveyor.io
 spec:
   group: forklift.konveyor.io
@@ -75,6 +75,26 @@ spec:
                     offloadPlugin:
                       description: Offload Plugin
                       properties:
+                        csiVolumeImport:
+                          description: |-
+                            CsiVolumeImport uses the CSI driver's native import capability to migrate VVol/RDM disks.
+                            The controller creates a PVC with import annotations; the CSI driver clones the source array
+                            volume directly — no populator pod, no CR, no service account is launched.
+                          properties:
+                            secretRef:
+                              description: SecretRef is the name of the secret with
+                                storage credentials, in the source provider's namespace.
+                              type: string
+                            storageVendorProduct:
+                              description: StorageVendorProduct identifies the storage
+                                array vendor.
+                              enum:
+                              - primera3par
+                              type: string
+                          required:
+                          - secretRef
+                          - storageVendorProduct
+                          type: object
                         vsphereXcopyConfig:
                           description: |-
                             VSphereXcopyPluginConfig works with the Vsphere Xcopy Volume Populator
@@ -89,18 +109,20 @@ spec:
                               description: StorageVendorProduct the string identifier
                                 of the storage vendor product
                               enum:
+                              - flashsystem
                               - vantara
                               - ontap
                               - primera3par
                               - pureFlashArray
                               - powerflex
+                              - powermax
+                              - powerstore
+                              - infinibox
                               type: string
                           required:
                           - secretRef
                           - storageVendorProduct
                           type: object
-                      required:
-                      - vsphereXcopyConfig
                       type: object
                     source:
                       description: Source storage.
@@ -259,6 +281,9 @@ spec:
                       type: string
                     status:
                       description: The condition status [true,false].
+                      type: string
+                    suggestion:
+                      description: A suggested action or resolution for the condition.
                       type: string
                     type:
                       description: The condition type.

@@ -9,7 +9,6 @@ import (
 	"net"
 	liburl "net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
@@ -39,8 +38,8 @@ func dialTLSWithTimeout(host string, cfg *tls.Config, timeout time.Duration) (*t
 func extractServerName(address string) string {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
-		// If SplitHostPort fails (likely no port is present), fallback
-		return strings.Split(address, ":")[0]
+		// If SplitHostPort fails (likely no port is present), assume the entire address is the host.
+		return address
 	}
 	return host
 }
@@ -82,7 +81,7 @@ func tlsConfig(secret *core.Secret) (cfg *tls.Config, err error) {
 	cfg = &tls.Config{}
 	if InsecureProvider(secret) {
 		cfg.InsecureSkipVerify = true
-	} else if cacert, ok := secret.Data["cacert"]; ok {
+	} else if cacert, ok := GetCACert(secret); ok {
 		cfg.RootCAs = x509.NewCertPool()
 		if ok := cfg.RootCAs.AppendCertsFromPEM(cacert); !ok {
 			err = liberr.New("failed to parse the specified certificate")
@@ -119,4 +118,25 @@ func InsecureProvider(secret *core.Secret) bool {
 	}
 
 	return insecureSkipVerify
+}
+
+// GetCACert retrieves the CA certificate from a secret.
+// It first checks for the standard Kubernetes field "ca.crt",
+// then falls back to the legacy "cacert" field for backward compatibility.
+// Returns the certificate bytes and a boolean indicating if found.
+func GetCACert(secret *core.Secret) ([]byte, bool) {
+	// Try standard Kubernetes field first
+	if cacrt, ok := secret.Data["ca.crt"]; ok && len(cacrt) > 0 {
+		return cacrt, true
+	}
+	// The following field is deprecated and will be removed in Forklift v2.14.
+	if cacert, ok := secret.Data["cacert"]; ok && len(cacert) > 0 {
+		return cacert, true
+	}
+	return nil, false
+}
+
+func HasCACert(secret *core.Secret) bool {
+	_, ok := GetCACert(secret)
+	return ok
 }

@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 14:49:23 -0700
+Subject: [PATCH 10/10] spectro: adapt v2.12.9 ShouldUseV2vForTransfer
+ excludeDisks test
+
+plan_transfer_test.go is new in upstream v2.12.9 and asserts the vSphere
+case returns true (virt-v2v) when excludeDisks is empty. That is the
+premise this fork inverts, so the assertion is updated to the CDI path.
+The excludeDisks-set case already expected false and is unchanged.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+(cherry picked from commit 509a0a85df26c4b464b0f52f72a486738637a0aa)
+---
+ pkg/apis/forklift/v1beta1/plan_transfer_test.go | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/pkg/apis/forklift/v1beta1/plan_transfer_test.go b/pkg/apis/forklift/v1beta1/plan_transfer_test.go
+index 3b04b2dcb..5b1bc892c 100644
+--- a/pkg/apis/forklift/v1beta1/plan_transfer_test.go
++++ b/pkg/apis/forklift/v1beta1/plan_transfer_test.go
+@@ -29,6 +29,11 @@ func TestShouldUseV2vForTransfer_ExcludeDisks(t *testing.T) {
+ 		}
+ 	}
+ 
++	// Spectro: the vSphere case always returns false, so both of upstream's
++	// assertions collapse to the CDI path. Upstream expects virt-v2v (true) in
++	// the second case; that premise is exactly what this fork inverts, so both
++	// cases are asserted as false here. See spectro_fork_test.go for the
++	// canonical guard on the inversion itself.
+ 	ok, err := newPlan([]string{"scsi0:1"}).ShouldUseV2vForTransfer(ref.Ref{ID: "vm-1"})
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -41,7 +46,7 @@ func TestShouldUseV2vForTransfer_ExcludeDisks(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if !ok {
+-		t.Fatal("expected virt-v2v when excludeDisks is empty")
++	if ok {
++		t.Fatal("expected CDI path when excludeDisks is empty (Spectro inverts upstream)")
+ 	}
+ }

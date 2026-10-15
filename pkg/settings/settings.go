@@ -13,8 +13,9 @@ import (
 var Settings = ControllerSettings{}
 
 const (
-	OpenShift   = "OPENSHIFT"
-	Development = "DEVELOPMENT"
+	OpenShift        = "OPENSHIFT"
+	Development      = "DEVELOPMENT"
+	OpenShiftVersion = "OPENSHIFT_VERSION"
 )
 
 // Settings
@@ -35,6 +36,8 @@ type ControllerSettings struct {
 	Profiler
 	// Feature gates.
 	Features
+	// Provider settings.
+	Providers
 	OpenShift   bool
 	Development bool
 }
@@ -70,6 +73,10 @@ func (r *ControllerSettings) Load() error {
 		return err
 	}
 	err = r.Features.Load()
+	if err != nil {
+		return err
+	}
+	err = r.Providers.Load()
 	if err != nil {
 		return err
 	}
@@ -131,4 +138,20 @@ func GetVDDKImage(providerSpecSettings map[string]string) string {
 	}
 
 	return vddkImage
+}
+
+// ControllerNamespace returns the namespace where the forklift-controller
+// pod is deployed (set via fieldRef in the deployment template).
+func ControllerNamespace() string {
+	return os.Getenv("POD_NAMESPACE")
+}
+
+// Lookup the value of an environment variable and
+// return a fallback value if it isn't found.
+func Lookup(env string, fallback string) string {
+	if val, found := os.LookupEnv(env); found {
+		return val
+	} else {
+		return fallback
+	}
 }

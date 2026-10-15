@@ -12,14 +12,70 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 )
 
-// Bus types
+// Bus types — re-exported from the model package for backward compatibility.
 const (
-	NVME = "nvme"
-	USB  = "usb"
-	SATA = "sata"
-	SCSI = "scsi"
-	IDE  = "ide"
+	NVME = model.NVME
+	USB  = model.USB
+	SATA = model.SATA
+	SCSI = model.SCSI
+	IDE  = model.IDE
 )
+
+// CtkEnabledKey is the VMware ExtraConfig key for Changed Block Tracking (canonical form).
+const CtkEnabledKey = "ctkEnabled"
+
+// VMware persistent PCI slot number encoding (Broadcom KB 311606).
+// The slot is a packed integer with bitmap FFF.BBBBB.DDDDD:
+//
+//	DDDDD  (bits 0-4)   device number on the secondary bus
+//	BBBBB  (bits 5-9)   bridge index: 0 = primary bus, N = pciBridge[N-1]
+//	FFF    (bits 10-12)  root-port function number within the bridge device
+const (
+	pciSlotMaskDevice  = 0x1F
+	pciSlotShiftBridge = 5
+	pciSlotMaskBridge  = 0x1F
+	pciSlotShiftFunc   = 10
+	pciSlotMaskFunc    = 0x7
+
+	// pciBusBaseOffset is the first bus number available for pciBridge devices
+	// in the VMware I440BX virtual chipset. Bus 0 is the root complex and bus 1
+	// is always the AGP bridge at 00:01.0. All VMware hardware versions (vmx-04
+	// through vmx-21, ESXi 2.x–8.x) use I440BX for both BIOS and EFI firmware.
+	pciBusBaseOffset = 2
+
+	// pciLegacyBridgeFunctions is the number of secondary buses consumed by a
+	// legacy PCI-to-PCI bridge (pciBridge0). Unlike PCIe root ports that reserve
+	// one bus per function, the legacy bridge provides a single shared secondary bus.
+	pciLegacyBridgeFunctions = 1
+)
+
+// computePciAddress converts a VMware persistent PCI slot number to the
+// guest-visible PCI address using the VM's pciBridge topology. Returns an
+// empty string when the bridge topology is unavailable or the slot is zero.
+func computePciAddress(slot int32, bridges []model.PciBridge) string {
+	if slot <= 0 {
+		return ""
+	}
+	dev := slot & pciSlotMaskDevice
+	bridgeIdx := (slot >> pciSlotShiftBridge) & pciSlotMaskBridge
+	bridgeFunc := (slot >> pciSlotShiftFunc) & pciSlotMaskFunc
+	// Primary bus devices don't need bridge topology.
+	if bridgeIdx == 0 {
+		return fmt.Sprintf("0000:00:%02x.0", dev)
+	}
+	if len(bridges) == 0 {
+		return ""
+	}
+	bridgeNum := int(bridgeIdx) - 1
+	bus := int32(pciBusBaseOffset)
+	for _, b := range bridges {
+		if b.Number == bridgeNum {
+			return fmt.Sprintf("0000:%02x:%02x.0", bus+bridgeFunc, dev)
+		}
+		bus += int32(b.Functions)
+	}
+	return ""
+}
 
 // Model adapter.
 // Each adapter provides provider-specific management of a model.
@@ -96,7 +152,7 @@ func (b *Base) RefList(in types.AnyType) (list []model.Ref) {
 func (b *Base) Decoded(in types.AnyType) (s string) {
 	var cast bool
 	if s, cast = in.(string); cast {
-		decoded, err := url.QueryUnescape(s)
+		decoded, err := url.PathUnescape(s)
 		if err == nil {
 			s = decoded
 		}
@@ -278,6 +334,10 @@ func (v *HostAdapter) Apply(u types.ObjectUpdate) {
 				if b, cast := p.Val.(int16); cast {
 					v.model.CpuCores = b
 				}
+			case fHostMemorySize:
+				if n, cast := p.Val.(int64); cast {
+					v.model.MemoryBytes = n
+				}
 			case fProductName:
 				if s, cast := p.Val.(string); cast {
 					v.model.ProductName = s
@@ -354,15 +414,24 @@ func (v *HostAdapter) Apply(u types.ObjectUpdate) {
 							}
 							return
 						}
+						// Extract all IPv6 addresses
+						var ipv6Addresses []string
+						if nic.Spec.Ip.IpV6Config != nil {
+							for _, ipv6 := range nic.Spec.Ip.IpV6Config.IpV6Address {
+								ipv6Addresses = append(ipv6Addresses, ipv6.IpAddress)
+							}
+						}
 						network.VNICs = append(
 							network.VNICs,
 							model.VNIC{
-								Key:        nic.Key,
-								PortGroup:  nic.Portgroup,
-								DPortGroup: dGroup(),
-								IpAddress:  nic.Spec.Ip.IpAddress,
-								SubnetMask: nic.Spec.Ip.SubnetMask,
-								MTU:        nic.Spec.Mtu,
+								Key:         nic.Key,
+								Device:      nic.Device,
+								PortGroup:   nic.Portgroup,
+								DPortGroup:  dGroup(),
+								IpAddress:   nic.Spec.Ip.IpAddress,
+								IpV6Address: ipv6Addresses,
+								SubnetMask:  nic.Spec.Ip.SubnetMask,
+								MTU:         nic.Spec.Mtu,
 							})
 					}
 					sort.Slice(
@@ -370,6 +439,25 @@ func (v *HostAdapter) Apply(u types.ObjectUpdate) {
 						func(i, j int) bool {
 							return network.VNICs[i].MTU > network.VNICs[j].MTU
 						})
+				}
+			case fVirtualNicManagerNet:
+				if array, cast := p.Val.(types.ArrayOfVirtualNicManagerNetConfig); cast {
+					v.model.ManagementIPs = nil
+					for _, nc := range array.VirtualNicManagerNetConfig {
+						if nc.NicType != string(types.HostVirtualNicManagerNicTypeManagement) {
+							continue
+						}
+						for ix := range nc.CandidateVnic {
+							for _, selectedVnicKey := range nc.SelectedVnic {
+								if nc.CandidateVnic[ix].Key != selectedVnicKey {
+									continue
+								}
+								if nc.CandidateVnic[ix].Spec.Ip.IpAddress != "" {
+									v.model.ManagementIPs = append(v.model.ManagementIPs, nc.CandidateVnic[ix].Spec.Ip.IpAddress)
+								}
+							}
+						}
+					}
 				}
 			case fScsiLun:
 				if array, cast := p.Val.(types.ArrayOfScsiLun); cast {
@@ -579,16 +667,47 @@ func (v *DatastoreAdapter) Apply(u types.ObjectUpdate) {
 					v.model.MaintenanceMode = s
 				}
 			case fVmfsExtent:
-				if s, cast := p.Val.(types.VmfsDatastoreInfo); cast {
-					backingDevList := []string{}
-					for _, val := range s.Vmfs.Extent {
-						backingDevList = append(backingDevList, val.DiskName)
-					}
-					v.model.BackingDevicesNames = backingDevList
-				}
+				applyDatastoreInfoProperty(p.Val, &v.model)
 			}
 		}
 	}
+}
+
+// applyDatastoreInfoProperty decodes the datastore "info" property, which is either
+// VMFS (LUN extent names) or NAS (NfsDatastoreInfo with HostNasVolume details).
+func applyDatastoreInfoProperty(val types.AnyType, ds *model.Datastore) {
+	if val == nil {
+		return
+	}
+	switch t := val.(type) {
+	case types.VmfsDatastoreInfo:
+		backing := []string{}
+		if t.Vmfs != nil {
+			for _, e := range t.Vmfs.Extent {
+				backing = append(backing, e.DiskName)
+			}
+		}
+		ds.BackingDevicesNames = backing
+	case *types.VmfsDatastoreInfo:
+		if t != nil {
+			applyDatastoreInfoProperty(*t, ds)
+		}
+	case types.NasDatastoreInfo:
+		applyNasDatastoreNfsInfo(t, ds)
+	case *types.NasDatastoreInfo:
+		if t != nil {
+			applyNasDatastoreNfsInfo(*t, ds)
+		}
+	}
+}
+
+func applyNasDatastoreNfsInfo(info types.NasDatastoreInfo, ds *model.Datastore) {
+	if info.Nas == nil {
+		return
+	}
+	ds.NasRemoteHost = info.Nas.RemoteHost
+	ds.NasRemotePath = info.Nas.RemotePath
+	ds.NasRemoteHostNames = append([]string(nil), info.Nas.RemoteHostNames...)
 }
 
 // VM model adapter.
@@ -647,6 +766,10 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 			case fUUID:
 				if s, cast := p.Val.(string); cast {
 					v.model.UUID = s
+				}
+			case fInstanceUUID:
+				if s, cast := p.Val.(string); cast {
+					v.model.InstanceUUID = s
 				}
 			case fFirmware:
 				if s, cast := p.Val.(string); cast {
@@ -727,6 +850,12 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 				if s, cast := p.Val.(string); cast {
 					v.model.HostName = s
 				}
+			case fToolsStatus:
+				v.model.ToolsStatus = fmt.Sprint(p.Val)
+			case fToolsRunningStatus:
+				v.model.ToolsRunningStatus = fmt.Sprint(p.Val)
+			case fToolsVersionStatus:
+				v.model.ToolsVersionStatus = fmt.Sprint(p.Val)
 			case fTpmPresent:
 				if b, cast := p.Val.(bool); cast {
 					v.model.TpmEnabled = b
@@ -759,14 +888,21 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 				v.model.Networks = v.RefList(p.Val)
 			case fExtraConfig:
 				if options, cast := p.Val.(types.ArrayOfOptionValue); cast {
+					pciBridgeSlots := map[int]int32{}
+					pciBridgeFuncs := map[int]int{}
 					for _, val := range options.OptionValue {
 						opt := val.GetOptionValue()
+
+						if strings.HasPrefix(opt.Key, "pciBridge") {
+							parsePciBridgeOption(opt.Key, opt.Value, pciBridgeSlots, pciBridgeFuncs)
+							continue
+						}
 
 						if opt.Key == "numa.nodeAffinity" {
 							if s, cast := opt.Value.(string); cast {
 								v.model.NumaNodeAffinity = strings.Split(s, ",")
 							}
-						} else if opt.Key == "ctkEnabled" {
+						} else if strings.EqualFold(opt.Key, CtkEnabledKey) {
 							if s, cast := opt.Value.(string); cast {
 								boolVal, err := strconv.ParseBool(s)
 								if err != nil {
@@ -782,19 +918,23 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 								}
 								v.model.DiskEnableUuid = boolVal
 							}
-						} else if hasDiskPrefix(opt.Key) && strings.HasSuffix(opt.Key, ".ctkEnabled") {
-
+						} else if hasDiskPrefix(opt.Key) && strings.HasSuffix(strings.ToLower(opt.Key), "."+strings.ToLower(CtkEnabledKey)) {
 							if s, cast := opt.Value.(string); cast {
 								boolVal, err := strconv.ParseBool(s)
 								if err != nil {
 									return
 								}
 								if boolVal {
-									ctkPerDisk[strings.Split(opt.Key, ".")[0]] = true
+									// Normalize to lowercase so lookup in isCBTEnabledForDisks matches (disk.Bus is lowercase)
+									deviceKey := strings.ToLower(strings.Split(opt.Key, ".")[0])
+									ctkPerDisk[deviceKey] = true
 								}
 							}
 						}
 					}
+
+					v.model.PciBridges = buildPciBridges(pciBridgeSlots, pciBridgeFuncs)
+					refreshNICPciAddresses(&v.model)
 
 					//In case of ExtraConfig update, on initial state model.Disks is not ready yet
 					if len(v.model.Disks) > 0 {
@@ -807,23 +947,33 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 				}
 			case fGuestDisk:
 				if disks, cast := p.Val.(types.ArrayOfGuestDiskInfo); cast {
-					v.model.GuestDisks = make([]model.GuestDisk, len(disks.GuestDiskInfo))
-					for i, info := range disks.GuestDiskInfo {
-						v.model.GuestDisks[i] = model.GuestDisk{
+					var diskMountPoints []model.DiskMountPoint
+					for _, info := range disks.GuestDiskInfo {
+						// Default to 0 so the policy can flag missing mappings
+						guestDiskKey := int32(0)
+						if len(info.Mappings) > 0 {
+							// VMware guarantees at least one mapping when non-empty
+							guestDiskKey = info.Mappings[0].Key
+						}
+						diskMountPoint := model.DiskMountPoint{
 							DiskPath:       info.DiskPath,
 							Capacity:       info.Capacity,
 							FreeSpace:      info.FreeSpace,
 							FilesystemType: info.FilesystemType,
+							Key:            guestDiskKey,
 						}
-					}
 
-					// Update matching disk items with Windows drive letters based on index
-					for i, guestDisk := range v.model.GuestDisks {
-						if i < len(v.model.Disks) {
-							winDriveLetter := v.extractWinDriveLetter(guestDisk.DiskPath)
-							v.model.Disks[i].WinDriveLetter = winDriveLetter
+						// Check for m.model.Disks with the same key (disk keys are expected to be unique)
+						for i, disk := range v.model.Disks {
+							if disk.Key == diskMountPoint.Key {
+								// Update the Disk's WinDriveLetter using the new DiskMountPoint's DiskPath
+								v.model.Disks[i].WinDriveLetter = extractWindowsDriveLetter(diskMountPoint.DiskPath)
+								break
+							}
 						}
+						diskMountPoints = append(diskMountPoints, diskMountPoint)
 					}
+					v.model.GuestDisks = diskMountPoints
 				}
 			case fGuestNet:
 				if nics, cast := p.Val.(types.ArrayOfGuestNicInfo); cast {
@@ -838,12 +988,14 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 								dnsList = info.DnsConfig.IpAddress
 							}
 							guestNetworksList = append(guestNetworksList, model.GuestNetwork{
-								MAC:          strings.ToLower(info.MacAddress),
-								IP:           ip.IpAddress,
-								Origin:       ip.Origin,
-								PrefixLength: ip.PrefixLength,
-								DNS:          dnsList,
-								Device:       strconv.Itoa(index),
+								MAC:            strings.ToLower(info.MacAddress),
+								IP:             ip.IpAddress,
+								Origin:         ip.Origin,
+								PrefixLength:   ip.PrefixLength,
+								DNS:            dnsList,
+								Device:         strconv.Itoa(index),
+								DeviceConfigId: info.DeviceConfigId,
+								Network:        info.Network,
 							})
 						}
 					}
@@ -884,67 +1036,8 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 				}
 			case fDevices:
 				if devArray, cast := p.Val.(types.ArrayOfVirtualDevice); cast {
-					devList := []model.Device{}
-					nicList := []model.NIC{}
-					nicsIndex := 0
-					for _, dev := range devArray.VirtualDevice {
-						var nic *types.VirtualEthernetCard
-						switch device := dev.(type) {
-						case *types.VirtualSriovEthernetCard,
-							*types.VirtualPCIPassthrough,
-							*types.VirtualSCSIPassthrough,
-							*types.VirtualUSBController:
-							devList = append(
-								devList,
-								model.Device{
-									Kind: libref.ToKind(dev),
-								})
-						case *types.VirtualE1000:
-							nic = &device.VirtualEthernetCard
-						case *types.VirtualE1000e:
-							nic = &device.VirtualEthernetCard
-						case *types.VirtualVmxnet:
-							nic = &device.VirtualEthernetCard
-						case *types.VirtualVmxnet2:
-							nic = &device.VirtualEthernetCard
-						case *types.VirtualVmxnet3:
-							nic = &device.VirtualEthernetCard
-						}
-
-						if nic != nil && nic.Backing != nil {
-							var network string
-							switch backing := dev.GetVirtualDevice().Backing.(type) {
-							case *types.VirtualEthernetCardNetworkBackingInfo:
-								if backing.Network != nil {
-									network = backing.Network.Value
-								}
-							case *types.VirtualEthernetCardDistributedVirtualPortBackingInfo:
-								network = backing.Port.PortgroupKey
-							case *types.VirtualEthernetCardOpaqueNetworkBackingInfo:
-								network = backing.OpaqueNetworkId
-							}
-
-							devList = append(
-								devList,
-								model.Device{
-									Kind: libref.ToKind(dev),
-								})
-
-							nicList = append(
-								nicList,
-								model.NIC{
-									MAC:   strings.ToLower(nic.MacAddress),
-									Index: nicsIndex,
-									Network: model.Ref{
-										Kind: model.NetKind,
-										ID:   network,
-									},
-								})
-							nicsIndex++
-						}
-					}
-					v.model.Devices = devList
-					v.model.NICs = nicList
+					v.model.Devices = v.collectDevices(devArray)
+					v.model.NICs = v.collectNICs(devArray)
 					v.updateControllers(&devArray)
 					v.updateDisks(&devArray)
 
@@ -955,28 +1048,68 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 						SortNICsByGuestNetworkOrder(&v.model)
 					}
 				}
+			case fCustomValue:
+				customValues := []model.CustomFieldValue{}
+				switch cv := p.Val.(type) {
+				case []types.BaseCustomFieldValue:
+					for _, field := range cv {
+						if strVal, ok := field.(*types.CustomFieldStringValue); ok {
+							customValues = append(customValues, model.CustomFieldValue{
+								Key:   strVal.Key,
+								Value: strVal.Value,
+							})
+						}
+					}
+				case types.ArrayOfCustomFieldValue:
+					for _, field := range cv.CustomFieldValue {
+						if strVal, ok := field.(*types.CustomFieldStringValue); ok {
+							customValues = append(customValues, model.CustomFieldValue{
+								Key:   strVal.Key,
+								Value: strVal.Value,
+							})
+						}
+					}
+				}
+				v.model.CustomValues = customValues
+			case fConsolidationNeeded:
+				if b, cast := p.Val.(bool); cast {
+					v.model.ConsolidationNeeded = b
+				}
 			}
 		}
 	}
 }
 
 func hasDiskPrefix(key string) bool {
-	return strings.HasPrefix(key, SCSI) ||
-		strings.HasPrefix(key, SATA) ||
-		strings.HasPrefix(key, IDE) ||
-		strings.HasPrefix(key, NVME)
+	keyLower := strings.ToLower(key)
+	return strings.HasPrefix(keyLower, SCSI) ||
+		strings.HasPrefix(keyLower, SATA) ||
+		strings.HasPrefix(keyLower, IDE) ||
+		strings.HasPrefix(keyLower, NVME)
+}
+
+// diskBusAddress returns the vSphere bus address for a disk (e.g. scsi0:0)
+// using the controller's BusNumber, which can differ from the device Key.
+func diskBusAddress(bus string, busNumber, unitNumber int32) string {
+	if bus == "" {
+		return ""
+	}
+	return strings.ToLower(fmt.Sprintf("%s%d:%d", bus, busNumber, unitNumber))
+}
+
+func withBusAddress(md model.Disk, busNumber int32) model.Disk {
+	md.BusNumber = busNumber
+	md.BusAddress = diskBusAddress(md.Bus, busNumber, md.UnitNumber)
+	return md
 }
 
 func isCBTEnabledForDisks(ctkPerDisk map[string]bool, disks []model.Disk) {
 	for i := range disks {
 		disk := &disks[i]
-
-		// In vSphere, ControllerKey values are typically large integers that encode the controller bus number.
-		// To extract the actual controller index (e.g., scsi0, scsi1), we round down to the nearest 100 to get the base,
-		// then subtract it from the ControllerKey. For example, 16001 → controllerIndex 1 (16001 - 16000).
-		baseKey := (disk.ControllerKey / 100) * 100
-		controllerIndex := disk.ControllerKey - baseKey
-		deviceKey := fmt.Sprintf("%s%d:%d", disk.Bus, controllerIndex, disk.UnitNumber)
+		deviceKey := disk.BusAddress
+		if deviceKey == "" {
+			deviceKey = diskBusAddress(disk.Bus, disk.BusNumber, disk.UnitNumber)
+		}
 
 		if ctkPerDisk[deviceKey] {
 			disk.ChangeTrackingEnabled = true
@@ -984,6 +1117,179 @@ func isCBTEnabledForDisks(ctkPerDisk map[string]bool, disks []model.Disk) {
 			disk.ChangeTrackingEnabled = false
 		}
 	}
+}
+
+// extractWindowsDriveLetter extracts the drive letter from a Windows disk path.
+// Returns the lowercase drive letter if the path is a Windows path (e.g., "C:\\"),
+// otherwise returns an empty string.
+func extractWindowsDriveLetter(diskPath string) string {
+	// Check if this looks like a Windows drive letter (e.g., "C:\\")
+	if len(diskPath) == 3 && diskPath[1] == ':' && (diskPath[2] == '\\' || diskPath[2] == '/') {
+		// Extract the drive letter and convert to lowercase
+		return strings.ToLower(string(diskPath[0]))
+	}
+	return ""
+}
+
+// parsePciBridgeOption extracts pciBridge slot numbers and function counts
+// from config.extraConfig entries like "pciBridge4.pciSlotNumber" and
+// "pciBridge4.functions".
+func parsePciBridgeOption(key string, value interface{}, slots map[int]int32, funcs map[int]int) {
+	rest := strings.TrimPrefix(key, "pciBridge")
+	dot := strings.IndexByte(rest, '.')
+	if dot < 1 {
+		return
+	}
+	bridgeNum, err := strconv.Atoi(rest[:dot])
+	if err != nil {
+		return
+	}
+	prop := rest[dot+1:]
+	s, ok := value.(string)
+	if !ok {
+		return
+	}
+	switch prop {
+	case "pciSlotNumber":
+		if n, err := strconv.ParseInt(s, 10, 32); err == nil {
+			slots[bridgeNum] = int32(n)
+		}
+	case "functions":
+		if n, err := strconv.Atoi(s); err == nil {
+			funcs[bridgeNum] = n
+		}
+	}
+}
+
+// buildPciBridges assembles PciBridge structs from the parsed extraConfig maps.
+func buildPciBridges(slots map[int]int32, funcs map[int]int) []model.PciBridge {
+	if len(slots) == 0 {
+		return nil
+	}
+	bridges := make([]model.PciBridge, 0, len(slots))
+	for num, slot := range slots {
+		f := funcs[num]
+		if f == 0 {
+			f = pciLegacyBridgeFunctions
+		}
+		bridges = append(bridges, model.PciBridge{
+			Number:     num,
+			SlotNumber: slot,
+			Functions:  f,
+		})
+	}
+	sort.Slice(bridges, func(i, j int) bool {
+		devI := bridges[i].SlotNumber & pciSlotMaskDevice
+		devJ := bridges[j].SlotNumber & pciSlotMaskDevice
+		return devI < devJ
+	})
+	return bridges
+}
+
+// refreshNICPciAddresses recomputes PciAddress on every NIC using the current
+// Devices and PciBridges. Call after PciBridges changes to keep NICs in sync.
+func refreshNICPciAddresses(m *model.VM) {
+	slotByKey := make(map[int32]int32, len(m.Devices))
+	for _, d := range m.Devices {
+		slotByKey[d.Key] = d.PciSlotNumber
+	}
+	for i := range m.NICs {
+		m.NICs[i].PciAddress = computePciAddress(slotByKey[m.NICs[i].DeviceKey], m.PciBridges)
+	}
+}
+
+// pciSlotNumber extracts the PCI slot number from a virtual device's SlotInfo.
+// Returns 0 if the device has no PCI slot assigned.
+func pciSlotNumber(vd *types.VirtualDevice) int32 {
+	if vd.SlotInfo == nil {
+		return 0
+	}
+	if pciInfo, ok := vd.SlotInfo.(*types.VirtualDevicePciBusSlotInfo); ok {
+		return pciInfo.PciSlotNumber
+	}
+	return 0
+}
+
+// isPassthroughOrController reports whether the device is a passthrough or
+// controller type that is always tracked in the device inventory.
+func isPassthroughOrController(dev types.BaseVirtualDevice) bool {
+	switch dev.(type) {
+	case *types.VirtualSriovEthernetCard,
+		*types.VirtualPCIPassthrough,
+		*types.VirtualSCSIPassthrough,
+		*types.VirtualUSBController:
+		return true
+	}
+	return false
+}
+
+// isConnectedNIC reports whether the device is a regular virtual ethernet card
+// with a backing (i.e. connected to a network). SR-IOV NICs are excluded
+// because they are passthrough devices that require matching physical hardware.
+func isConnectedNIC(dev types.BaseVirtualDevice) bool {
+	if _, sriov := dev.(*types.VirtualSriovEthernetCard); sriov {
+		return false
+	}
+	ethCard, ok := dev.(types.BaseVirtualEthernetCard)
+	return ok && ethCard.GetVirtualEthernetCard().Backing != nil
+}
+
+// collectDevices builds the list of tracked virtual devices (passthrough,
+// controllers, and NICs with backing) from the VirtualDevice array.
+func (v *VmAdapter) collectDevices(devArray types.ArrayOfVirtualDevice) []model.Device {
+	var devList []model.Device
+	for _, dev := range devArray.VirtualDevice {
+		// Skip device types we don't track (e.g. disks, SCSI controllers).
+		if !isPassthroughOrController(dev) && !isConnectedNIC(dev) {
+			continue
+		}
+
+		vd := dev.GetVirtualDevice()
+		devList = append(devList, model.Device{
+			Kind:          libref.ToKind(dev),
+			Key:           vd.Key,
+			PciSlotNumber: pciSlotNumber(vd),
+		})
+	}
+	return devList
+}
+
+// collectNICs builds the list of NICs with their network and PCI address info
+// from the VirtualDevice array.
+func (v *VmAdapter) collectNICs(devArray types.ArrayOfVirtualDevice) []model.NIC {
+	var nicList []model.NIC
+	for _, dev := range devArray.VirtualDevice {
+		if !isConnectedNIC(dev) {
+			continue
+		}
+
+		vd := dev.GetVirtualDevice()
+		nic := dev.(types.BaseVirtualEthernetCard).GetVirtualEthernetCard()
+
+		var network string
+		switch backing := vd.Backing.(type) {
+		case *types.VirtualEthernetCardNetworkBackingInfo:
+			if backing.Network != nil {
+				network = backing.Network.Value
+			}
+		case *types.VirtualEthernetCardDistributedVirtualPortBackingInfo:
+			network = backing.Port.PortgroupKey
+		case *types.VirtualEthernetCardOpaqueNetworkBackingInfo:
+			network = backing.OpaqueNetworkId
+		}
+
+		nicList = append(nicList, model.NIC{
+			MAC:        strings.ToLower(nic.MacAddress),
+			Index:      len(nicList),
+			DeviceKey:  nic.Key,
+			PciAddress: computePciAddress(pciSlotNumber(vd), v.model.PciBridges),
+			Network: model.Ref{
+				Kind: model.NetKind,
+				ID:   network,
+			},
+		})
+	}
+	return nicList
 }
 
 // Update virtual disk devices.
@@ -994,51 +1300,59 @@ func (v *VmAdapter) updateControllers(devArray *types.ArrayOfVirtualDevice) {
 		switch controller := dev.(type) {
 		case *types.VirtualIDEController:
 			md = model.Controller{
-				Bus:   IDE,
-				Disks: controller.Device,
-				Key:   controller.Key,
+				Bus:       IDE,
+				Disks:     controller.Device,
+				Key:       controller.Key,
+				BusNumber: controller.BusNumber,
 			}
 		case *types.VirtualBusLogicController:
 			md = model.Controller{
-				Bus:   SCSI,
-				Disks: controller.Device,
-				Key:   controller.Key,
+				Bus:       SCSI,
+				Disks:     controller.Device,
+				Key:       controller.Key,
+				BusNumber: controller.BusNumber,
 			}
 		case *types.VirtualLsiLogicController:
 			md = model.Controller{
-				Bus:   SCSI,
-				Disks: controller.Device,
-				Key:   controller.Key,
+				Bus:       SCSI,
+				Disks:     controller.Device,
+				Key:       controller.Key,
+				BusNumber: controller.BusNumber,
 			}
 		case *types.VirtualLsiLogicSASController:
 			md = model.Controller{
-				Bus:   SCSI,
-				Disks: controller.Device,
-				Key:   controller.Key,
+				Bus:       SCSI,
+				Disks:     controller.Device,
+				Key:       controller.Key,
+				BusNumber: controller.BusNumber,
 			}
 		case *types.ParaVirtualSCSIController:
 			md = model.Controller{
-				Bus:   SCSI,
-				Disks: controller.Device,
-				Key:   controller.Key,
+				Bus:       SCSI,
+				Disks:     controller.Device,
+				Key:       controller.Key,
+				BusNumber: controller.BusNumber,
 			}
 		case *types.VirtualAHCIController:
 			md = model.Controller{
-				Bus:   SATA,
-				Disks: controller.Device,
-				Key:   controller.Key,
+				Bus:       SATA,
+				Disks:     controller.Device,
+				Key:       controller.Key,
+				BusNumber: controller.BusNumber,
 			}
 		case *types.VirtualUSBController:
 			md = model.Controller{
-				Bus:   USB,
-				Disks: controller.Device,
-				Key:   controller.Key,
+				Bus:       USB,
+				Disks:     controller.Device,
+				Key:       controller.Key,
+				BusNumber: controller.BusNumber,
 			}
 		case *types.VirtualNVMEController:
 			md = model.Controller{
-				Bus:   NVME,
-				Disks: controller.Device,
-				Key:   controller.Key,
+				Bus:       NVME,
+				Disks:     controller.Device,
+				Key:       controller.Key,
+				BusNumber: controller.BusNumber,
 			}
 		}
 		controllers = append(controllers, md)
@@ -1055,6 +1369,17 @@ func (v *VmAdapter) getDiskController(key int32) *model.Controller {
 	return nil
 }
 
+// getDiskGuestInfo retrieves the guest disk information for a given device key.
+func (v *VmAdapter) getDiskGuestInfo(deviceKey int32) *model.DiskMountPoint {
+	for i := range v.model.GuestDisks {
+		if v.model.GuestDisks[i].Key == deviceKey {
+			return &v.model.GuestDisks[i]
+		}
+	}
+
+	return nil
+}
+
 // Update virtual disk devices.
 func (v *VmAdapter) updateDisks(devArray *types.ArrayOfVirtualDevice) {
 	disks := []model.Disk{}
@@ -1063,17 +1388,33 @@ func (v *VmAdapter) updateDisks(devArray *types.ArrayOfVirtualDevice) {
 		case *types.VirtualDisk:
 			disk := dev.(*types.VirtualDisk)
 			controller := v.getDiskController(disk.ControllerKey)
+			guestDiskInfo := v.getDiskGuestInfo(disk.Key)
+
+			// If controller is not nil, get the disk bus from the controller
+			bus := ""
+			busNumber := int32(0)
+			if controller != nil {
+				bus = controller.Bus
+				busNumber = controller.BusNumber
+			}
+
+			// Try to extract the Windows drive letter from the guest disk info
+			winDriveLetter := ""
+			if guestDiskInfo != nil {
+				winDriveLetter = extractWindowsDriveLetter(guestDiskInfo.DiskPath)
+			}
 
 			switch backing := disk.Backing.(type) {
 			case *types.VirtualDiskFlatVer1BackingInfo:
 				md := model.Disk{
-					Key:           disk.Key,
-					UnitNumber:    *disk.UnitNumber,
-					ControllerKey: disk.ControllerKey,
-					File:          backing.FileName,
-					Capacity:      disk.CapacityInBytes,
-					Mode:          backing.DiskMode,
-					Bus:           controller.Bus,
+					Key:            disk.Key,
+					UnitNumber:     *disk.UnitNumber,
+					ControllerKey:  disk.ControllerKey,
+					File:           backing.FileName,
+					Capacity:       disk.CapacityInBytes,
+					Mode:           backing.DiskMode,
+					Bus:            bus,
+					WinDriveLetter: winDriveLetter,
 				}
 				if backing.Datastore != nil {
 					datastoreId, _ := sanitize(backing.Datastore.Value)
@@ -1082,18 +1423,26 @@ func (v *VmAdapter) updateDisks(devArray *types.ArrayOfVirtualDevice) {
 						ID:   datastoreId,
 					}
 				}
-				disks = append(disks, md)
+				if backing.Parent != nil {
+					md.ParentFile = backing.Parent.FileName
+				}
+				disks = append(disks, withBusAddress(md, busNumber))
 			case *types.VirtualDiskFlatVer2BackingInfo:
 				md := model.Disk{
-					Key:           disk.Key,
-					UnitNumber:    *disk.UnitNumber,
-					ControllerKey: disk.ControllerKey,
-					File:          backing.FileName,
-					Capacity:      disk.CapacityInBytes,
-					Shared:        backing.Sharing != "sharingNone" && backing.Sharing != "",
-					Mode:          backing.DiskMode,
-					Bus:           controller.Bus,
-					Serial:        backing.Uuid,
+					Key:            disk.Key,
+					UnitNumber:     *disk.UnitNumber,
+					ControllerKey:  disk.ControllerKey,
+					File:           backing.FileName,
+					Capacity:       disk.CapacityInBytes,
+					Shared:         backing.Sharing != "sharingNone" && backing.Sharing != "",
+					Mode:           backing.DiskMode,
+					Bus:            bus,
+					Serial:         backing.Uuid,
+					WinDriveLetter: winDriveLetter,
+					VVolID:         backing.BackingObjectId,
+				}
+				if backing.Parent != nil {
+					md.ParentFile = backing.Parent.FileName
 				}
 				if backing.Datastore != nil {
 					datastoreId, _ := sanitize(backing.Datastore.Value)
@@ -1102,19 +1451,23 @@ func (v *VmAdapter) updateDisks(devArray *types.ArrayOfVirtualDevice) {
 						ID:   datastoreId,
 					}
 				}
-				disks = append(disks, md)
+				disks = append(disks, withBusAddress(md, busNumber))
 			case *types.VirtualDiskRawDiskMappingVer1BackingInfo:
 				md := model.Disk{
-					Key:           disk.Key,
-					UnitNumber:    *disk.UnitNumber,
-					ControllerKey: disk.ControllerKey,
-					File:          backing.FileName,
-					Capacity:      disk.CapacityInBytes,
-					Shared:        backing.Sharing != "sharingNone" && backing.Sharing != "",
-					Mode:          backing.DiskMode,
-					RDM:           true,
-					Bus:           controller.Bus,
-					Serial:        backing.Uuid,
+					Key:            disk.Key,
+					UnitNumber:     *disk.UnitNumber,
+					ControllerKey:  disk.ControllerKey,
+					File:           backing.FileName,
+					Capacity:       disk.CapacityInBytes,
+					Shared:         backing.Sharing != "sharingNone" && backing.Sharing != "",
+					Mode:           backing.DiskMode,
+					RDM:            true,
+					PhysicalMode:   backing.CompatibilityMode == string(types.VirtualDiskCompatibilityModePhysicalMode),
+					Bus:            bus,
+					Serial:         backing.Uuid,
+					WinDriveLetter: winDriveLetter,
+					DeviceName:     backing.DeviceName,
+					LunUuid:        backing.LunUuid,
 				}
 				if backing.Datastore != nil {
 					datastoreId, _ := sanitize(backing.Datastore.Value)
@@ -1123,7 +1476,7 @@ func (v *VmAdapter) updateDisks(devArray *types.ArrayOfVirtualDevice) {
 						ID:   datastoreId,
 					}
 				}
-				disks = append(disks, md)
+				disks = append(disks, withBusAddress(md, busNumber))
 			case *types.VirtualDiskRawDiskVer2BackingInfo:
 				md := model.Disk{
 					Key:           disk.Key,
@@ -1133,31 +1486,18 @@ func (v *VmAdapter) updateDisks(devArray *types.ArrayOfVirtualDevice) {
 					Capacity:      disk.CapacityInBytes,
 					Shared:        backing.Sharing != "sharingNone" && backing.Sharing != "",
 					RDM:           true,
-					Bus:           controller.Bus,
+					// VirtualDiskRawDiskVer2BackingInfo represents direct pass-through
+					// to a physical device without SCSI virtualization, so it is
+					// always treated as physical mode.
+					PhysicalMode:   true,
+					Bus:            bus,
+					WinDriveLetter: winDriveLetter,
+					DeviceName:     backing.DeviceName,
 				}
-				disks = append(disks, md)
+				disks = append(disks, withBusAddress(md, busNumber))
 			}
 		}
 	}
 
-	// Update Windows drive letters for all disks based on guest disk information
-	for i := range disks {
-		if i < len(v.model.GuestDisks) {
-			winDriveLetter := v.extractWinDriveLetter(v.model.GuestDisks[i].DiskPath)
-			disks[i].WinDriveLetter = winDriveLetter
-		}
-	}
-
 	v.model.Disks = disks
-}
-
-// extractWinDriveLetter extracts the Windows drive letter from a disk path.
-// For example: "C:\\" returns "c", "/home" returns ""
-func (v *VmAdapter) extractWinDriveLetter(diskPath string) string {
-	// Check if this looks like a Windows drive letter (e.g., "C:\\")
-	if len(diskPath) >= 3 && diskPath[1] == ':' && diskPath[2] == '\\' {
-		// Extract the drive letter and convert to lowercase
-		return strings.ToLower(string(diskPath[0]))
-	}
-	return ""
 }

@@ -1,4 +1,24 @@
 version: "2"
 
-run:
-  timeout: 10m
+linters:
+  enable:
+    - ginkgolinter
+    - nilerr
+    - nilnil
+    - bodyclose
+  settings:
+    ginkgolinter:
+      forbid-focus-container: true
+  exclusions:
+    paths:
+      - vendor
+      - pkg/lib/gob
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    paths:
+      - vendor
+      - pkg/lib/gob

@@ -2,6 +2,7 @@ package openstack
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -14,11 +15,10 @@ import (
 	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
 	utils "github.com/kubev2v/forklift/pkg/controller/plan/util"
-	"github.com/kubev2v/forklift/pkg/controller/provider/web/base"
-	"github.com/kubev2v/forklift/pkg/controller/provider/web/ocp"
 	model "github.com/kubev2v/forklift/pkg/controller/provider/web/openstack"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	libitr "github.com/kubev2v/forklift/pkg/lib/itinerary"
+	"github.com/kubev2v/forklift/pkg/settings"
 	core "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -34,8 +34,6 @@ import (
 // Openstack builder.
 type Builder struct {
 	*plancontext.Context
-	// MAC addresses already in use on the destination cluster. k=mac, v=vmName
-	macConflictsMap map[string]string
 }
 
 // Template labels
@@ -259,23 +257,12 @@ func (r *Builder) VirtualMachine(vmRef ref.Ref, vmSpec *cnv.VirtualMachineSpec, 
 		return
 	}
 
-	var conflicts []string
-	conflicts, err = r.macConflicts(vm)
-	if err != nil {
-		return
-	}
-	if len(conflicts) > 0 {
-		err = liberr.New(
-			fmt.Sprintf("Source VM has a mac address conflict with one or more destination VMs: %s", conflicts))
-		return
-	}
-
 	if vmSpec.Template == nil {
 		vmSpec.Template = &cnv.VirtualMachineInstanceTemplateSpec{}
 	}
 
 	r.mapFirmware(vm, vmSpec)
-	r.mapResources(vm, vmSpec, usesInstanceType)
+	r.mapResources(vmRef, vm, vmSpec, usesInstanceType)
 	r.mapHardwareRng(vm, vmSpec)
 	r.mapInput(vm, vmSpec)
 	r.mapVideo(vm, vmSpec)
@@ -284,50 +271,6 @@ func (r *Builder) VirtualMachine(vmRef ref.Ref, vmSpec *cnv.VirtualMachineSpec, 
 	if err != nil {
 		err = liberr.Wrap(err, "vm", vmRef.String())
 		return
-	}
-
-	return
-}
-
-// Get list of destination VMs with mac addresses that would
-// conflict with this VM, if any exist.
-func (r *Builder) macConflicts(vm *model.Workload) (conflictingVMs []string, err error) {
-	if r.macConflictsMap == nil {
-		list := []ocp.VM{}
-		err = r.Destination.Inventory.List(&list, base.Param{
-			Key:   base.DetailParam,
-			Value: "all",
-		})
-		if err != nil {
-			return
-		}
-
-		r.macConflictsMap = make(map[string]string)
-		for _, kVM := range list {
-			for _, iface := range kVM.Object.Spec.Template.Spec.Domain.Devices.Interfaces {
-				r.macConflictsMap[iface.MacAddress] = path.Join(kVM.Namespace, kVM.Name)
-			}
-		}
-	}
-
-	for _, vmAddresses := range vm.Addresses {
-		if nics, ok := vmAddresses.([]interface{}); ok {
-			for _, nic := range nics {
-				if m, ok := nic.(map[string]interface{}); ok {
-					if macAddress, ok := m["OS-EXT-IPS-MAC:mac_addr"]; ok {
-						if conflictingVm, found := r.macConflictsMap[macAddress.(string)]; found {
-							for i := range conflictingVMs {
-								// ignore duplicates
-								if conflictingVMs[i] == conflictingVm {
-									continue
-								}
-							}
-							conflictingVMs = append(conflictingVMs, conflictingVm)
-						}
-					}
-				}
-			}
-		}
 	}
 
 	return
@@ -398,7 +341,7 @@ func (r *Builder) mapInput(vm *model.Workload, object *cnv.VirtualMachineSpec) {
 	}
 }
 
-func (r *Builder) mapResources(vm *model.Workload, object *cnv.VirtualMachineSpec, usesInstanceType bool) {
+func (r *Builder) mapResources(vmRef ref.Ref, vm *model.Workload, object *cnv.VirtualMachineSpec, usesInstanceType bool) {
 	if usesInstanceType {
 		return
 	}
@@ -427,6 +370,17 @@ func (r *Builder) mapResources(vm *model.Workload, object *cnv.VirtualMachineSpe
 	object.Template.Spec.Domain.CPU.Sockets = r.getCpuCount(vm, CpuSockets)
 	object.Template.Spec.Domain.CPU.Cores = r.getCpuCount(vm, CpuCores)
 	object.Template.Spec.Domain.CPU.Threads = r.getCpuCount(vm, CpuThreads)
+
+	if enableNestedVirt := r.NestedVirtualizationSetting(vmRef, false); enableNestedVirt != nil {
+		policy := "optional"
+		if !*enableNestedVirt {
+			policy = "disable"
+		}
+		object.Template.Spec.Domain.CPU.Features = append(object.Template.Spec.Domain.CPU.Features,
+			cnv.CPUFeature{Name: "vmx", Policy: policy},
+			cnv.CPUFeature{Name: "svm", Policy: policy},
+		)
+	}
 
 	// TODO Support HugePages
 	memory := resource.NewQuantity(int64(vm.Flavor.RAM)*1024*1024, resource.BinarySI)
@@ -499,7 +453,7 @@ func (r *Builder) mapDisks(vm *model.Workload, persistentVolumeClaims []*core.Pe
 
 	var bootOrderSet bool
 	var imagePVC *core.PersistentVolumeClaim
-	for _, pvc := range persistentVolumeClaims {
+	for diskIdx, pvc := range persistentVolumeClaims {
 		// Handle loopvar https://go.dev/wiki/LoopvarExperiment
 		pvc := pvc
 
@@ -566,6 +520,7 @@ func (r *Builder) mapDisks(vm *model.Workload, persistentVolumeClaims []*core.Pe
 						Bus: cnv.DiskBus(bus),
 					},
 				},
+				Serial: planbase.DiskSerial(pvc.Annotations[planbase.AnnDiskSource], vm.ID, diskIdx),
 			}
 		default:
 			r.Log.Info("image disk format not supported", "format", image.DiskFormat)
@@ -593,11 +548,15 @@ func (r *Builder) mapDisks(vm *model.Workload, persistentVolumeClaims []*core.Pe
 func (r *Builder) mapNetworks(vm *model.Workload, object *cnv.VirtualMachineSpec) (err error) {
 	var kNetworks []cnv.Network
 	var kInterfaces []cnv.Interface
+	staticIpInterfaces := make(map[string][]string)
 
+	hasUDN := r.Plan.DestinationHasUdnNetwork(r.Destination)
 	numNetworks := 0
 	for vmNetworkName, vmAddresses := range vm.Addresses {
 		if nics, ok := vmAddresses.([]interface{}); ok {
-			for _, nic := range nics {
+			// Use only first NIC in order to avoid duplicates in case of multiple NICs per interface
+			if len(nics) > 0 {
+				nic := nics[0]
 				// Look for the network map for the source network
 				var vmNetworkID string
 				for _, vmNetwork := range vm.Networks {
@@ -653,7 +612,9 @@ func (r *Builder) mapNetworks(vm *model.Workload, object *cnv.VirtualMachineSpec
 				kInterface.Model = interfaceModel
 				if m := nic.(map[string]interface{}); ok {
 					if macAddress, ok := m["OS-EXT-IPS-MAC:mac_addr"]; ok {
-						kInterface.MacAddress = macAddress.(string)
+						if !hasUDN || settings.Settings.UdnSupportsMac {
+							kInterface.MacAddress = macAddress.(string)
+						}
 					}
 					if ipType, ok := m["OS-EXT-IPS:type"]; ok {
 						if ipType.(string) == "floating" {
@@ -665,7 +626,18 @@ func (r *Builder) mapNetworks(vm *model.Workload, object *cnv.VirtualMachineSpec
 				switch networkPair.Destination.Type {
 				case Pod:
 					kNetwork.Pod = &cnv.PodNetwork{}
-					kInterface.Masquerade = &cnv.InterfaceMasquerade{}
+					if hasUDN {
+						kInterface.Binding = &cnv.PluginBinding{
+							Name: planbase.UdnL2bridge,
+						}
+						if r.Plan.Spec.PreserveStaticIPs {
+							if ip := getFixedIPv4ForNetwork(vm, vmNetworkName); ip != "" {
+								staticIpInterfaces[networkName] = append(staticIpInterfaces[networkName], ip)
+							}
+						}
+					} else {
+						kInterface.Masquerade = &cnv.InterfaceMasquerade{}
+					}
 				case Multus:
 					kNetwork.Multus = &cnv.MultusNetwork{
 						NetworkName: path.Join(
@@ -683,6 +655,18 @@ func (r *Builder) mapNetworks(vm *model.Workload, object *cnv.VirtualMachineSpec
 
 	object.Template.Spec.Networks = kNetworks
 	object.Template.Spec.Domain.Devices.Interfaces = kInterfaces
+
+	if settings.Settings.StaticUdnIpAddresses && hasUDN && r.Plan.Spec.PreserveStaticIPs && len(staticIpInterfaces) > 0 {
+		var staticIpInterfacesAnnotation []byte
+		staticIpInterfacesAnnotation, err = json.Marshal(staticIpInterfaces)
+		if err != nil {
+			return err
+		}
+		if object.Template.ObjectMeta.Annotations == nil {
+			object.Template.ObjectMeta.Annotations = make(map[string]string)
+		}
+		object.Template.ObjectMeta.Annotations[planbase.AnnStaticUdnIp] = string(staticIpInterfacesAnnotation)
+	}
 
 	var vifMultiQueueEnabled *bool
 	if imageVifMultiQueueEnabled, ok := vm.Image.Properties[VifMultiQueueEnabled]; ok {
@@ -757,6 +741,14 @@ func (r *Builder) ConfigMap(_ ref.Ref, in *core.Secret, object *core.ConfigMap) 
 }
 
 func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, configMap *core.ConfigMap, dvTemplate *cdi.DataVolume, vddkConfigMap *core.ConfigMap) (dvs []cdi.DataVolume, err error) {
+	return nil, nil
+}
+
+func (r *Builder) ConfigMaps(vmRef ref.Ref) (list []core.ConfigMap, err error) {
+	return nil, nil
+}
+
+func (r *Builder) Secrets(vmRef ref.Ref) (list []core.Secret, err error) {
 	return nil, nil
 }
 
@@ -1093,6 +1085,7 @@ func (r *Builder) createVolumePopulatorCR(image model.Image, secretName, vmId st
 			Labels: map[string]string{
 				"vmID":      vmId,
 				"migration": getMigrationID(r.Context),
+				"plan":      string(r.Plan.GetUID()),
 				"imageID":   image.ID,
 			},
 		},
@@ -1265,6 +1258,7 @@ func (r *Builder) persistentVolumeClaimWithSourceRef(image model.Image,
 			Annotations:  annotations,
 			Labels: map[string]string{
 				"migration": getMigrationID(r.Context),
+				"plan":      string(r.Plan.GetUID()),
 				"imageID":   image.ID,
 				"vmID":      vmID,
 			},
@@ -1325,6 +1319,10 @@ func (r *Builder) getImageFromPVC(pvc *core.PersistentVolumeClaim) (image *model
 		return
 	}
 	return
+}
+
+func (r *Builder) PopulatorOffloadInfo(_ *core.PersistentVolumeClaim) (map[string]string, error) {
+	return map[string]string{}, nil
 }
 
 func (r *Builder) SetPopulatorDataSourceLabels(vmRef ref.Ref, pvcs []*core.PersistentVolumeClaim) (err error) {
@@ -1388,6 +1386,7 @@ func (r *Builder) setPopulatorLabels(populatorCr api.OpenstackVolumePopulator, v
 	}
 	populatorCr.Labels["vmID"] = vmId
 	populatorCr.Labels["migration"] = migrationId
+	populatorCr.Labels["plan"] = string(r.Plan.GetUID())
 	patch := client.MergeFrom(populatorCrCopy)
 	err = r.Destination.Client.Patch(context.TODO(), &populatorCr, patch)
 	return
@@ -1400,5 +1399,23 @@ func (r *Builder) GetPopulatorTaskName(pvc *core.PersistentVolumeClaim) (taskNam
 		return
 	}
 	taskName = image.Name
+	return
+}
+
+// ConversionPodConfig returns provider-specific configuration for the virt-v2v conversion pod.
+// OpenStack provider does not require any special configuration.
+func (r *Builder) ConversionPodConfig(_ ref.Ref) (*planbase.ConversionPodConfigResult, error) {
+	return &planbase.ConversionPodConfigResult{}, nil
+}
+
+func (r *Builder) NetAppShiftPVCs(vmRef ref.Ref, labels map[string]string) ([]core.PersistentVolumeClaim, error) {
+	return nil, nil
+}
+
+func (r *Builder) CsiImportPVCs(_ ref.Ref, _ map[string]string) ([]core.PersistentVolumeClaim, error) {
+	return nil, nil
+}
+
+func (r *Builder) SourceVMLabelsAndAnnotations(vmRef ref.Ref, tagMapping *api.TagMapping) (labels map[string]string, annotations map[string]string, sanitizationReport map[string]string, err error) {
 	return
 }

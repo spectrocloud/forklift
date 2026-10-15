@@ -1,16 +1,20 @@
 package plan
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"path"
 	"strings"
+	"time"
 
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	planapi "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
+	"github.com/kubev2v/forklift/pkg/lib/aap"
 	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
+	"github.com/kubev2v/forklift/pkg/settings"
 	"gopkg.in/yaml.v2"
 	batch "k8s.io/api/batch/v1"
 	core "k8s.io/api/core/v1"
@@ -26,7 +30,17 @@ import (
 const (
 	// VM step label
 	kStep = "step"
+	// Hook ID label
+	kHook = "hook"
 )
+
+// Resource label
+const (
+	ResourceHookConfig = "hook-config"
+)
+
+// defaultAAPJobPollSeconds is used when spec.aap.timeout and spec.deadline are 0 and ForkliftController aap_timeout is unset.
+const defaultAAPJobPollSeconds int64 = 3600
 
 // Hook runner.
 type HookRunner struct {
@@ -57,6 +71,14 @@ func (r *HookRunner) Run(vm *planapi.VMStatus) (err error) {
 		step.MarkedCompleted()
 		return
 	}
+
+	// Check if this is an AAP job template hook
+	if r.hook.Spec.AAP != nil {
+		err = r.runAAPJob(step)
+		return
+	}
+
+	// Standard local playbook execution
 	job, err := r.ensureJob()
 	if err != nil {
 		return
@@ -216,8 +238,8 @@ func (r *HookRunner) template(mp *core.ConfigMap) (template *core.PodTemplateSpe
 	if deadline > 0 {
 		template.Spec.ActiveDeadlineSeconds = &deadline
 	}
-	sa := r.hook.Spec.ServiceAccount
-	if len(sa) > 0 {
+	// Hook SA > plan SA > global controller SA > namespace default (empty).
+	if sa := cmp.Or(r.hook.Spec.ServiceAccount, r.Context.Plan.Spec.ServiceAccount, Settings.Migration.ServiceAccount); sa != "" {
 		template.Spec.ServiceAccountName = sa
 	}
 	if len(r.hook.Spec.Playbook) > 0 {
@@ -362,5 +384,157 @@ func (r *HookRunner) labels() map[string]string {
 		kMigration: string(r.Migration.UID),
 		kVM:        r.vm.ID,
 		kStep:      r.vm.Phase,
+		kHook:      string(r.hook.UID),
+		kResource:  ResourceHookConfig,
 	}
+}
+
+// aapJobExtraVars builds extra_vars for the AAP job template (extend here when adding new migration context).
+func (r *HookRunner) aapJobExtraVars() map[string]string {
+	m := map[string]string{
+		"vm_id":           r.vm.ID,
+		"vm_name":         r.vm.Name,
+		"plan_name":       r.Plan.Name,
+		"plan_namespace":  r.Plan.Namespace,
+		"migration_phase": r.vm.Phase,
+	}
+	if id := r.vm.Ref.ID; id != "" {
+		m["vm_source_id"] = id
+	}
+	return m
+}
+
+// Run AAP job template remotely.
+func (r *HookRunner) runAAPJob(step *planapi.Step) (err error) {
+	aapConfig := r.hook.Spec.AAP
+	m := Settings.Migration
+
+	if aapConfig == nil {
+		step.AddError("Hook AAP configuration is missing")
+		step.MarkCompleted()
+		return
+	}
+
+	useHook := strings.TrimSpace(aapConfig.URL) != "" && aapConfig.TokenSecret != nil &&
+		strings.TrimSpace(aapConfig.TokenSecret.Name) != ""
+	useCluster := strings.TrimSpace(m.AAPURL) != "" && strings.TrimSpace(m.AAPTokenSecretName) != ""
+	if !useHook && !useCluster {
+		step.AddError("AAP is not configured: set ForkliftController aap_url and aap_token_secret_name, or spec.aap.url and spec.aap.tokenSecret")
+		step.MarkCompleted()
+		return
+	}
+
+	var aapURL string
+	var token string
+	if useHook {
+		aapURL = strings.TrimSpace(aapConfig.URL)
+		var tokErr error
+		token, tokErr = aap.GetTokenFromSecret(
+			context.TODO(),
+			r.Client,
+			r.Plan.Namespace,
+			aapConfig.TokenSecret,
+		)
+		err = tokErr
+	} else {
+		aapURL = strings.TrimSpace(m.AAPURL)
+		var tokErr error
+		token, tokErr = aap.GetTokenFromSecretName(
+			context.TODO(),
+			r.Client,
+			settings.ControllerNamespace(),
+			m.AAPTokenSecretName,
+		)
+		err = tokErr
+	}
+	if err != nil {
+		step.AddError(err.Error())
+		step.MarkCompleted()
+		return
+	}
+
+	httpTimeout := 30 * time.Second
+	if m.AAPTimeoutSeconds > 0 {
+		httpTimeout = time.Duration(m.AAPTimeoutSeconds) * time.Second
+	}
+
+	transport, tlsErr := aap.TLSTransportFromSettings(context.TODO(), r.Client, m.AAPInsecureSkipVerify, m.AAPCASecretName)
+	if tlsErr != nil {
+		step.AddError(tlsErr.Error())
+		step.MarkCompleted()
+		return
+	}
+
+	aapClient := aap.NewClient(aapURL, token, httpTimeout, transport)
+
+	extraVars := r.aapJobExtraVars()
+
+	r.Log.Info(
+		"Launching AAP job template",
+		"aap.jobTemplateId", aapConfig.JobTemplateID,
+		"aap.url", aapURL,
+		"vm.name", r.vm.Name,
+		"vm.id", r.vm.ID,
+	)
+
+	// Launch the job
+	jobID, err := aapClient.LaunchJob(context.TODO(), aapConfig.JobTemplateID, extraVars)
+	if err != nil {
+		step.AddError(err.Error())
+		step.MarkCompleted()
+		return
+	}
+
+	step.MarkStarted()
+	r.Log.Info(
+		"AAP job launched successfully",
+		"jobId", jobID,
+		"jobTemplateId", aapConfig.JobTemplateID,
+	)
+
+	// Poll until the AAP job completes. spec.aap.timeout (if set) takes precedence for wall-clock behavior,
+	// then spec.deadline, then ForkliftController aap_timeout, then default 3600.
+	var pollTimeout time.Duration
+	unlimited := false
+	switch {
+	case aapConfig.Timeout < 0:
+		unlimited = true
+	case aapConfig.Timeout > 0:
+		pollTimeout = time.Duration(aapConfig.Timeout) * time.Second
+	case r.hook.Spec.Deadline < 0:
+		unlimited = true
+	case r.hook.Spec.Deadline > 0:
+		pollTimeout = time.Duration(r.hook.Spec.Deadline) * time.Second
+	default:
+		if m.AAPTimeoutSeconds > 0 {
+			pollTimeout = time.Duration(m.AAPTimeoutSeconds) * time.Second
+		} else {
+			pollTimeout = time.Duration(defaultAAPJobPollSeconds) * time.Second
+		}
+	}
+
+	// Wait for job completion
+	err = aapClient.WaitForJobCompletion(
+		context.TODO(),
+		jobID,
+		pollTimeout,
+		unlimited,
+	)
+
+	if err != nil {
+		r.Log.Error(err, "AAP job failed", "jobId", jobID)
+		step.AddError(err.Error())
+		step.MarkCompleted()
+		return
+	}
+
+	r.Log.Info(
+		"AAP job completed successfully",
+		"jobId", jobID,
+	)
+
+	step.Progress.Completed = 1
+	step.MarkCompleted()
+
+	return
 }

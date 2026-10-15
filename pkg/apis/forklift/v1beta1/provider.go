@@ -40,6 +40,11 @@ const (
 	OpenStack ProviderType = "openstack"
 	// OVA
 	Ova ProviderType = "ova"
+	// EC2
+	EC2 ProviderType = "ec2"
+
+	// HyperV
+	HyperV ProviderType = "hyperv"
 )
 
 var ProviderTypes = []ProviderType{
@@ -48,6 +53,8 @@ var ProviderTypes = []ProviderType{
 	OVirt,
 	OpenStack,
 	Ova,
+	EC2,
+	HyperV,
 }
 
 func (t ProviderType) String() string {
@@ -68,9 +75,26 @@ const (
 	ESXI                   = "esxi"
 	UseVddkAioOptimization = "useVddkAioOptimization"
 	VddkConfig             = "vddkConfig"
+	ESXiCloneMethod        = "esxiCloneMethod"
+	TargetAZ               = "target-az"
+	TargetRegion           = "target-region"
+)
+
+// ESXi clone method values.
+const (
+	ESXiCloneMethodVIB = "vib"
+	ESXiCloneMethodSSH = "ssh"
+)
+
+// Hyper-V management type setting key and values.
+const (
+	ManagementType   = "managementType"
+	HyperVStandalone = "standalone"
+	HyperVCluster    = "cluster"
 )
 
 const OvaProviderFinalizer = "forklift/ova-provider"
+const HyperVProviderFinalizer = "forklift/hyperv-provider"
 
 // Defines the desired state of Provider.
 type ProviderSpec struct {
@@ -101,6 +125,13 @@ type ProviderStatus struct {
 	// Fingerprint.
 	// +optional
 	Fingerprint string `json:"fingerprint,omitempty"`
+	// Provider service reference
+	// +optional
+	Service *core.ObjectReference `json:"service,omitempty"`
+	// The ResourceVersion of the secret referenced by this provider.
+	// Used to detect when credentials have been rotated.
+	// +optional
+	SecretResourceVersion string `json:"secretResourceVersion,omitempty"`
 }
 
 // +genclient
@@ -140,6 +171,10 @@ func (p *Provider) Type() ProviderType {
 	return Undefined
 }
 
+func (p *Provider) SupportsPreserveStaticIps() bool {
+	return p.Type() == VSphere || p.Type() == HyperV
+}
+
 // This provider is the `host` cluster.
 func (p *Provider) IsHost() bool {
 	return p.Type() == OpenShift && p.Spec.URL == ""
@@ -159,6 +194,9 @@ func (p *Provider) HasReconciled() bool {
 
 // This provider requires VM guest conversion.
 func (p *Provider) RequiresConversion() bool {
+	// Spectro: guest conversion is opt-in. Upstream returns true for
+	// VSphere/Ova/HyperV/EC2; we convert only when explicitly requested so raw
+	// disk import is the default.
 	if p.Spec.ConvertDisk == nil {
 		return false
 	}
@@ -176,4 +214,9 @@ func (p *Provider) UseVddkAioOptimization() bool {
 		return false
 	}
 	return parseBool
+}
+
+// Whether this Hyper-V provider is configured for Failover Cluster mode.
+func (p *Provider) IsHyperVCluster() bool {
+	return p.Type() == HyperV && p.Spec.Settings[ManagementType] == HyperVCluster
 }

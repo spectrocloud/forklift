@@ -24,6 +24,11 @@ spec:
         prometheus.forklift.konveyor.io: "true" 
       annotations:
         configHash: "{{ (inventory_volume_path | string) }}"
+{% if controller_transfer_network is defined %}
+        k8s.v1.cni.cncf.io/networks: {{ controller_transfer_network | to_json }}
+{% else %}
+        k8s.v1.cni.cncf.io/networks: null
+{% endif %}
     spec:
       serviceAccountName: {{ controller_service_name }}
       containers:
@@ -42,7 +47,13 @@ spec:
         - name: KUBEVIRT_CLIENT_GO_SCHEME_REGISTRATION_VERSION
           value: "v1"
         - name: VIRT_V2V_IMAGE
-          value: {{ virt_v2v_image_fqin }}
+          value: "{{ virt_v2v_image_fqin or lookup('env', 'VIRT_V2V_IMAGE') or lookup('env', 'RELATED_IMAGE_VIRT_V2V') }}"
+        - name: VIRT_V2V_IMAGE_XFS
+          value: "{{ virt_v2v_image_xfs_fqin or lookup('env', 'VIRT_V2V_IMAGE_XFS') or lookup('env', 'RELATED_IMAGE_VIRT_V2V_XFS') }}"
+        - name: DEEP_INSPECTION_IMAGE
+          value: "{{ deep_inspection_image_fqin or lookup('env', 'DEEP_INSPECTION_IMAGE') or lookup('env', 'RELATED_IMAGE_DEEP_INSPECTION') }}"
+        - name: DEEP_INSPECTION_IMAGE_XFS
+          value: "{{ deep_inspection_image_xfs_fqin or lookup('env', 'DEEP_INSPECTION_IMAGE_XFS') or lookup('env', 'RELATED_IMAGE_DEEP_INSPECTION_XFS') }}"
         - name: API_PORT
           value: "8443"
         - name: METRICS_PORT
@@ -57,6 +68,10 @@ spec:
 {% else %}
           value: "true"
 {% endif %}
+{% if ocp_version is defined %}
+        - name: OPENSHIFT_VERSION
+          value: {{ ocp_version }}
+{% endif %}
 {% if controller_log_level is defined and controller_log_level is number %}
         - name: LOG_LEVEL
           value: "{{ controller_log_level }}"
@@ -64,6 +79,10 @@ spec:
 {% if controller_precopy_interval is number %}
         - name: PRECOPY_INTERVAL
           value: "{{ controller_precopy_interval }}"
+{% endif %}
+{% if controller_blocker_grace_period_minutes is number %}
+        - name: BLOCKER_GRACE_PERIOD_MINUTES
+          value: "{{ controller_blocker_grace_period_minutes }}"
 {% endif %}
 {% if controller_vddk_job_active_deadline_sec is number %}
         - name: VDDK_JOB_ACTIVE_DEADLINE
@@ -81,10 +100,6 @@ spec:
         - name: CLEANUP_RETRIES
           value: "{{ controller_cleanup_retries }}"
 {% endif %}
-{% if controller_dv_status_check_retries is number %}
-        - name: DV_STATUS_CHECK_RETRIES
-          value: "{{ controller_dv_status_check_retries }}"
-{% endif %}
 {% if controller_snapshot_removal_check_retries is number %}
         - name: SNAPSHOT_REMOVAL_CHECK_RETRIES
           value: "{{ controller_snapshot_removal_check_retries }}"
@@ -100,6 +115,45 @@ spec:
 {% if controller_tls_connection_timeout_sec is number %}
         - name: TLS_CONNECTION_TIMEOUT
           value: "{{ controller_tls_connection_timeout_sec }}"
+{% endif %}
+{% if controller_windows_reboot_timeout is number %}
+        - name: CONTROLLER_WINDOWS_REBOOT_TIMEOUT
+          value: "{{ controller_windows_reboot_timeout }}"
+{% endif %}
+{% if controller_max_concurrent_reconciles is number %}
+        - name: MAX_CONCURRENT_RECONCILES
+          value: "{{ controller_max_concurrent_reconciles }}"
+{% endif %}
+{% if controller_max_parent_backing_retries is number %}
+        - name: MAX_PARENT_BACKING_RETRIES
+          value: "{{ controller_max_parent_backing_retries }}"
+{% endif %}
+{% if controller_migration_service_account is string and controller_migration_service_account|length > 0 %}
+        - name: MIGRATION_SERVICE_ACCOUNT
+          value: "{{ controller_migration_service_account }}"
+{% endif %}
+{% if aap_url is defined and aap_url is string and aap_url|length > 0 %}
+        - name: AAP_URL
+          value: "{{ aap_url }}"
+{% endif %}
+{% if aap_token_secret_name is defined and aap_token_secret_name is string and aap_token_secret_name|length > 0 %}
+        - name: AAP_TOKEN_SECRET_NAME
+          value: "{{ aap_token_secret_name }}"
+{% endif %}
+{% if aap_timeout is defined and aap_timeout is string and aap_timeout|length > 0 %}
+        - name: AAP_TIMEOUT
+          value: "{{ aap_timeout }}"
+{% elif aap_timeout is defined and aap_timeout is number %}
+        - name: AAP_TIMEOUT
+          value: "{{ aap_timeout }}"
+{% endif %}
+{% if aap_insecure_skip_verify is defined and aap_insecure_skip_verify|bool %}
+        - name: AAP_INSECURE_SKIP_VERIFY
+          value: "true"
+{% endif %}
+{% if aap_ca_secret_name is defined and aap_ca_secret_name is string and aap_ca_secret_name|length > 0 %}
+        - name: AAP_CA_SECRET_NAME
+          value: "{{ aap_ca_secret_name }}"
 {% endif %}
 {% if controller_cdi_export_token_ttl is number %}
         - name: CDI_EXPORT_TOKEN_TTL
@@ -124,10 +178,40 @@ spec:
         - name: FEATURE_OVIRT_WARM_MIGRATION
           value: "true"
 {% endif %}
+{% if controller_static_udn_ip_addresses|bool %}
+        - name: FEATURE_STATIC_UDN_IP_ADDRESSES
+          value: "true"
+{% endif %}
 {% if controller_retain_precopy_importer_pods|bool %}
         - name: FEATURE_RETAIN_PRECOPY_IMPORTER_PODS
           value: "true"
 {% endif %}
+{% if controller_retain_populator_pods|bool %}
+        - name: FEATURE_RETAIN_POPULATOR_PODS
+          value: "true"
+{% endif %}
+{% if feature_xfs_repair_ignore|bool %}
+        - name: FEATURE_XFS_REPAIR_IGNORE
+          value: "true"
+{% endif %}
+{% if feature_ocp_live_migration|bool %}
+        - name: FEATURE_OCP_LIVE_MIGRATION
+          value: "true"
+{% endif %}
+        - name: FEATURE_VMWARE_SYSTEM_SERIAL_NUMBER
+          value: "{{ feature_vmware_system_serial_number|bool|lower }}"
+{% if feature_vsphere_vmware_driver_removal|bool %}
+        - name: FEATURE_VSPHERE_VMWARE_DRIVER_REMOVAL
+          value: "true"
+{% endif %}
+{% if feature_windows_registry_network_config|bool %}
+        - name: FEATURE_WINDOWS_REGISTRY_NETWORK_CONFIG
+          value: "true"
+{% endif %}
+        - name: FEATURE_WINDOWS_WAIT_FOR_REBOOT
+          value: "{{ feature_windows_wait_for_reboot|bool|lower }}"
+        - name: FEATURE_USE_CONVERSION_CR
+          value: "{{ feature_use_conversion_cr|bool|lower }}"
 {% if ovirt_osmap_configmap_name is defined %}
         - name: OVIRT_OS_MAP
           value: {{ ovirt_osmap_configmap_name }}
@@ -139,6 +223,10 @@ spec:
 {% if virt_customize_configmap_name is defined %}
         - name: VIRT_CUSTOMIZE_MAP
           value: {{ virt_customize_configmap_name }}
+{% endif %}
+{% if naa_oui_map_configmap_name is defined %}
+        - name: NAA_OUI_MAP
+          value: {{ naa_oui_map_configmap_name }}
 {% endif %}
 {% if controller_profile_kind is defined and controller_profile_path is defined and controller_profile_duration is defined %}
         - name: PROFILE_KIND
@@ -154,8 +242,18 @@ spec:
 {% endif %}
         - name: VIRT_V2V_EXTRA_ARGS
           value: "{{ virt_v2v_extra_args }}"
+        - name: VIRT_V2V_INSPECTOR_EXTRA_ARGS
+          value: "{{ virt_v2v_inspector_extra_args }}"
         - name: VIRT_V2V_EXTRA_CONF_CONFIG_MAP
           value: "{{ virt_v2v_extra_conf_config_map }}"
+{% if virt_v2v_memsize is defined and virt_v2v_memsize != "" %}
+        - name: VIRT_V2V_MEMSIZE
+          value: "{{ virt_v2v_memsize }}"
+{% endif %}
+{% if virt_v2v_smp is defined and virt_v2v_smp != "" %}
+        - name: VIRT_V2V_SMP
+          value: "{{ virt_v2v_smp }}"
+{% endif %}
         - name: VIRT_V2V_CONTAINER_LIMITS_CPU
           value: "{{ virt_v2v_container_limits_cpu }}"
         - name: VIRT_V2V_CONTAINER_LIMITS_MEMORY
@@ -180,10 +278,20 @@ spec:
           value: "{{ ova_container_requests_cpu }}"
         - name: OVA_CONTAINER_REQUESTS_MEMORY
           value: "{{ ova_container_requests_memory }}"
+        - name: POPULATOR_CONTAINER_LIMITS_CPU
+          value: "{{ populator_container_limits_cpu }}"
+        - name: POPULATOR_CONTAINER_LIMITS_MEMORY
+          value: "{{ populator_container_limits_memory }}"
+        - name: POPULATOR_CONTAINER_REQUESTS_CPU
+          value: "{{ populator_container_requests_cpu }}"
+        - name: POPULATOR_CONTAINER_REQUESTS_MEMORY
+          value: "{{ populator_container_requests_memory }}"
+        - name: WAIT_FOR_FINAL_SNAPSHOT_CONSOLIDATION
+          value: "{{ wait_for_final_snapshot_consolidation }}"
         envFrom:
         - configMapRef:
             name: {{ controller_configmap_name }}
-        image: {{ controller_image_fqin }}
+        image: "{{ controller_image_fqin or lookup('env', 'CONTROLLER_IMAGE') or lookup('env', 'RELATED_IMAGE_CONTROLLER') }}"
         imagePullPolicy: {{ image_pull_policy }}
         resources:
           limits:
@@ -213,6 +321,29 @@ spec:
           value: "v1"
         - name: AUTH_REQUIRED
           value: '{{ feature_auth_required|lower }}'
+{% if aap_url is defined and aap_url is string and aap_url|length > 0 %}
+        - name: AAP_URL
+          value: "{{ aap_url }}"
+{% endif %}
+{% if aap_token_secret_name is defined and aap_token_secret_name is string and aap_token_secret_name|length > 0 %}
+        - name: AAP_TOKEN_SECRET_NAME
+          value: "{{ aap_token_secret_name }}"
+{% endif %}
+{% if aap_timeout is defined and aap_timeout is string and aap_timeout|length > 0 %}
+        - name: AAP_TIMEOUT
+          value: "{{ aap_timeout }}"
+{% elif aap_timeout is defined and aap_timeout is number %}
+        - name: AAP_TIMEOUT
+          value: "{{ aap_timeout }}"
+{% endif %}
+{% if aap_insecure_skip_verify is defined and aap_insecure_skip_verify|bool %}
+        - name: AAP_INSECURE_SKIP_VERIFY
+          value: "true"
+{% endif %}
+{% if aap_ca_secret_name is defined and aap_ca_secret_name is string and aap_ca_secret_name|length > 0 %}
+        - name: AAP_CA_SECRET_NAME
+          value: "{{ aap_ca_secret_name }}"
+{% endif %}
         - name: API_PORT
           value: "8443"
         - name: API_TLS_CERTIFICATE
@@ -222,7 +353,13 @@ spec:
         - name: METRICS_PORT
           value: '8082'
         - name: OVA_PROVIDER_SERVER_IMAGE
-          value: {{ ova_provider_server_fqin }}
+          value: "{{ ova_provider_server_fqin or lookup('env', 'OVA_PROVIDER_SERVER_IMAGE') or lookup('env', 'RELATED_IMAGE_OVA_PROVIDER_SERVER') }}"
+        - name: HYPERV_PROVIDER_SERVER_IMAGE
+          value: "{{ hyperv_provider_server_fqin or lookup('env', 'HYPERV_PROVIDER_SERVER_IMAGE') or lookup('env', 'RELATED_IMAGE_HYPERV_PROVIDER_SERVER') }}"
+{% if feature_ova_appliance_management|bool %}
+        - name: FEATURE_OVF_APPLIANCE_MANAGEMENT
+          value: "true"
+{% endif %}
 {% if feature_validation|bool %}
         - name: POLICY_AGENT_URL
           value: "https://{{ validation_service_name }}.{{ app_namespace }}.svc.cluster.local:8181"
@@ -257,7 +394,7 @@ spec:
         envFrom:
         - configMapRef:
             name: {{ controller_configmap_name }}
-        image: {{ controller_image_fqin }}
+        image: "{{ controller_image_fqin or lookup('env', 'CONTROLLER_IMAGE') or lookup('env', 'RELATED_IMAGE_CONTROLLER') }}"
         imagePullPolicy: {{ image_pull_policy }}
         ports:
         - name: api

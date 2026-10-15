@@ -1,0 +1,161 @@
+package inventory
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+
+	"github.com/yaacov/kubectl-mtv/pkg/util/output"
+	querypkg "github.com/yaacov/kubectl-mtv/pkg/util/query"
+	"github.com/yaacov/kubectl-mtv/pkg/util/watch"
+)
+
+// ListStorageWithInsecure queries the provider's storage inventory and displays the results with optional insecure TLS skip verification
+func ListStorageWithInsecure(ctx context.Context, kubeConfigFlags *genericclioptions.ConfigFlags, providerName, namespace string, inventoryURL string, outputFormat string, query string, watchMode bool, insecureSkipTLS bool) error {
+	sq := watch.NewSafeQuery(query)
+
+	return watch.WrapWithWatchAndQuery(watchMode, outputFormat, func() error {
+		return listStorageOnce(ctx, kubeConfigFlags, providerName, namespace, inventoryURL, outputFormat, sq.Get(), insecureSkipTLS)
+	}, watch.DefaultInterval, sq.Set, query)
+}
+
+func listStorageOnce(ctx context.Context, kubeConfigFlags *genericclioptions.ConfigFlags, providerName, namespace string, inventoryURL string, outputFormat string, query string, insecureSkipTLS bool) error {
+	// Get the provider object
+	provider, err := GetProviderByName(ctx, kubeConfigFlags, providerName, namespace)
+	if err != nil {
+		return err
+	}
+
+	// Create a new provider client
+	providerClient := NewProviderClientWithInsecure(kubeConfigFlags, provider, inventoryURL, insecureSkipTLS)
+
+	// Get provider type to determine which storage resource to fetch
+	providerType, err := providerClient.GetProviderType()
+	if err != nil {
+		return fmt.Errorf("failed to get provider type: %v", err)
+	}
+
+	// Define default headers based on provider type
+	var defaultHeaders []output.Column
+	switch providerType {
+	case "openshift":
+		defaultHeaders = []output.Column{
+			{Title: "NAME", Key: "name"},
+			{Title: "ID", Key: "id"},
+			{Title: "DEFAULT", Key: "object.metadata.annotations[storageclass.kubernetes.io/is-default-class]", ColorFunc: output.ColorizeBooleanString},
+			{Title: "VIRT-DEFAULT", Key: "object.metadata.annotations[storageclass.kubevirt.io/is-default-virt-class]", ColorFunc: output.ColorizeBooleanString},
+		}
+	case "ec2":
+		defaultHeaders = []output.Column{
+			{Title: "TYPE", Key: "type"},
+			{Title: "DESCRIPTION", Key: "description"},
+			{Title: "MAX-IOPS", Key: "maxIOPS"},
+			{Title: "MAX-THROUGHPUT", Key: "maxThroughput"},
+		}
+	default:
+		defaultHeaders = []output.Column{
+			{Title: "NAME", Key: "name"},
+			{Title: "ID", Key: "id"},
+			{Title: "TYPE", Key: "type"},
+			{Title: "CAPACITY", Key: "capacityHuman"},
+			{Title: "FREE", Key: "freeHuman"},
+			{Title: "MAINTENANCE", Key: "maintenance", ColorFunc: output.ColorizeBooleanString},
+		}
+	}
+
+	// Fetch storage inventory based on provider type
+	var data interface{}
+	switch providerType {
+	case "ovirt":
+		data, err = providerClient.GetStorageDomains(ctx, 4)
+	case "vsphere":
+		data, err = providerClient.GetDatastores(ctx, 4)
+	case "ova":
+		data, err = providerClient.GetResourceCollection(ctx, "storages", 4)
+	case "openstack":
+		data, err = providerClient.GetVolumeTypes(ctx, 4)
+	case "openshift":
+		data, err = providerClient.GetStorageClasses(ctx, 4)
+	case "ec2":
+		data, err = providerClient.GetResourceCollection(ctx, "storages", 4)
+	default:
+		// For other providers, use generic storage resource
+		data, err = providerClient.GetResourceCollection(ctx, "storages", 4)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to fetch storage inventory: %v", err)
+	}
+
+	// Extract objects from EC2 envelope
+	if providerType == "ec2" {
+		data = ExtractEC2Objects(data)
+	}
+
+	// Verify data is an array
+	dataArray, ok := data.([]interface{})
+	if !ok {
+		return fmt.Errorf("unexpected data format: expected array for storage inventory")
+	}
+
+	// Convert to expected format
+	storages := make([]map[string]interface{}, 0, len(dataArray))
+	for _, item := range dataArray {
+		if storage, ok := item.(map[string]interface{}); ok {
+			// Add provider name to each storage
+			storage["provider"] = providerName
+
+			// Humanize capacity and free space
+			if capacity, exists := storage["capacity"]; exists {
+				if capacityFloat, ok := capacity.(float64); ok {
+					storage["capacityHuman"] = humanizeBytes(capacityFloat)
+				} else if capacityNum, ok := capacity.(int64); ok {
+					storage["capacityHuman"] = humanizeBytes(float64(capacityNum))
+				}
+			}
+
+			if free, exists := storage["free"]; exists {
+				if freeFloat, ok := free.(float64); ok {
+					storage["freeHuman"] = humanizeBytes(freeFloat)
+				} else if freeNum, ok := free.(int64); ok {
+					storage["freeHuman"] = humanizeBytes(float64(freeNum))
+				}
+			}
+
+			storages = append(storages, storage)
+		}
+	}
+
+	// Parse and apply query options
+	queryOpts, err := querypkg.ParseQueryString(query)
+	if err != nil {
+		return fmt.Errorf("invalid query string: %v", err)
+	}
+
+	// Apply query options (sorting, filtering, limiting)
+	storages, err = querypkg.ApplyQuery(storages, queryOpts)
+	if err != nil {
+		return fmt.Errorf("error applying query: %v", err)
+	}
+
+	// Format validation
+	outputFormat = strings.ToLower(outputFormat)
+	if outputFormat != "table" && outputFormat != "json" && outputFormat != "yaml" && outputFormat != "markdown" {
+		return fmt.Errorf("unsupported output format: %s. Supported formats: table, json, yaml, markdown", outputFormat)
+	}
+
+	// Handle different output formats
+	emptyMessage := fmt.Sprintf("No storage resources found for provider %s", providerName)
+	switch outputFormat {
+	case "json":
+		return output.PrintJSONWithEmpty(storages, emptyMessage)
+	case "yaml":
+		return output.PrintYAMLWithEmpty(storages, emptyMessage)
+	case "markdown":
+		return output.PrintMarkdownWithQuery(storages, defaultHeaders, queryOpts, emptyMessage)
+	default:
+		return output.PrintTableWithQuery(storages, defaultHeaders, queryOpts, emptyMessage)
+	}
+}

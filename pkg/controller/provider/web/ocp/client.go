@@ -51,6 +51,18 @@ func (r *Resolver) Path(object interface{}, id string) (path string, err error) 
 		r.UID = id
 		r.Link(provider)
 		path = r.SelfLink
+	case *KubeVirt:
+		r.UID = id
+		r.Link(provider)
+		path = r.SelfLink
+	case *DataVolume:
+		r.UID = id
+		r.Link(provider)
+		path = r.SelfLink
+	case *PersistentVolumeClaim:
+		r.UID = id
+		r.Link(provider)
+		path = r.SelfLink
 	default:
 		err = liberr.Wrap(
 			ResourceNotResolvedError{
@@ -89,10 +101,12 @@ func (r *Finder) ByRef(resource interface{}, ref base.Ref) (err error) {
 			err = r.Get(resource, id)
 			return
 		}
-		name := ref.Name
+		ns, name := r.resolve(ref)
 		if name != "" {
-			ns, name := path.Split(name)
-			ns = strings.TrimRight(ns, "/")
+			if ns == "" {
+				err = liberr.Wrap(RefNotUniqueError{Ref: ref})
+				break
+			}
 			list := []NetworkAttachmentDefinition{}
 			err = r.List(
 				&list,
@@ -223,19 +237,133 @@ func (r *Finder) ByRef(resource interface{}, ref base.Ref) (err error) {
 			err = r.Get(resource, id)
 			return
 		}
-		name := ref.Name
+		ns, name := r.resolve(ref)
 		if name != "" {
-			var ns string
-
-			// ref.Namespace might be missing when passed from NetworkMaps
-			// or StorageMaps
-			if ref.Namespace != "" {
-				ns = ref.Namespace
-			} else {
-				ns, name = path.Split(name)
-				ns = strings.TrimRight(ns, "/")
+			if ns == "" {
+				err = liberr.Wrap(RefNotUniqueError{Ref: ref})
+				break
 			}
 			list := []VM{}
+			err = r.List(
+				&list,
+				base.Param{
+					Key:   DetailParam,
+					Value: "all",
+				},
+				base.Param{
+					Key:   NsParam,
+					Value: ns,
+				},
+				base.Param{
+					Key:   NameParam,
+					Value: name,
+				})
+			if err != nil {
+				break
+			}
+			if len(list) == 0 {
+				err = liberr.Wrap(NotFoundError{Ref: ref})
+				break
+			}
+			if len(list) > 1 {
+				err = liberr.Wrap(RefNotUniqueError{Ref: ref})
+				break
+			}
+			*res = list[0]
+		}
+	case *PersistentVolumeClaim:
+		id := ref.ID
+		if id != "" {
+			err = r.Get(resource, id)
+			return
+		}
+		ns, name := r.resolve(ref)
+		if name != "" {
+			if ns == "" {
+				err = liberr.Wrap(RefNotUniqueError{Ref: ref})
+				break
+			}
+			list := []PersistentVolumeClaim{}
+			err = r.List(
+				&list,
+				base.Param{
+					Key:   DetailParam,
+					Value: "all",
+				},
+				base.Param{
+					Key:   NsParam,
+					Value: ns,
+				},
+				base.Param{
+					Key:   NameParam,
+					Value: name,
+				})
+			if err != nil {
+				break
+			}
+			if len(list) == 0 {
+				err = liberr.Wrap(NotFoundError{Ref: ref})
+				break
+			}
+			if len(list) > 1 {
+				err = liberr.Wrap(RefNotUniqueError{Ref: ref})
+				break
+			}
+			*res = list[0]
+		}
+	case *DataVolume:
+		id := ref.ID
+		if id != "" {
+			err = r.Get(resource, id)
+			return
+		}
+		ns, name := r.resolve(ref)
+		if name != "" {
+			if ns == "" {
+				err = liberr.Wrap(RefNotUniqueError{Ref: ref})
+				break
+			}
+			list := []DataVolume{}
+			err = r.List(
+				&list,
+				base.Param{
+					Key:   DetailParam,
+					Value: "all",
+				},
+				base.Param{
+					Key:   NsParam,
+					Value: ns,
+				},
+				base.Param{
+					Key:   NameParam,
+					Value: name,
+				})
+			if err != nil {
+				break
+			}
+			if len(list) == 0 {
+				err = liberr.Wrap(NotFoundError{Ref: ref})
+				break
+			}
+			if len(list) > 1 {
+				err = liberr.Wrap(RefNotUniqueError{Ref: ref})
+				break
+			}
+			*res = list[0]
+		}
+	case *KubeVirt:
+		id := ref.ID
+		if id != "" {
+			err = r.Get(resource, id)
+			return
+		}
+		ns, name := r.resolve(ref)
+		if name != "" {
+			if ns == "" {
+				err = liberr.Wrap(RefNotUniqueError{Ref: ref})
+				break
+			}
+			list := []KubeVirt{}
 			err = r.List(
 				&list,
 				base.Param{
@@ -303,7 +431,7 @@ func (r *Finder) Workload(ref *base.Ref) (object interface{}, err error) {
 	err = r.ByRef(vm, *ref)
 	if err == nil {
 		ref.ID = vm.UID
-		ref.Name = path.Join(vm.Namespace, vm.Name)
+		ref.Name = vm.Name
 		object = vm
 	}
 
@@ -322,7 +450,7 @@ func (r *Finder) Network(ref *base.Ref) (object interface{}, err error) {
 	err = r.ByRef(nad, *ref)
 	if err == nil {
 		ref.ID = nad.UID
-		ref.Name = path.Join(nad.Namespace, nad.Name)
+		ref.Name = nad.Name
 		object = nad
 	}
 
@@ -374,7 +502,7 @@ func (r *Finder) InstanceType(ref *base.Ref) (object interface{}, err error) {
 	err = r.ByRef(it, *ref)
 	if err == nil {
 		ref.ID = it.UID
-		ref.Name = path.Join(it.Namespace, it.Name)
+		ref.Name = it.Name
 		object = it
 	}
 
@@ -397,5 +525,80 @@ func (r *Finder) ClusterInstanceType(ref *base.Ref) (object interface{}, err err
 		object = it
 	}
 
+	return
+}
+
+// Find a PersistentVolumeClaim by ref.
+// Returns the matching resource and:
+//
+//	ProviderNotSupportedErr
+//	ProviderNotReadyErr
+//	NotFoundErr
+//	RefNotUniqueErr
+func (r *Finder) PersistentVolumeClaim(ref *base.Ref) (object interface{}, err error) {
+	pvc := &PersistentVolumeClaim{}
+	err = r.ByRef(pvc, *ref)
+	if err == nil {
+		ref.Name = pvc.Name
+		ref.Namespace = pvc.Namespace
+		ref.ID = pvc.UID
+		object = pvc
+	}
+
+	return
+}
+
+// Find a DataVolume by ref.
+// Returns the matching resource and:
+//
+//	ProviderNotSupportedErr
+//	ProviderNotReadyErr
+//	NotFoundErr
+//	RefNotUniqueErr
+func (r *Finder) DataVolume(ref *base.Ref) (object interface{}, err error) {
+	dv := &DataVolume{}
+	err = r.ByRef(dv, *ref)
+	if err == nil {
+		ref.Name = dv.Name
+		ref.Namespace = dv.Namespace
+		ref.ID = dv.UID
+		object = dv
+	}
+
+	return
+}
+
+// Find a KubeVirt by ref.
+// Returns the matching resource and:
+//
+//	ProviderNotSupportedErr
+//	ProviderNotReadyErr
+//	NotFoundErr
+//	RefNotUniqueErr
+func (r *Finder) KubeVirt(ref *base.Ref) (object interface{}, err error) {
+	kv := &KubeVirt{}
+	err = r.ByRef(kv, *ref)
+	if err == nil {
+		ref.Name = kv.Name
+		ref.Namespace = kv.Namespace
+		ref.ID = kv.UID
+		object = kv
+	}
+
+	return
+}
+
+// Resolve a Ref into a namespace and name. The OCP provider tolerates
+// a Ref that contains a namespaced name in the `Name` field, so if the
+// Namespace field isn't populated, then the Name field needs to be checked
+// for a namespaced name.
+func (r *Finder) resolve(ref base.Ref) (namespace string, name string) {
+	if ref.Namespace != "" {
+		namespace = ref.Namespace
+		name = ref.Name
+	} else {
+		namespace, name = path.Split(ref.Name)
+		namespace = strings.TrimRight(namespace, "/")
+	}
 	return
 }

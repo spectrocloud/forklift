@@ -74,7 +74,9 @@ const (
 	PhaseCreateInitialSnapshot             = "CreateInitialSnapshot"
 	PhaseCreateSnapshot                    = "CreateSnapshot"
 	PhaseCreateVM                          = "CreateVM"
+	PhaseWaitForGuestReboots               = "WaitForGuestReboots"
 	PhaseFinalize                          = "Finalize"
+	PhasePreflightInspection               = "PreflightInspection"
 	PhasePowerOffSource                    = "PowerOffSource"
 	PhaseRemoveFinalSnapshot               = "RemoveFinalSnapshot"
 	PhaseRemovePenultimateSnapshot         = "RemovePenultimateSnapshot"
@@ -82,8 +84,6 @@ const (
 	PhaseStoreInitialSnapshotDeltas        = "StoreInitialSnapshotDeltas"
 	PhaseStorePowerState                   = "StorePowerState"
 	PhaseStoreSnapshotDeltas               = "StoreSnapshotDeltas"
-	PhaseWaitForDataVolumesStatus          = "WaitForDataVolumesStatus"
-	PhaseWaitForFinalDataVolumesStatus     = "WaitForFinalDataVolumesStatus"
 	PhaseWaitForFinalSnapshot              = "WaitForFinalSnapshot"
 	PhaseWaitForFinalSnapshotRemoval       = "WaitForFinalSnapshotRemoval"
 	PhaseWaitForInitialSnapshot            = "WaitForInitialSnapshot"
@@ -99,4 +99,15 @@ const (
 	StepPending   = "Pending"
 	StepRunning   = "Running"
 	StepCompleted = "Completed"
+)
+
+// Annotations.
+const (
+	AnnDiskSource = "forklift.konveyor.io/disk-source"
+	AnnSource     = "forklift.konveyor.io/source"
+)
+
+// Labels.
+const (
+	LabelSourceHost = "sourceHost"
 )

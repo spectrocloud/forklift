@@ -1,12 +1,46 @@
 package settings
 
+import (
+	"os"
+
+	"github.com/hashicorp/go-version"
+)
+
 // Environment Variables
 const (
-	FeatureOvirtWarmMigration        = "FEATURE_OVIRT_WARM_MIGRATION"
-	FeatureRetainPrecopyImporterPods = "FEATURE_RETAIN_PRECOPY_IMPORTER_PODS"
-	FeatureVsphereIncrementalBackup  = "FEATURE_VSPHERE_INCREMENTAL_BACKUP"
-	FeatureCopyOffload               = "FEATURE_COPY_OFFLOAD"
+	FeatureOvirtWarmMigration           = "FEATURE_OVIRT_WARM_MIGRATION"
+	FeatureRetainPrecopyImporterPods    = "FEATURE_RETAIN_PRECOPY_IMPORTER_PODS"
+	FeatureStaticUdnIpAddresses         = "FEATURE_STATIC_UDN_IP_ADDRESSES"
+	FeatureVsphereIncrementalBackup     = "FEATURE_VSPHERE_INCREMENTAL_BACKUP"
+	FeatureCopyOffload                  = "FEATURE_COPY_OFFLOAD"
+	FeatureOCPLiveMigration             = "FEATURE_OCP_LIVE_MIGRATION"
+	FeatureVmwareSystemSerialNumber     = "FEATURE_VMWARE_SYSTEM_SERIAL_NUMBER"
+	FeatureOVFApplianceManagement       = "FEATURE_OVF_APPLIANCE_MANAGEMENT"
+	FeatureVsphereVmwareDriverRemoval   = "FEATURE_VSPHERE_VMWARE_DRIVER_REMOVAL"
+	FeatureWindowsRegistryNetworkConfig = "FEATURE_WINDOWS_REGISTRY_NETWORK_CONFIG"
+	FeatureWindowsWaitForReboot         = "FEATURE_WINDOWS_WAIT_FOR_REBOOT"
+	FeatureUseConversionCR              = "FEATURE_USE_CONVERSION_CR"
+	FeatureRetainPopulatorPods          = "FEATURE_RETAIN_POPULATOR_PODS"
+	FeatureXfsRepairIgnore              = "FEATURE_XFS_REPAIR_IGNORE"
 )
+
+// OpenShift version where the FeatureVmwareSystemSerialNumber feature is supported:
+//   - https://issues.redhat.com/browse/CNV-64582
+//   - https://issues.redhat.com/browse/MTV-2988
+const ocpMinForVmwareSystemSerial = "4.20.0-0"
+
+// OpenShift version where the defined MAC address is supported in User Defined Network:
+//   - https://issues.redhat.com/browse/CNV-66820
+const ocpMinForUdnMacSupport = "4.20.0-0"
+
+// OpenShift version where Forklift can specify static IP addresses in User Defined Network:
+//   - https://issues.redhat.com/browse/CNV-61227
+const ocpMinForUdnPreserveStaticIp = "4.20.0-0"
+
+// OpenShift version where InsecureSkipVerify is supported for ImageIO data sources:
+//   - https://issues.redhat.com/browse/CNV-71978
+//   - https://github.com/kubevirt/containerized-data-importer/pull/3944
+const ocpMinForInsecureSkipVerify = "4.21.0-0"
 
 // Feature gates.
 type Features struct {
@@ -19,13 +53,71 @@ type Features struct {
 	VsphereIncrementalBackup bool
 	// Where to use copy offload plugins
 	CopyOffload bool
+	// Whether to enable support for OCP cross-cluster live migration.
+	OCPLiveMigration bool
+	// Whether to use VMware system serial number for VM migration from VMware.
+	VmwareSystemSerialNumber bool
+	// Whether to create VMs with MAC address with the User Defined Network
+	UdnSupportsMac bool
+	// Whether to create VMs with MAC address with the User Defined Network
+	StaticUdnIpAddresses bool
+	// Whether to enable support for appliance management endpoints for OVF-based providers (OVA, HyperV).
+	OVFApplianceManagement bool
+	// Whether CDI supports InsecureSkipVerify for ImageIO data sources (CNV 4.21+)
+	InsecureSkipVerifySupported bool
+	// Whether to run VMware driver removal scripts during Windows vSphere conversion (virt-customize).
+	VsphereVmwareDriverRemoval bool
+	// Whether to use registry-based network configuration scripts for Windows static IP setup.
+	WindowsRegistryNetworkConfig bool
+	// Whether to enable automatic wait-for-reboot step for Windows VM migrations.
+	WindowsWaitForReboot bool
+	// Whether to delegate VM conversion to Conversion CRs instead of managing it directly.
+	UseConversionCR bool
+	// Whether populator pods should be retained after migration for debugging.
+	RetainPopulatorPods bool
+	// Whether to ignore xfs_repair exit status during conversion.
+	XfsRepairIgnore bool
+}
+
+// isOpenShiftVersionAboveMinimum checks if OpenShift version is above or equal to minimum version using semantic versioning
+func (r *Features) isOpenShiftVersionAboveMinimum(minimumVersion string) bool {
+	openshiftVersionStr := os.Getenv(OpenShiftVersion)
+	if openshiftVersionStr == "" {
+		return false
+	}
+
+	// Parse the OpenShift version
+	openshiftVersion, err := version.NewVersion(openshiftVersionStr)
+	if err != nil {
+		return false
+	}
+
+	// Parse the minimum version
+	minVersion, err := version.NewVersion(minimumVersion)
+	if err != nil {
+		return false
+	}
+
+	return openshiftVersion.GreaterThanOrEqual(minVersion)
 }
 
 // Load settings.
 func (r *Features) Load() (err error) {
 	r.OvirtWarmMigration = getEnvBool(FeatureOvirtWarmMigration, false)
 	r.RetainPrecopyImporterPods = getEnvBool(FeatureRetainPrecopyImporterPods, false)
+	r.StaticUdnIpAddresses = getEnvBool(FeatureStaticUdnIpAddresses, false) && r.isOpenShiftVersionAboveMinimum(ocpMinForUdnPreserveStaticIp)
 	r.VsphereIncrementalBackup = getEnvBool(FeatureVsphereIncrementalBackup, false)
 	r.CopyOffload = getEnvBool(FeatureCopyOffload, false)
+	r.OCPLiveMigration = getEnvBool(FeatureOCPLiveMigration, false)
+	r.VmwareSystemSerialNumber = getEnvBool(FeatureVmwareSystemSerialNumber, true) && r.isOpenShiftVersionAboveMinimum(ocpMinForVmwareSystemSerial)
+	r.UdnSupportsMac = r.isOpenShiftVersionAboveMinimum(ocpMinForUdnMacSupport)
+	r.InsecureSkipVerifySupported = r.isOpenShiftVersionAboveMinimum(ocpMinForInsecureSkipVerify)
+	r.OVFApplianceManagement = getEnvBool(FeatureOVFApplianceManagement, false)
+	r.VsphereVmwareDriverRemoval = getEnvBool(FeatureVsphereVmwareDriverRemoval, false)
+	r.WindowsRegistryNetworkConfig = getEnvBool(FeatureWindowsRegistryNetworkConfig, false)
+	r.WindowsWaitForReboot = getEnvBool(FeatureWindowsWaitForReboot, true)
+	r.UseConversionCR = getEnvBool(FeatureUseConversionCR, true)
+	r.RetainPopulatorPods = getEnvBool(FeatureRetainPopulatorPods, false)
+	r.XfsRepairIgnore = getEnvBool(FeatureXfsRepairIgnore, false)
 	return
 }

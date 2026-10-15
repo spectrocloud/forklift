@@ -10,7 +10,6 @@ import (
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web"
 	model "github.com/kubev2v/forklift/pkg/controller/provider/web/vsphere"
-	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 )
 
@@ -27,8 +26,10 @@ const (
 
 // Steps.
 const (
-	DiskTransfer = "DiskTransfer"
-	NotFound     = "NotFound"
+	DiskTransfer    = "DiskTransfer"
+	DiskTransferV2v = "DiskTransferV2v"
+	DiskAllocation  = "DiskAllocation"
+	NotFound        = "NotFound"
 )
 
 // Package level mutex to ensure that
@@ -124,16 +125,6 @@ func (r *Scheduler) buildInFlight() (err error) {
 		vm := &model.VM{}
 		err = r.Source.Inventory.Find(vm, vmStatus.Ref)
 		if err != nil {
-			if errors.As(err, &web.NotFoundError{}) {
-				vmStatus.SetCondition(libcnd.Condition{
-					Type:     api.ConditionCanceled,
-					Status:   libcnd.True,
-					Category: api.CategoryAdvisory,
-					Reason:   NotFound,
-					Message:  "VM was not found in inventory.",
-					Durable:  true,
-				})
-			}
 			return
 		}
 		if vmStatus.Running() {
@@ -191,8 +182,19 @@ func (r *Scheduler) buildInFlight() (err error) {
 }
 
 // Build the map of pending VMs belonging to each host.
+//
+// Shared-disk VMs are ordered to ensure shareable PVCs are created before
+// they are consumed:
+//   - VMs that create shareable PVCs (migrateSharedDisks=true) run first.
+//   - VMs that reuse PVCs (migrateSharedDisks=false) run after all creators finish.
+//   - VMs without shared disks run any time.
 func (r *Scheduler) buildPending() (err error) {
 	r.pending = make(map[string][]*pendingVM)
+
+	hasActiveCreators, err := r.hasActiveSharedDiskCreators()
+	if err != nil {
+		return
+	}
 
 	for _, vmStatus := range r.Plan.Status.Migration.VMs {
 		if vmStatus.HasCondition(Canceled) {
@@ -203,21 +205,51 @@ func (r *Scheduler) buildPending() (err error) {
 		if err != nil {
 			return
 		}
-
-		if !vmStatus.MarkedStarted() && !vmStatus.MarkedCompleted() {
-			pending := &pendingVM{
-				status: vmStatus,
-				cost:   r.cost(vm, vmStatus),
-			}
-			r.pending[vm.Host] = append(r.pending[vm.Host], pending)
+		if vmStatus.MarkedStarted() || vmStatus.MarkedCompleted() {
+			continue
 		}
+		if hasActiveCreators && vm.HasSharedDisk() && !r.migratesSharedDisks(vmStatus) {
+			continue
+		}
+		r.pending[vm.Host] = append(r.pending[vm.Host], &pendingVM{
+			status: vmStatus,
+			cost:   r.cost(vm, vmStatus),
+		})
 	}
 	return
 }
 
+// hasActiveSharedDiskCreators reports whether any VM that creates
+// shareable PVCs (shared disk + migrateSharedDisks=true) has not
+// yet completed.
+func (r *Scheduler) hasActiveSharedDiskCreators() (bool, error) {
+	for _, vmStatus := range r.Plan.Status.Migration.VMs {
+		if vmStatus.HasCondition(Canceled) || vmStatus.MarkedCompleted() {
+			continue
+		}
+		vm := &model.VM{}
+		if err := r.Source.Inventory.Find(vm, vmStatus.Ref); err != nil {
+			return false, err
+		}
+		if vm.HasSharedDisk() && r.migratesSharedDisks(vmStatus) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// migratesSharedDisks resolves the effective migrateSharedDisks setting,
+// checking the per-VM override first, then the plan-level default.
+func (r *Scheduler) migratesSharedDisks(vmStatus *plan.VMStatus) bool {
+	if specVM, found := r.Plan.Spec.FindVM(vmStatus.Ref); found && specVM.MigrateSharedDisks != nil {
+		return *specVM.MigrateSharedDisks
+	}
+	return r.Plan.Spec.MigrateSharedDisks
+}
+
 func (r *Scheduler) cost(vm *model.VM, vmStatus *plan.VMStatus) int {
-	useV2vForTransfer, _ := r.Plan.ShouldUseV2vForTransfer()
-	if useV2vForTransfer {
+	useV2vForTransfer, _ := r.Plan.ShouldUseV2vForTransfer(vmStatus.Ref)
+	if useV2vForTransfer || r.Plan.IsUsingOffloadPlugin() {
 		switch vmStatus.Phase {
 		case CreateVM, PostHook, Completed:
 			// In these phases we already have the disk transferred and are left only to create the VM
@@ -245,7 +277,8 @@ func (r *Scheduler) cost(vm *model.VM, vmStatus *plan.VMStatus) int {
 func (r *Scheduler) finishedDisks(vmStatus *plan.VMStatus) int {
 	var resp = 0
 	for _, step := range vmStatus.Pipeline {
-		if step.Name == DiskTransfer {
+		switch step.Name {
+		case DiskTransfer, DiskTransferV2v, DiskAllocation:
 			for _, task := range step.Tasks {
 				if task.Phase == Completed {
 					resp += 1

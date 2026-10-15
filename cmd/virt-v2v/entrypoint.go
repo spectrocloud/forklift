@@ -32,46 +32,83 @@ func main() {
 		os.Exit(1)
 	}
 
-	// virt-v2v or virt-v2v-in-place
-	if convert.IsInPlace {
-		err = convert.RunVirtV2vInPlace()
-	} else {
-		err = convert.RunVirtV2v()
-	}
-	if err != nil {
-		fmt.Println("Failed to execute virt-v2v command", err)
-		os.Exit(1)
-	}
-
-	// virt-v2v-inspector
-	err = convert.RunVirtV2VInspection()
-	if err != nil {
-		fmt.Println("Failed to inspect the disk", err)
-		os.Exit(1)
-	}
-	inspection, err := utils.GetInspectionV2vFromFile(convert.InspectionOutputFile)
-	if err != nil {
-		fmt.Println("Failed to get inspection file", err)
-		os.Exit(1)
-	}
-
-	// virt-customize
-	err = convert.RunCustomize(inspection.OS)
-	if err != nil {
-		fmt.Println("Failed to customize the VM", err)
-	}
-	// In the remote migrations we can not connect to the conversion pod from the controller.
-	// This connection is needed for to get the additional configuration which is gathered either form virt-v2v or
-	// virt-v2v-inspector. We expose those parameters via server in this pod and once the controller gets the config
-	// the controller sends the request to terminate the pod.
-	if convert.IsLocalMigration {
-		s := server.Server{
-			AppConfig: env,
-		}
-		err = s.Start()
+	// Check if remote inspection of VMs should run
+	if env.IsRemoteInspection {
+		err = convert.RunRemoteV2vInspection()
 		if err != nil {
-			fmt.Println("failed to run the server", err)
+			fmt.Println("Failed to execute virt-v2v-inspector command", err)
 			os.Exit(1)
+		}
+	} else {
+		// virt-v2v or virt-v2v-in-place
+		if convert.IsInPlace {
+			// Choose in-place conversion method based on available configuration:
+			// - If LibvirtUrl is set: fetch domain XML from libvirt and use -i libvirtxml mode
+			// - Otherwise: use -i disk mode directly on the mounted disks (e.g., EC2)
+			if convert.LibvirtUrl != "" {
+				// fetch xml description of the guest from libvirt to help virt-v2v make the conversion
+				err = func() error {
+					domainXML, err := convert.GetDomainXML()
+					if err != nil {
+						return fmt.Errorf("failed to get domain XML: %v", err)
+					}
+
+					err = os.WriteFile(convert.LibvirtDomainFile, []byte(domainXML), 0644)
+					if err != nil {
+						return fmt.Errorf("failed to write domain XML file: %v", err)
+					}
+					return nil
+				}()
+				if err == nil {
+					err = convert.RunVirtV2vInPlace()
+				}
+			} else {
+				// No libvirt URL - use disk mode directly on mounted disks
+				err = convert.RunVirtV2vInPlaceDisk()
+			}
+		} else {
+			err = convert.RunVirtV2v()
+		}
+		if err != nil {
+			fmt.Println("Failed to execute virt-v2v command", err)
+			os.Exit(1)
+		}
+
+		// virt-v2v-inspector
+		err = convert.RunVirtV2VInspection()
+		if err != nil {
+			fmt.Println("Failed to inspect the disk", err)
+			os.Exit(1)
+		}
+		inspection, err := utils.GetInspectionV2vFromFile(convert.InspectionOutputFile)
+		if err != nil {
+			fmt.Println("Failed to get inspection file", err)
+			os.Exit(1)
+		}
+
+		// virt-customize
+		err = convert.RunCustomize(inspection.OS)
+		if err != nil {
+			warningMsg := fmt.Sprintf("VM customization failed: %v. Migration will proceed but customization was not applied successfully.", err)
+			fmt.Println("WARNING:", warningMsg)
+			server.AddWarning(server.Warning{
+				Reason:  "CustomizationFailed",
+				Message: warningMsg,
+			})
+		}
+		// In the remote migrations we can not connect to the conversion pod from the controller.
+		// This connection is needed for to get the additional configuration which is gathered either form virt-v2v or
+		// virt-v2v-inspector. We expose those parameters via server in this pod and once the controller gets the config
+		// the controller sends the request to terminate the pod.
+		if convert.IsLocalMigration {
+			s := server.Server{
+				AppConfig: env,
+			}
+			err = s.Start()
+			if err != nil {
+				fmt.Println("failed to run the server", err)
+				os.Exit(1)
+			}
 		}
 	}
 }

@@ -1,49 +1,151 @@
 package io.konveyor.forklift.vmware
- 
-test_unsupported_el6_64 {
-    mock_vm := { "name": "test",
-                 "guestId": "rhel6_64Guest"
-                }
-    results = concerns with input as mock_vm
-    count(results) == 1
+
+import rego.v1
+
+test_unsupported_el6_64 if {
+	mock_vm := {
+		"name": "test",
+		"guestId": "rhel6_64Guest",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 1
 }
 
-test_supported_el7 {
-    mock_vm := { "name": "test",
-                 "guestId": "rhel7_64Guest"
-                }
-    results = concerns with input as mock_vm
-    count(results) == 0
+test_unsupported_el6_64_by_guestName if {
+	mock_vm := {
+		"name": "test",
+		"guestNameFromVmwareTools": "Red Hat Enterprise Linux 6 (64-bit)",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 1
 }
 
-test_unsupported_el6 {
-    mock_vm := { "name": "test",
-                 "guestId": "rhel6Guest"
-                }
-    results = concerns with input as mock_vm
-    count(results) == 1
+test_unsupported_el6 if {
+	mock_vm := {
+		"name": "test",
+		"guestId": "rhel6Guest",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 1
 }
 
-test_supported_windows {
-    mock_vm := { "name": "test",
-                 "guestId": "windows11_64Guest"
-                }
-    results = concerns with input as mock_vm
-    count(results) == 0
+test_unsupported_el6_by_guestName if {
+	mock_vm := {
+		"name": "test",
+		"guestNameFromVmwareTools": "Red Hat Enterprise Linux 6 (32-bit)",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 1
 }
 
-test_unsupported_photonOS {
-    mock_vm := { "name": "test",
-                 "guestId": "photonGuest"
-                }
-    results = concerns with input as mock_vm
-    count(results) == 1
+test_unsupported_photonOS if {
+	mock_vm := {
+		"name": "test",
+		"guestId": "photonGuest",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 1
 }
 
-test_unsupported_photonOS_64 {
-    mock_vm := { "name": "test",
-                 "guestId": "vmwarePhoton64Guest"
-                }
-    results = concerns with input as mock_vm
-    count(results) == 1
+test_unsupported_photonOS_by_guestName if {
+	mock_vm := {
+		"name": "test",
+		"guestNameFromVmwareTools": "VMware Photon OS (32-bit)",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 1
+}
+
+test_unsupported_photonOS_64 if {
+	mock_vm := {
+		"name": "test",
+		"guestId": "vmwarePhoton64Guest",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 1
+}
+
+test_unsupported_photonOS_64_by_guestName if {
+	mock_vm := {
+		"name": "test",
+		"guestNameFromVmwareTools": "VMware Photon OS (64-bit)",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 1
+}
+
+test_supported_el7 if {
+	mock_vm := {
+		"name": "test",
+		"guestId": "rhel7_64Guest",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 0
+}
+
+test_supported_rhel9_by_guestName if {
+	mock_vm := {
+		"name": "test",
+		"guestName": "Red Hat Enterprise Linux 9 (64-bit)",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 0
+}
+
+test_supported_el7_by_vmwareTools_guestName if {
+	mock_vm := {
+		"name": "test",
+		"guestNameFromVmwareTools": "Red Hat Enterprise Linux 7 (64-bit)",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 0
+}
+
+test_supported_windows if {
+	mock_vm := {
+		"name": "test",
+		"guestId": "windows11_64Guest",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 0
+}
+
+test_supported_windows_2025 if {
+	mock_vm := {
+		"name": "test",
+		"guestId": "windows2022srvNext_64Guest",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 0
+}
+
+
+test_supported_windows_2025_by_guestName if {
+	mock_vm := {
+		"name": "test",
+		"guestNameFromVmwareTools": "Microsoft Windows Server 2025 (64-bit)",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 0
+}
+
+# Test that guestNameFromVmwareTools takes precedence when non-empty
+test_guestNameFromVmwareTools_takes_precedence_when_non_empty if {
+	mock_vm := {
+		"guestNameFromVmwareTools": "Red Hat Enterprise Linux 9 (64-bit)",
+		"guestName": "Red Hat Enterprise Linux 6 (64-bit)",
+	}
+	results = concerns with input as mock_vm
+	# Should NOT raise flag because guestNameFromVmwareTools indicates supported OS. guestName should be ignored
+	count(results) == 0
+}
+
+# Test that guestName doesn't takes precedence when non-empty
+test_guestName_not_takes_precedence_when_non_empty if {
+	mock_vm := {
+		"guestNameFromVmwareTools": "Red Hat Enterprise Linux 6 (64-bit)",
+		"guestName": "Red Hat Enterprise Linux 9 (64-bit)",
+	}
+	results = concerns with input as mock_vm
+	count(results) == 1
 }

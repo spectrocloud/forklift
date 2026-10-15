@@ -508,15 +508,13 @@ func TestCascade(t *testing.T) {
 	n, _ = DB.Count(&DetailC{}, nil)
 	g.Expect(n).To(gomega.Equal(int64(27)))
 
-	for i := 0; i < 10; i++ {
-		time.Sleep(time.Millisecond * 10)
-		if len(handler.deleted) != 40 {
-			continue
-		} else {
-			break
-		}
+	// Watches apply deletes asynchronously; allow enough time for CI and slow hosts.
+	const wantDeleted = 40
+	deadline := time.Now().Add(5 * time.Second)
+	for len(handler.deleted) != wantDeleted && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
 	}
-	g.Expect(len(handler.deleted)).To(gomega.Equal(40))
+	g.Expect(len(handler.deleted)).To(gomega.Equal(wantDeleted))
 
 }
 
@@ -997,12 +995,12 @@ func TestWatch(t *testing.T) {
 		time.Sleep(time.Millisecond * 10)
 		if len(handlerA.created) != N ||
 			len(handlerA.updated) != N ||
-			len(handlerA.created) != N ||
+			len(handlerA.deleted) != N ||
 			len(handlerB.created) != N ||
 			len(handlerB.updated) != N ||
-			len(handlerB.created) != N ||
+			len(handlerB.deleted) != N ||
 			len(handlerC.created) != N ||
-			len(handlerC.created) != N {
+			len(handlerC.deleted) != N {
 			continue
 		} else {
 			break

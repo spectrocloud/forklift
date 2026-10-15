@@ -18,22 +18,30 @@ package plan
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"sort"
+	"strings"
 	"time"
 
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	planapi "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
 	"github.com/kubev2v/forklift/pkg/controller/base"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
+	"github.com/kubev2v/forklift/pkg/controller/plan/util"
 	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
 	libref "github.com/kubev2v/forklift/pkg/lib/ref"
 	metrics "github.com/kubev2v/forklift/pkg/monitoring/metrics/forklift-controller"
 	"github.com/kubev2v/forklift/pkg/settings"
+	core "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/storage/names"
+	cdi "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -56,6 +64,18 @@ var log = logging.WithName(Name)
 // Application settings.
 var Settings = &settings.Settings
 
+// blockerGracePeriod returns how long Critical/Error blocker conditions must
+// persist before an actively executing migration is failed (ForkliftController
+// controller_blocker_grace_period_minutes / BLOCKER_GRACE_PERIOD_MINUTES).
+// If settings were not loaded (e.g. unit tests), defaults to 5 minutes.
+func blockerGracePeriod() time.Duration {
+	m := Settings.Migration.BlockerGracePeriodMinutes
+	if m <= 0 {
+		return 5 * time.Minute
+	}
+	return time.Duration(m) * time.Minute
+}
+
 // Creates a new Plan Controller and adds it to the Manager.
 func Add(mgr manager.Manager) error {
 	reconciler := &Reconciler{
@@ -64,12 +84,14 @@ func Add(mgr manager.Manager) error {
 			Client:        mgr.GetClient(),
 			Log:           log,
 		},
+		APIReader: mgr.GetAPIReader(),
 	}
 	cnt, err := controller.New(
 		Name,
 		mgr,
 		controller.Options{
-			Reconciler: reconciler,
+			Reconciler:              reconciler,
+			MaxConcurrentReconciles: Settings.MaxConcurrentReconciles,
 		})
 	if err != nil {
 		log.Trace(err)
@@ -159,6 +181,7 @@ var _ reconcile.Reconciler = &Reconciler{}
 // Reconciles a Plan object.
 type Reconciler struct {
 	base.Reconciler
+	APIReader client.Reader
 }
 
 // Reconcile a Plan CR.
@@ -179,11 +202,13 @@ func (r Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (r
 
 	// Fetch the CR.
 	plan := &api.Plan{}
-	err = r.Get(context.TODO(), request.NamespacedName, plan)
+	err = r.APIReader.Get(context.TODO(), request.NamespacedName, plan)
 	if err != nil {
 		if k8serr.IsNotFound(err) {
-			r.Log.Info("Plan deleted.")
+			r.Log.Info("Plan deleted, cleaning up orphaned resources.")
+			r.cleanupOrphanedResources(request.Name, request.Namespace)
 			err = nil
+			return
 		}
 		return
 	}
@@ -194,6 +219,14 @@ func (r Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (r
 	// Don't reconcile if the plan is archived.
 	if plan.Spec.Archived && plan.Status.HasCondition(Archived) {
 		r.Log.Info("Aborting reconcile of archived plan.")
+		return
+	}
+
+	// Don't reconcile succeeded plans unless they need archiving.
+	if plan.Status.HasCondition(Succeeded) && !plan.Spec.Archived {
+		r.Log.V(1).Info("Skipping reconcile of succeeded plan.", "plan", plan.Name)
+		result.RequeueAfter = 0
+		err = nil
 		return
 	}
 
@@ -247,19 +280,11 @@ func (r Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (r
 	// End staging conditions.
 	plan.Status.EndStagingConditions()
 
-	if err = r.updatePlanStatus(plan); err != nil {
-		r.Log.Error(err, "failed to update plan status")
-		return
-	}
-
 	//
 	// Execute.
 	// The plan is updated as needed to reflect status.
 	result.RequeueAfter, err = r.execute(plan)
 	if err != nil {
-		if updateErr := r.updatePlanStatus(plan); updateErr != nil {
-			r.Log.Error(err, "failed to update plan status")
-		}
 		return
 	}
 
@@ -275,32 +300,15 @@ func (r *Reconciler) updatePlanStatus(plan *api.Plan) error {
 	// Record events.
 	r.Record(plan, plan.Status.Conditions)
 
-	// Try to fetch latest version first to get current ResourceVersion
-	latest := &api.Plan{}
-	key := client.ObjectKeyFromObject(plan)
-	if err := r.Get(context.TODO(), key, latest); err != nil {
-		r.Log.V(1).Info("Failed to fetch latest plan version, trying update with current version",
-			"plan", plan.Name, "error", err.Error())
-
-		// Fallback: try update with current plan
-		plan.Status.ObservedGeneration = plan.Generation
-		if updateErr := r.Status().Update(context.TODO(), plan.DeepCopy()); updateErr != nil {
-			r.Log.Error(updateErr, "Failed to update plan status with current version")
-			return updateErr
-		}
-		return nil
-	}
-
-	// Preserve our status changes but use latest ResourceVersion and Generation
-	latest.Status = plan.Status
-	latest.Status.ObservedGeneration = latest.Generation
+	// Apply changes.
+	plan.Status.ObservedGeneration = plan.Generation
 
 	// At this point, the plan contains data that is not persisted by design, like the Referenced data
 	// and the staged flags in the status, and more data that has been loaded in the validate function,
 	// like the name of the VMs in the spec section, therefore we don't want the plan to be overridden
 	// by data from the server (even the spec section is overridden) and so we pass a copy of the plan
-	if err := r.Status().Update(context.TODO(), latest.DeepCopy()); err != nil {
-		r.Log.Error(err, "Failed to update plan status with latest ResourceVersion")
+	if err := r.Status().Update(context.TODO(), plan.DeepCopy()); err != nil {
+		r.Log.Error(err, "Failed to update plan status", "plan", plan)
 		return err
 	}
 
@@ -344,6 +352,14 @@ func (r *Reconciler) archive(plan *api.Plan) {
 	if err != nil {
 		r.Log.Error(err, "Couldn't construct plan context while archiving plan.")
 	} else {
+		snapshot := plan.Status.Migration.ActiveSnapshot()
+		if snapshot.Migration.UID != "" {
+			migration := &api.Migration{}
+			migration.UID = snapshot.Migration.UID
+			migration.Name = snapshot.Migration.Name
+			migration.Namespace = snapshot.Migration.Namespace
+			ctx.SetMigration(migration)
+		}
 		runner := Migration{Context: ctx}
 		runner.Archive()
 	}
@@ -367,8 +383,19 @@ func (r *Reconciler) archive(plan *api.Plan) {
 //  5. If a new migration is being started, update the context and snapshot.
 //  6. Run the migration.
 func (r *Reconciler) execute(plan *api.Plan) (reQ time.Duration, err error) {
+	defer func() {
+		if err == nil {
+			err = r.updatePlanStatus(plan)
+			if err != nil {
+				err = liberr.Wrap(err)
+			}
+		}
+	}()
 	conditionRequiresReQ := plan.Status.HasReQCondition()
 	if plan.Status.HasBlockerCondition() || plan.Status.HasCondition(Archived) || conditionRequiresReQ {
+		if plan.Status.HasBlockerCondition() {
+			r.failExecutingMigrationOnBlocker(plan)
+		}
 		if conditionRequiresReQ || plan.Status.HasBlockerCondition() {
 			r.Log.Info(
 				"Found a condition requiring re-reconcile.",
@@ -381,14 +408,7 @@ func (r *Reconciler) execute(plan *api.Plan) (reQ time.Duration, err error) {
 		}
 		return
 	}
-	defer func() {
-		if err == nil {
-			err = r.updatePlanStatus(plan)
-			if err != nil {
-				err = liberr.Wrap(err)
-			}
-		}
-	}()
+
 	ctx, err := plancontext.New(r, plan, r.Log)
 	if err != nil {
 		return
@@ -468,7 +488,6 @@ func (r *Reconciler) execute(plan *api.Plan) (reQ time.Duration, err error) {
 	if migration == nil {
 		r.Log.Info("No pending migrations found.")
 		plan.Status.DeleteCondition(Executing)
-		reQ = base.SlowReQ
 		return
 	}
 
@@ -509,6 +528,97 @@ func (r *Reconciler) execute(plan *api.Plan) (reQ time.Duration, err error) {
 	return
 }
 
+// Fail an actively executing migration when blocker conditions appear.
+// Conditions must have persisted for at least the configured grace period to
+// allow transient issues (e.g. brief provider blips) to self-resolve.
+func (r *Reconciler) failExecutingMigrationOnBlocker(plan *api.Plan) {
+	// Only act on snapshots that are mid-execution and not yet terminal.
+	if len(plan.Status.Migration.History) == 0 {
+		return
+	}
+	snapshot := plan.Status.Migration.ActiveSnapshot()
+	if !snapshot.HasCondition(Executing) {
+		return
+	}
+	if snapshot.HasAnyCondition(Failed, Canceled, Succeeded) {
+		return
+	}
+
+	grace := blockerGracePeriod()
+	reason := criticalOrErrorCondition(plan, grace)
+	if reason == "" {
+		r.Log.Info(
+			"Blocker condition detected but still within grace period, will recheck.",
+			"name", plan.GetName(),
+			"namespace", plan.GetNamespace(),
+			"gracePeriod", grace)
+		return
+	}
+
+	r.Log.Info(
+		"Failing active migration due to blocker condition during execution.",
+		"name", plan.GetName(),
+		"namespace", plan.GetNamespace(),
+		"reason", reason)
+
+	failedCondition := libcnd.Condition{
+		Type:     Failed,
+		Status:   True,
+		Category: api.CategoryAdvisory,
+		Message:  "The migration has FAILED due to a validation blocker: " + reason,
+		Durable:  true,
+	}
+
+	// Transition snapshot and plan to Failed.
+	plan.Status.Migration.MarkCompleted()
+	snapshot.DeleteCondition(Executing)
+	snapshot.SetCondition(failedCondition)
+	// Set on plan directly, the normal snapshot→plan reflection loop is not reached on early return.
+	plan.Status.DeleteCondition(Executing)
+	plan.Status.SetCondition(failedCondition)
+
+	// Fail all in-flight VMs, skip those already terminal.
+	for _, vm := range plan.Status.Migration.VMs {
+		if vm.HasAnyCondition(Succeeded, Failed, Canceled) {
+			continue
+		}
+		vm.SetCondition(failedCondition)
+		vm.AddError(failedCondition.Message)
+		vm.Phase = api.PhaseCompleted
+		vm.MarkCompleted()
+		markStartedStepsCompleted(vm)
+	}
+}
+
+// Collect human-readable messages from Critical/Error conditions on the plan
+// that have persisted for at least the given grace period. Returns an empty
+// string when no qualifying conditions exist (either none are present or all
+// are still within the grace window).
+func criticalOrErrorCondition(plan *api.Plan, gracePeriod time.Duration) string {
+	now := time.Now()
+	var messages []string
+	for _, cnd := range plan.Status.Conditions.List {
+		if cnd.Status != True {
+			continue
+		}
+		if cnd.Category != Critical && cnd.Category != Error {
+			continue
+		}
+		if now.Sub(cnd.LastTransitionTime.Time) < gracePeriod {
+			continue
+		}
+		msg := cnd.Message
+		if msg == "" {
+			msg = fmt.Sprintf("%s (category=%s, reason=%s)", cnd.Type, cnd.Category, cnd.Reason)
+		}
+		messages = append(messages, msg)
+	}
+	if len(messages) == 0 {
+		return ""
+	}
+	return strings.Join(messages, "; ")
+}
+
 // Create a new snapshot.
 // Return: The new active snapshot.
 func (r *Reconciler) newSnapshot(ctx *plancontext.Context) *planapi.Snapshot {
@@ -520,7 +630,9 @@ func (r *Reconciler) newSnapshot(ctx *plancontext.Context) *planapi.Snapshot {
 	snapshot.Provider.Source.With(plan.Referenced.Provider.Source)
 	snapshot.Provider.Destination.With(plan.Referenced.Provider.Destination)
 	snapshot.Map.Network.With(plan.Referenced.Map.Network)
-	snapshot.Map.Storage.With(plan.Referenced.Map.Storage)
+	if plan.Spec.Type != api.MigrationOnlyConversion {
+		snapshot.Map.Storage.With(plan.Referenced.Map.Storage)
+	}
 	plan.Status.Migration.NewSnapshot(snapshot)
 	log.V(1).Info(
 		"Snapshot created.",
@@ -567,7 +679,7 @@ func (r *Reconciler) matchSnapshot(ctx *plancontext.Context) (matched bool) {
 		log.Info("Snapshot: networkMap not matched.")
 		return false
 	}
-	if !snapshot.Map.Storage.Match(plan.Referenced.Map.Storage) {
+	if plan.Spec.Type != api.MigrationOnlyConversion && !snapshot.Map.Storage.Match(plan.Referenced.Map.Storage) {
 		log.Info("Snapshot: storageMap not matched.")
 		return false
 	}
@@ -780,4 +892,73 @@ func (r *Reconciler) postpone() (postpone bool, err error) {
 	}
 
 	return
+}
+
+// cleanupOrphanedResources removes migration resources left behind when a Plan
+// is deleted. Resources are found by plan-name and plan-namespace labels.
+func (r *Reconciler) cleanupOrphanedResources(planName, planNamespace string) {
+	labels := client.MatchingLabels{
+		kPlanName:      planName,
+		kPlanNamespace: planNamespace,
+	}
+
+	r.deleteOrphanedResources(&core.PersistentVolumeClaimList{}, labels, "PVC", true)
+	r.deleteOrphanedResources(&cdi.DataVolumeList{}, labels, "DataVolume", true)
+	r.deleteOrphanedResources(&core.PodList{}, labels, "Pod", false)
+	r.deleteOrphanedResources(&core.SecretList{}, labels, "Secret", false)
+	r.deleteOrphanedResources(&core.ConfigMapList{}, labels, "ConfigMap", false)
+	r.deleteOrphanedResources(&core.PersistentVolumeList{}, labels, "PV", false)
+
+	r.Log.Info(
+		"Orphaned resource cleanup completed.",
+		"plan", planName,
+		"namespace", planNamespace)
+}
+
+// deleteOrphanedResources lists resources matching labels and deletes them.
+// When preserveVMOwned is true, resources owned by a VirtualMachine are preserved.
+func (r *Reconciler) deleteOrphanedResources(list client.ObjectList, labels client.MatchingLabels, kind string, preserveVMOwned bool) {
+	if err := r.List(context.TODO(), list, labels); err != nil {
+		r.Log.Error(err, "Failed to list resources for cleanup.", "kind", kind)
+		return
+	}
+	_ = apimeta.EachListItem(list, func(obj runtime.Object) error {
+		resource, ok := obj.(client.Object)
+		if !ok {
+			r.Log.Error(nil, "Unexpected object type during cleanup.", "kind", kind)
+			return nil
+		}
+		// Preserve resources already owned by a migrated VirtualMachine.
+		if preserveVMOwned && hasVMOwner(resource.GetOwnerReferences()) {
+			r.Log.V(1).Info(
+				"Skipping resource owned by VirtualMachine.",
+				"kind", kind,
+				"name", resource.GetName(),
+				"namespace", resource.GetNamespace())
+			return nil
+		}
+		if err := r.Delete(context.TODO(), resource); err != nil {
+			if !k8serr.IsNotFound(err) {
+				r.Log.Error(err, "Failed to delete resource.",
+					"kind", kind,
+					"name", resource.GetName(),
+					"namespace", resource.GetNamespace())
+			}
+		} else {
+			r.Log.Info("Deleted orphaned resource.",
+				"kind", kind,
+				"name", resource.GetName(),
+				"namespace", resource.GetNamespace())
+		}
+		return nil
+	})
+}
+
+func hasVMOwner(owners []meta.OwnerReference) bool {
+	for _, owner := range owners {
+		if owner.Kind == util.VirtualMachineKind {
+			return true
+		}
+	}
+	return false
 }

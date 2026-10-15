@@ -1,6 +1,8 @@
 package vsphere
 
 import (
+	"strconv"
+
 	"github.com/kubev2v/forklift/pkg/controller/provider/model/base"
 	libmodel "github.com/kubev2v/forklift/pkg/lib/inventory/model"
 )
@@ -26,6 +28,15 @@ const (
 	ProtocolPCIe         ProtocolType = "PCIe"         // PCI Express storage interface
 	ProtocolRDMA         ProtocolType = "RDMA"         // Remote Direct Memory Access
 	ProtocolTCP          ProtocolType = "TCP"          // Generic TCP-based adapter
+)
+
+// Bus types
+const (
+	NVME = "nvme"
+	USB  = "usb"
+	SATA = "sata"
+	SCSI = "scsi"
+	IDE  = "ide"
 )
 
 // Errors
@@ -142,10 +153,12 @@ type Host struct {
 	Status             string             `sql:""`
 	InMaintenanceMode  bool               `sql:""`
 	ManagementServerIp string             `sql:""`
+	ManagementIPs      []string           `sql:""`
 	Thumbprint         string             `sql:""`
 	Timezone           string             `sql:""`
 	CpuSockets         int16              `sql:""`
 	CpuCores           int16              `sql:""`
+	MemoryBytes        int64              `sql:""`
 	ProductName        string             `sql:""`
 	ProductVersion     string             `sql:""`
 	Model              string             `sql:""`
@@ -240,12 +253,14 @@ type PNIC struct {
 }
 
 type VNIC struct {
-	Key        string `json:"key"`
-	PortGroup  string `json:"portGroup"`
-	DPortGroup string `json:"dPortGroup"`
-	IpAddress  string `json:"ipAddress"`
-	SubnetMask string `json:"subnetMask"`
-	MTU        int32  `json:"mtu"`
+	Key         string   `json:"key"`
+	Device      string   `json:"device"`
+	PortGroup   string   `json:"portGroup"`
+	DPortGroup  string   `json:"dPortGroup"`
+	IpAddress   string   `json:"ipAddress"`
+	IpV6Address []string `json:"ipV6Address"`
+	SubnetMask  string   `json:"subnetMask"`
+	MTU         int32    `json:"mtu"`
 }
 
 type PortGroup struct {
@@ -283,50 +298,61 @@ type Datastore struct {
 	Free                int64    `sql:""`
 	MaintenanceMode     string   `sql:""`
 	BackingDevicesNames []string `sql:""`
+	NasRemoteHost       string   `sql:""`
+	NasRemotePath       string   `sql:""`
+	NasRemoteHostNames  []string `sql:""`
 }
 
 type VM struct {
 	Base
-	Folder                   string         `sql:"d0,index(folder)"`
-	Host                     string         `sql:"d0,index(host)"`
-	RevisionValidated        int64          `sql:"d0,index(revisionValidated)"`
-	PolicyVersion            int            `sql:"d0,index(policyVersion)"`
-	UUID                     string         `sql:""`
-	Firmware                 string         `sql:""`
-	PowerState               string         `sql:""`
-	ConnectionState          string         `sql:""`
-	CpuAffinity              []int32        `sql:""`
-	CpuHotAddEnabled         bool           `sql:""`
-	CpuHotRemoveEnabled      bool           `sql:""`
-	MemoryHotAddEnabled      bool           `sql:""`
-	FaultToleranceEnabled    bool           `sql:""`
-	CpuCount                 int32          `sql:""`
-	CoresPerSocket           int32          `sql:""`
-	MemoryMB                 int32          `sql:""`
-	GuestName                string         `sql:""`
-	GuestNameFromVmwareTools string         `sql:""`
-	HostName                 string         `sql:""`
-	GuestID                  string         `sql:""`
-	BalloonedMemory          int32          `sql:""`
-	IpAddress                string         `sql:""`
-	NumaNodeAffinity         []string       `sql:""`
-	StorageUsed              int64          `sql:""`
-	Snapshot                 Ref            `sql:""`
-	IsTemplate               bool           `sql:""`
-	ChangeTrackingEnabled    bool           `sql:""`
-	TpmEnabled               bool           `sql:""`
-	Devices                  []Device       `sql:""`
-	NICs                     []NIC          `sql:""`
-	Disks                    []Disk         `sql:""`
-	Controllers              []Controller   `sql:""`
-	Networks                 []Ref          `sql:""`
-	Concerns                 []Concern      `sql:""`
-	GuestNetworks            []GuestNetwork `sql:""`
-	GuestDisks               []GuestDisk    `sql:""`
-	GuestIpStacks            []GuestIpStack `sql:""`
-	SecureBoot               bool           `sql:""`
-	DiskEnableUuid           bool           `sql:""`
-	NestedHVEnabled          bool           `sql:""`
+	Folder                   string             `sql:"d0,index(folder)"`
+	Host                     string             `sql:"d0,index(host)"`
+	RevisionValidated        int64              `sql:"d0,index(revisionValidated)"`
+	PolicyVersion            int                `sql:"d0,index(policyVersion)"`
+	UUID                     string             `sql:""`
+	InstanceUUID             string             `sql:""`
+	Firmware                 string             `sql:""`
+	PowerState               string             `sql:""`
+	ConnectionState          string             `sql:""`
+	CpuAffinity              []int32            `sql:""`
+	CpuHotAddEnabled         bool               `sql:""`
+	CpuHotRemoveEnabled      bool               `sql:""`
+	MemoryHotAddEnabled      bool               `sql:""`
+	FaultToleranceEnabled    bool               `sql:""`
+	CpuCount                 int32              `sql:""`
+	CoresPerSocket           int32              `sql:""`
+	MemoryMB                 int32              `sql:""`
+	GuestName                string             `sql:""`
+	GuestNameFromVmwareTools string             `sql:""`
+	HostName                 string             `sql:""`
+	GuestID                  string             `sql:""`
+	BalloonedMemory          int32              `sql:""`
+	IpAddress                string             `sql:""`
+	NumaNodeAffinity         []string           `sql:""`
+	StorageUsed              int64              `sql:""`
+	Snapshot                 Ref                `sql:""`
+	IsTemplate               bool               `sql:""`
+	ChangeTrackingEnabled    bool               `sql:""`
+	TpmEnabled               bool               `sql:""`
+	Devices                  []Device           `sql:""`
+	PciBridges               []PciBridge        `sql:""`
+	NICs                     []NIC              `sql:""`
+	Disks                    []Disk             `sql:""`
+	Controllers              []Controller       `sql:""`
+	Networks                 []Ref              `sql:""`
+	Concerns                 []Concern          `sql:""`
+	GuestNetworks            []GuestNetwork     `sql:""`
+	GuestDisks               []DiskMountPoint   `sql:""`
+	GuestIpStacks            []GuestIpStack     `sql:""`
+	SecureBoot               bool               `sql:""`
+	ToolsStatus              string             `sql:""`
+	ToolsRunningStatus       string             `sql:""`
+	ToolsVersionStatus       string             `sql:""`
+	DiskEnableUuid           bool               `sql:""`
+	NestedHVEnabled          bool               `sql:""`
+	CustomValues             []CustomFieldValue `sql:""`
+	Tags                     []Tag              `sql:""`
+	ConsolidationNeeded      bool               `sql:""`
 }
 
 // Determine if current revision has been validated.
@@ -336,9 +362,10 @@ func (m *VM) Validated() bool {
 
 // Virtual Controller.
 type Controller struct {
-	Key   int32   `json:"key"`
-	Bus   string  `json:"bus"`
-	Disks []int32 `sql:""`
+	Key       int32   `json:"key"`
+	BusNumber int32   `json:"busNumber"`
+	Bus       string  `json:"bus"`
+	Disks     []int32 `sql:""`
 }
 
 // Virtual Disk.
@@ -346,38 +373,59 @@ type Disk struct {
 	Key                   int32  `json:"key"`
 	UnitNumber            int32  `json:"unitNumber"`
 	ControllerKey         int32  `json:"controllerKey"`
+	BusNumber             int32  `json:"busNumber"`
 	File                  string `json:"file"`
 	Datastore             Ref    `json:"datastore"`
 	Capacity              int64  `json:"capacity"`
 	Shared                bool   `json:"shared"`
 	RDM                   bool   `json:"rdm"`
+	PhysicalMode          bool   `json:"physicalMode,omitempty"`
 	Bus                   string `json:"bus"`
+	BusAddress            string `json:"busAddress,omitempty"` // e.g. scsi0:0
 	Mode                  string `json:"mode,omitempty"`
 	Serial                string `json:"serial,omitempty"`
 	WinDriveLetter        string `json:"winDriveLetter,omitempty"`
 	ChangeTrackingEnabled bool   `json:"changeTrackingEnabled"`
+	ParentFile            string `json:"parent"`
+	DeviceName            string `json:"deviceName,omitempty"`
+	VVolID                string `json:"vvolId,omitempty"`
+	LunUuid               string `json:"lunUuid,omitempty"`
 }
 
 // Virtual Device.
 type Device struct {
-	Kind string `json:"kind"`
+	Kind          string `json:"kind"`
+	Key           int32  `json:"key"`
+	PciSlotNumber int32  `json:"pciSlotNumber"`
+}
+
+// PciBridge represents a virtual PCI bridge from the VM's extraConfig.
+// Used to compute guest-visible PCI addresses from persistent slot numbers.
+type PciBridge struct {
+	Number     int   `json:"number"`
+	SlotNumber int32 `json:"slotNumber"`
+	Functions  int   `json:"functions"`
 }
 
 // Virtual ethernet card.
 type NIC struct {
-	Network Ref    `json:"network"`
-	MAC     string `json:"mac"`
-	Index   int    `json:"order"`
+	Network    Ref    `json:"network"`
+	MAC        string `json:"mac"`
+	Index      int    `json:"order"`
+	DeviceKey  int32  `json:"deviceKey"`
+	PciAddress string `json:"pciAddress"`
 }
 
 // Guest network.
 type GuestNetwork struct {
-	Device       string   `json:"device"`
-	MAC          string   `json:"mac"`
-	IP           string   `json:"ip"`
-	Origin       string   `json:"origin"`
-	PrefixLength int32    `json:"prefix"`
-	DNS          []string `json:"dns"`
+	Device         string   `json:"device"`
+	DeviceConfigId int32    `json:"deviceConfigId"`
+	MAC            string   `json:"mac"`
+	IP             string   `json:"ip"`
+	Origin         string   `json:"origin"`
+	PrefixLength   int32    `json:"prefix"`
+	DNS            []string `json:"dns"`
+	Network        string   `json:"network"`
 }
 
 // Guest ipStack
@@ -390,7 +438,12 @@ type GuestIpStack struct {
 }
 
 // Guest disk.
-type GuestDisk struct {
+type DiskMountPoint struct {
+	// The key of the VirtualDevice.
+	//
+	// `VirtualDevice.key`
+	Key int32 `xml:"key" json:"key"`
+
 	// Name of the virtual disk in the guest operating system.
 	//
 	// For example: C:\\ ( in linux it can by a path like /home ).
@@ -407,4 +460,28 @@ type GuestDisk struct {
 	//
 	// For example NTFS or ext3.
 	FilesystemType string `xml:"filesystemType,omitempty" json:"filesystemType,omitempty"`
+}
+
+type CustomFieldDef struct {
+	Name              string `json:"name"`
+	Key               int32  `json:"key" sql:"pk"`
+	ManagedObjectType string `json:"managedObjectType,omitempty"`
+}
+
+// Get the primary key.
+func (m *CustomFieldDef) Pk() string {
+	return strconv.Itoa(int(m.Key))
+}
+
+type CustomFieldValue struct {
+	Key   int32  `json:"key"`
+	Value string `json:"value"`
+}
+
+type Tag struct {
+	ID          string   `json:"id"`
+	Description string   `json:"description"`
+	Name        string   `json:"name"`
+	CategoryID  string   `json:"categoryID"`
+	UsedBy      []string `json:"usedBy"`
 }
