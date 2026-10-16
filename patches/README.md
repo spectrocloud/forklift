@@ -56,6 +56,8 @@ Typical build, mirroring the mongodb-enterprise pattern:
 | 0008 | virt-v2v tag suffix | The operator bundle passes `VIRT_V2V_IMAGE + PLATFORM_SUFFIX`, so the tag must carry the suffix or the CSV points at an image that does not exist. |
 | 0009 | guard test signature | v2.12.7 dropped the `destinationClient` parameter from `ShouldUseV2vForTransfer`; the guard test is updated to the new call shape. |
 | 0010 | adapt v2.12.9 test | `plan_transfer_test.go` lands in v2.12.9 asserting the vSphere virt-v2v default this fork inverts. The empty-`excludeDisks` case is reasserted as the CDI path. |
+| 0011 | passt as root | libguestfs >= 1.52 gives the appliance its network via passt, which drops to `nobody` before creating its namespaces; the kernel clears capabilities on that setuid, so sandbox setup fails with EPERM and the appliance never gets its network. A wrapper keeps uid 0 in the virt-v2v images. |
+| 0012 | deep-inspection image | Upstream's `build-deep-inspection-image` points at a `Containerfile-upstream` that does not exist. The operator bundle also neither passed nor declared `DEEP_INSPECTION_IMAGE`, so the CSV envsubst'ed it to empty and warm vSphere plans failed preflight inspection with `deep inspection container image is not set`. Fixes the path, restores the target to the all-images aggregates, and wires the ARG through. Deliberately no RHEL9/XFS variant: the pack ships one deep-inspection image, so `deep_inspection_image_xfs_fqin` stays unset. |
 
 Patches 0002-0004 replace six commits from the 2.9.2 line. v2.12.7 ships the
 itinerary/predicate framework the old fork hand-rolled, so the behaviour now
