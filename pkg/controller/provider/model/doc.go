@@ -3,7 +3,6 @@ package model
 import (
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	"github.com/kubev2v/forklift/pkg/controller/provider/model/hyperv"
-	"github.com/kubev2v/forklift/pkg/controller/provider/model/nutanix"
 	"github.com/kubev2v/forklift/pkg/controller/provider/model/ocp"
 	"github.com/kubev2v/forklift/pkg/controller/provider/model/openstack"
 	"github.com/kubev2v/forklift/pkg/controller/provider/model/ovf"
@@ -43,10 +42,6 @@ func Models(provider *api.Provider) (all []interface{}) {
 		all = append(
 			all,
 			ec2model.All()...)
-	case api.Nutanix:
-		all = append(
-			all,
-			nutanix.All()...)
 	}
 
 	return

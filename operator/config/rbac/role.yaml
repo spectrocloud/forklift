@@ -105,9 +105,3 @@ rules:
   - watch
   - update
   - patch
-- apiGroups:
-  - networking.k8s.io
-  resources:
-  - networkpolicies
-  verbs:
-  - '*'

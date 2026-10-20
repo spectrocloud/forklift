@@ -8,6 +8,9 @@ on:
       - "operator/streams/**"
       - "operator/roles/**"
 
+permissions:
+  contents: read
+
 jobs:
   verify-manifests:
     runs-on: ubuntu-latest

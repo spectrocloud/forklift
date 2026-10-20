@@ -7,8 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	crand "crypto/rand"
-	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -70,9 +68,10 @@ type FlashSystemHost struct {
 }
 
 type FlashSystemVolume struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	VdiskUID string `json:"vdisk_UID"` // Unique Identification Number, used for NAA.
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	VdiskUID   string `json:"vdisk_UID"`    // Unique Identification Number, used for NAA.
+	MdiskGrpID string `json:"mdisk_grp_id"` // Pool ID this volume belongs to.
 }
 
 type FlashSystemVolumeHostMapping struct {
@@ -104,14 +103,11 @@ type FlashSystemAPIClient struct {
 	authToken    string // Session token from /auth
 	username     string // Store for re-authentication
 	password     string // Store for re-authentication
-	tokenCache   TokenCache
 	log          klog.Logger
 }
 
 // NewFlashSystemAPIClient creates and authenticates a new API client.
-// If tokenCache is provided, the client will try to use a cached token before authenticating,
-// and will save new tokens to the cache after authentication.
-func NewFlashSystemAPIClient(managementIP, username, password string, sslSkipVerify bool, tokenCache TokenCache) (*FlashSystemAPIClient, error) {
+func NewFlashSystemAPIClient(managementIP, username, password string, sslSkipVerify bool) (*FlashSystemAPIClient, error) {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: sslSkipVerify},
 	}
@@ -122,56 +118,25 @@ func NewFlashSystemAPIClient(managementIP, username, password string, sslSkipVer
 		httpClient:   httpClient,
 		username:     username,
 		password:     password,
-		tokenCache:   tokenCache,
 		log:          logger.New("flashsystem"),
 	}
 
-	if tokenCache != nil {
-		if cached, err := tokenCache.ReadToken(); err == nil && cached != "" {
-			client.log.Info("using cached FlashSystem auth token from shared secret")
-			client.authToken = cached
-			return client, nil
-		}
-	}
-
-	if err := client.authenticateAndCache(); err != nil {
+	// Initial authentication
+	if err := client.authenticate(); err != nil {
 		return nil, fmt.Errorf("initial authentication failed: %w", err)
 	}
 
 	return client, nil
 }
 
-// authenticate handles authentication with retry on 429 (Too Many Requests).
-// Uses exponential backoff + jitter to spread concurrent re-auth attempts.
+// authenticate handles the authentication process using v1 API best practices
 func (c *FlashSystemAPIClient) authenticate() error {
-	var lastStatus int
-	var lastErr error
-	for attempt := 0; attempt <= 3; attempt++ {
-		if attempt > 0 {
-			jitterMs, _ := crand.Int(crand.Reader, big.NewInt(500))
-			backoff := time.Duration(1<<uint(attempt-1))*time.Second +
-				time.Duration(jitterMs.Int64())*time.Millisecond
-			c.log.Info("auth rate limited (429), retrying", "attempt", attempt, "backoff", backoff)
-			time.Sleep(backoff)
-		}
-
-		lastStatus, lastErr = c.doAuthenticate()
-		if lastErr == nil {
-			return nil
-		}
-		if lastStatus != http.StatusTooManyRequests {
-			return lastErr
-		}
-	}
-	return lastErr
-}
-
-func (c *FlashSystemAPIClient) doAuthenticate() (int, error) {
 	authURL := fmt.Sprintf("https://%s:7443/rest/v1/auth", c.ManagementIP)
 
+	// FlashSystem expects username and password via HTTP headers, not JSON body
 	req, err := http.NewRequest("POST", authURL, bytes.NewBuffer([]byte{}))
 	if err != nil {
-		return 0, fmt.Errorf("failed to create auth request: %w", err)
+		return fmt.Errorf("failed to create auth request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -182,72 +147,32 @@ func (c *FlashSystemAPIClient) doAuthenticate() (int, error) {
 	c.log.V(2).Info("authenticating with FlashSystem", "host", c.ManagementIP)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("failed to send auth request to FlashSystem: %w", err)
+		return fmt.Errorf("failed to send auth request to FlashSystem: %w", err)
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return resp.StatusCode, fmt.Errorf("failed to read auth response body: %w", err)
+		return fmt.Errorf("failed to read auth response body: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return resp.StatusCode, fmt.Errorf("FlashSystem authentication failed. Status: %s, Body: %s", resp.Status, string(bodyBytes))
+		return fmt.Errorf("FlashSystem authentication failed. Status: %s, Body: %s", resp.Status, string(bodyBytes))
 	}
 
 	var authResp AuthResponse
 	if err := json.Unmarshal(bodyBytes, &authResp); err != nil {
-		return resp.StatusCode, fmt.Errorf("failed to unmarshal auth token response: %w. Body: %s", err, string(bodyBytes))
+		return fmt.Errorf("failed to unmarshal auth token response: %w. Body: %s", err, string(bodyBytes))
 	}
 
 	if authResp.Token == "" {
-		return resp.StatusCode, fmt.Errorf("FlashSystem authentication successful but no token found in response")
+		return fmt.Errorf("FlashSystem authentication successful but no token found in response")
 	}
 
 	c.authToken = authResp.Token
 
 	c.log.V(2).Info("Successfully authenticated with FlashSystem and obtained session token.")
-	return resp.StatusCode, nil
-}
-
-func (c *FlashSystemAPIClient) authenticateAndCache() error {
-	if err := c.authenticate(); err != nil {
-		return err
-	}
-	if c.tokenCache != nil {
-		if err := c.tokenCache.WriteToken(c.authToken); err != nil {
-			c.log.Info("failed to cache auth token in shared secret (non-fatal)", "error", err)
-		}
-	}
 	return nil
-}
-
-// refreshToken tries to get a fresh token without hitting the auth endpoint.
-// Checks the cache first (another pod may have already refreshed), then
-// uses jitter before re-authenticating to avoid simultaneous auth storms.
-func (c *FlashSystemAPIClient) refreshToken() error {
-	if c.tokenCache == nil {
-		return c.authenticateAndCache()
-	}
-
-	if cached, err := c.tokenCache.ReadToken(); err == nil && cached != "" && cached != c.authToken {
-		c.log.Info("using refreshed token from shared secret (another pod already re-authenticated)")
-		c.authToken = cached
-		return nil
-	}
-
-	jitterMs, _ := crand.Int(crand.Reader, big.NewInt(900))
-	jitter := time.Duration(100+jitterMs.Int64()) * time.Millisecond
-	c.log.Info("waiting before re-authentication", "jitter", jitter)
-	time.Sleep(jitter)
-
-	if cached, err := c.tokenCache.ReadToken(); err == nil && cached != "" && cached != c.authToken {
-		c.log.Info("using refreshed token from shared secret after jitter")
-		c.authToken = cached
-		return nil
-	}
-
-	return c.authenticateAndCache()
 }
 
 // makeRequest is a helper to make authenticated HTTP requests with automatic token refresh.
@@ -255,11 +180,13 @@ func (c *FlashSystemAPIClient) makeRequest(method, path string, payload interfac
 	// Try the request first, and handle 403 (token expiry) by re-authenticating
 	respBodyBytes, statusCode, err := c.doRequest(method, path, payload)
 
-	if statusCode == http.StatusForbidden || statusCode == http.StatusUnauthorized {
-		c.log.Info("received auth error, refreshing token", "status", statusCode)
-		if refreshErr := c.refreshToken(); refreshErr != nil {
-			return nil, statusCode, fmt.Errorf("token refresh failed: %w", refreshErr)
+	// Handle 403 Forbidden - token expired, re-authenticate and retry once
+	if statusCode == http.StatusForbidden {
+		c.log.Info("received 403 forbidden, token likely expired, re-authenticating")
+		if authErr := c.authenticate(); authErr != nil {
+			return nil, statusCode, fmt.Errorf("re-authentication failed: %w", authErr)
 		}
+		// Retry the request with new token
 		return c.doRequest(method, path, payload)
 	}
 
@@ -352,6 +279,27 @@ func (c *FlashSystemAPIClient) GetSystemInfo() (*FlashSystemInfo, error) {
 
 	c.log.V(2).Info("system info", "vdisk_protection_enabled", sysInfo.VdiskProtectionEnabled, "vdisk_protection_time", sysInfo.VdiskProtectionTime)
 	return &sysInfo, nil
+}
+
+// GetPoolProtection queries a single pool's detailed view to check vdisk_protection_enabled.
+// The concise lsmdiskgrp list does not include this field; only lsmdiskgrp/<id> returns it.
+func (c *FlashSystemAPIClient) GetPoolProtection(poolID string) (enabled bool, poolName string, err error) {
+	c.log.V(2).Info("checking pool vdisk protection", "pool_id", poolID)
+	respBytes, status, err := c.makeRequest("POST", "/lsmdiskgrp/"+poolID, map[string]string{})
+	if err != nil || status != http.StatusOK {
+		return false, "", fmt.Errorf("failed to get pool details for id=%s: %w, status: %d", poolID, err, status)
+	}
+
+	var detail struct {
+		Name                   string `json:"name"`
+		VdiskProtectionEnabled string `json:"vdisk_protection_enabled"`
+	}
+	if err := json.Unmarshal(respBytes, &detail); err != nil {
+		return false, "", fmt.Errorf("failed to unmarshal pool details for id=%s: %w", poolID, err)
+	}
+
+	c.log.V(2).Info("pool vdisk protection", "pool_id", poolID, "pool_name", detail.Name, "enabled", detail.VdiskProtectionEnabled)
+	return detail.VdiskProtectionEnabled == "yes", detail.Name, nil
 }
 
 // FlashCopyMapping represents one entry from lsfcmap (list FlashCopy mappings).
@@ -479,9 +427,9 @@ func (c *FlashSystemClonner) GetStorageArrayInfo() populator.StorageArrayInfo {
 // NewFlashSystemClonner creates a new FlashSystemClonner.
 // It checks that vdisk protection is disabled on the FlashSystem; if protection is enabled,
 // it returns an error because it must be off for Virtual Machines (see README, section IBM FlashSystem).
-func NewFlashSystemClonner(managementIP, username, password string, sslSkipVerify bool, tokenCache TokenCache) (FlashSystemClonner, error) {
+func NewFlashSystemClonner(managementIP, username, password string, sslSkipVerify bool) (FlashSystemClonner, error) {
 	log := logger.New("flashsystem")
-	client, err := NewFlashSystemAPIClient(managementIP, username, password, sslSkipVerify, tokenCache)
+	client, err := NewFlashSystemAPIClient(managementIP, username, password, sslSkipVerify)
 	if err != nil {
 		return FlashSystemClonner{}, fmt.Errorf("failed to create FlashSystem API client: %w", err)
 	}
@@ -491,13 +439,7 @@ func NewFlashSystemClonner(managementIP, username, password string, sslSkipVerif
 		return FlashSystemClonner{}, fmt.Errorf("failed to query FlashSystem system info (required to check vdisk protection): %w", err)
 	}
 
-	protectionEnabled := sysInfo.VdiskProtectionEnabled == "yes"
-	log.Info("FlashSystem volume protection settings", "enabled", protectionEnabled, "protection_time_minutes", sysInfo.VdiskProtectionTime)
-
-	if protectionEnabled {
-		log.Error(nil, "vdisk protection must be off on the IBM FlashSystem; read about it in the README in the section 'IBM FlashSystem'")
-		return FlashSystemClonner{}, fmt.Errorf("vdisk protection is enabled on the IBM FlashSystem; it must be disabled")
-	}
+	log.Info("FlashSystem volume protection settings", "system_level", sysInfo.VdiskProtectionEnabled, "protection_time_minutes", sysInfo.VdiskProtectionTime)
 
 	clonner := FlashSystemClonner{
 		api: client,
@@ -952,6 +894,17 @@ func (c *FlashSystemClonner) createLUNFromVDisk(vdiskDetails FlashSystemVolume, 
 	return lun, nil
 }
 
+func (c *FlashSystemClonner) checkPoolVdiskProtection(poolID string) error {
+	enabled, poolName, err := c.api.GetPoolProtection(poolID)
+	if err != nil {
+		return fmt.Errorf("failed to check vdisk protection for pool id=%s: %w", poolID, err)
+	}
+	if enabled {
+		return fmt.Errorf("vdisk protection is enabled on pool '%s' (id=%s); it must be disabled for pools used by migration volumes — see README section 'IBM FlashSystem'", poolName, poolID)
+	}
+	return nil
+}
+
 // ResolvePVToLUN resolves a PersistentVolume to a LUN by finding a volume with matching vdisk_UID.
 func (c *FlashSystemClonner) ResolvePVToLUN(pv populator.PersistentVolume) (populator.LUN, error) {
 	c.log.Info("resolving PV to LUN", "pv", pv.Name, "volume_handle", pv.VolumeHandle)
@@ -992,7 +945,12 @@ func (c *FlashSystemClonner) ResolvePVToLUN(pv populator.PersistentVolume) (popu
 	}
 
 	vdisk := vdisks[0]
-	c.log.V(2).Info("found matching volume", "vdisk", vdisk.Name, "vdisk_id", vdisk.ID, "pv", pv.Name)
+	c.log.V(2).Info("found matching volume", "vdisk", vdisk.Name, "vdisk_id", vdisk.ID, "pool_id", vdisk.MdiskGrpID, "pv", pv.Name)
+
+	if err := c.checkPoolVdiskProtection(vdisk.MdiskGrpID); err != nil {
+		return populator.LUN{}, err
+	}
+
 	return c.createLUNFromVDisk(vdisk, pv.VolumeHandle)
 }
 
@@ -1018,6 +976,11 @@ func (c *FlashSystemClonner) getVDiskByUID(uid string) (*FlashSystemVolume, erro
 	if len(vdisks) > 1 {
 		return nil, fmt.Errorf("multiple volumes (%d) found for vdisk_UID %s", len(vdisks), uid)
 	}
+
+	if err := c.checkPoolVdiskProtection(vdisks[0].MdiskGrpID); err != nil {
+		return nil, err
+	}
+
 	return &vdisks[0], nil
 }
 

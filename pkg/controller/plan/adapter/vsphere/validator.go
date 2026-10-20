@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 
 	k8snet "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
@@ -12,6 +13,7 @@ import (
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
 	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
+	utils "github.com/kubev2v/forklift/pkg/controller/plan/util"
 	ocpmodel "github.com/kubev2v/forklift/pkg/controller/provider/model/ocp"
 	"github.com/kubev2v/forklift/pkg/controller/provider/model/vsphere"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web/base"
@@ -128,15 +130,18 @@ func (r *Validator) PVCNameTemplate(vmRef ref.Ref, pvcNameTemplate string) (ok b
 		return
 	}
 
+	if pvcNameTemplate == "" {
+		return true, nil
+	}
+
 	targetVmName := planbase.ResolveTargetVmName(r.Plan, vm.ID, vm.Name)
 
 	for i, disk := range vm.Disks {
-		testData := api.PVCNameTemplateData{
+		testData := api.VSpherePVCNameTemplateData{
 			VmName:         vm.Name,
 			TargetVmName:   targetVmName,
 			PlanName:       r.Plan.Name,
 			DiskIndex:      i,
-			VmId:           vm.ID,
 			RootDiskIndex:  1,
 			Shared:         false,
 			FileName:       extractDiskFileName(disk.File),
@@ -326,7 +331,7 @@ func (r *Validator) SharedDisks(vmRef ref.Ref, client client.Client) (ok bool, m
 
 	// Check existing PVCs
 	if !r.shouldMigrateSharedDisks(vm) {
-		_, missingDiskPVCs, err := findSharedPVCs(client, vm, r.Plan.Spec.TargetNamespace, string(r.Plan.UID))
+		_, missingDiskPVCs, err := findSharedPVCs(client, vm, r.Plan.Spec.TargetNamespace)
 		if err != nil {
 			return false, "", "", liberr.Wrap(err, "vm", vm)
 		}
@@ -341,7 +346,7 @@ func (r *Validator) SharedDisks(vmRef ref.Ref, client client.Client) (ok bool, m
 		}
 	} else {
 		// Find duplicate already shared disk
-		sharedPVCs, _, err := findSharedPVCs(client, vm, r.Plan.Spec.TargetNamespace, string(r.Plan.UID))
+		sharedPVCs, _, err := findSharedPVCs(client, vm, r.Plan.Spec.TargetNamespace)
 		if err != nil {
 			return false, "", "", liberr.Wrap(err, "vm", vm)
 		}
@@ -402,6 +407,88 @@ func (r *Validator) SharedDisks(vmRef ref.Ref, client client.Client) (ok bool, m
 		}
 	}
 	return true, "", "", nil
+}
+
+// ExcludedDisks reports whether excludeDisks is valid for the VM.
+// Unknown bus addresses and excluding every disk are Critical; excluding the root disk is a Warning.
+func (r *Validator) ExcludedDisks(vmRef ref.Ref) (ok bool, msg string, category string, err error) {
+	planVM, found := r.Plan.Spec.FindVM(vmRef)
+	if !found || len(planVM.ExcludeDisks) == 0 {
+		return true, "", "", nil
+	}
+	vm := &model.VM{}
+	err = r.Source.Inventory.Find(vm, vmRef)
+	if err != nil {
+		return false, "", "", liberr.Wrap(err, "vm", vmRef)
+	}
+	unknown := unknownExcludeDisks(vm.Disks, planVM.ExcludeDisks)
+	if len(unknown) > 0 {
+		return false, fmt.Sprintf("excludeDisks bus addresses not found on VM: %s", strings.Join(unknown, ", ")), validation.Critical, nil
+	}
+	if allDisksExcluded(vm.Disks, planVM.ExcludeDisks) {
+		return false, "excludeDisks removes every disk from the VM", validation.Critical, nil
+	}
+	if bus, excluded := rootDiskExcluded(vm, planVM.RootDisk, planVM.ExcludeDisks); excluded {
+		return false, fmt.Sprintf("excludeDisks includes the root disk %s; the target VM may not boot", bus), validation.Warn, nil
+	}
+	return true, "", "", nil
+}
+
+func unknownExcludeDisks(disks []vsphere.Disk, exclude []string) []string {
+	known := make(map[string]struct{}, len(disks))
+	for _, disk := range disks {
+		if disk.BusAddress != "" {
+			known[disk.BusAddress] = struct{}{}
+		}
+	}
+	var unknown []string
+	for _, bus := range exclude {
+		if _, ok := known[bus]; !ok {
+			unknown = append(unknown, bus)
+		}
+	}
+	return unknown
+}
+
+func excludeSet(exclude []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(exclude))
+	for _, bus := range exclude {
+		set[bus] = struct{}{}
+	}
+	return set
+}
+
+func allDisksExcluded(disks []vsphere.Disk, exclude []string) bool {
+	if len(disks) == 0 {
+		return false
+	}
+	set := excludeSet(exclude)
+	for _, disk := range disks {
+		if _, skip := set[disk.BusAddress]; !skip {
+			return false
+		}
+	}
+	return true
+}
+
+func rootDiskExcluded(vm *model.VM, rootDiskSpec string, exclude []string) (bus string, excluded bool) {
+	disks := vm.SortedDisksAsVmware()
+	if len(disks) == 0 {
+		disks = vm.Disks
+	}
+	if len(disks) == 0 {
+		return "", false
+	}
+	idx := utils.GetBootDiskNumber(rootDiskSpec)
+	if idx < 0 || idx >= len(disks) {
+		idx = 0
+	}
+	root := disks[idx]
+	if root.BusAddress == "" {
+		return "", false
+	}
+	_, excluded = excludeSet(exclude)[root.BusAddress]
+	return root.BusAddress, excluded
 }
 
 func (r *Validator) getUdnSubnet(client client.Client) (string, error) {

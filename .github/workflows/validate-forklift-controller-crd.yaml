@@ -3,7 +3,11 @@ on:
   pull_request:
     paths:
       - "operator/config/crd/**"
-      - "pkg/apis/forklift/v1beta1/**"
+      - "operator/roles/forkliftcontroller/**"
+      - "hack/validate_forklift_controller_crd.py"
+
+permissions:
+  contents: read
 
 jobs:
   validate:
@@ -11,18 +15,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          persist-credentials: false
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - name: Regenerate CRD manifests
-        run: make manifests
-      - name: Check for CRD drift
+          python-version: '3.x'
+      - name: Install Python dependencies
         run: |
-          if ! git diff --quiet operator/config/crd/; then
-            echo "ERROR: CRD files are out of date. Run 'make manifests' and commit the result."
-            git diff operator/config/crd/
-            exit 1
-          fi
+          python -m pip install --upgrade pip
+          pip install PyYAML
+      - name: Validate ForkliftController CRD
+        run: |
+          python3 hack/validate_forklift_controller_crd.py

@@ -176,6 +176,11 @@ func (r *Validator) SharedDisks(_ ref.Ref, _ client.Client) (bool, string, strin
 }
 
 // NO-OP
+func (r *Validator) ExcludedDisks(_ ref.Ref) (bool, string, string, error) {
+	return true, "", "", nil
+}
+
+// NO-OP
 func (r *Validator) ChangeTrackingEnabled(_ ref.Ref) (bool, error) {
 	return true, nil
 }
@@ -244,6 +249,10 @@ func (r *Validator) MacConflicts(vmRef ref.Ref) ([]planbase.MacConflict, error) 
 }
 
 func (r *Validator) PVCNameTemplate(vmRef ref.Ref, pvcNameTemplate string) (bool, error) {
+	if pvcNameTemplate == "" {
+		return true, nil
+	}
+
 	vm := &hyperv.VM{}
 	err := r.Source.Inventory.Find(vm, vmRef)
 	if err != nil {
@@ -253,19 +262,16 @@ func (r *Validator) PVCNameTemplate(vmRef ref.Ref, pvcNameTemplate string) (bool
 	targetVmName := planbase.ResolveTargetVmName(r.Plan, vm.ID, vm.Name)
 
 	// Validate template produces valid k8s labels for each disk
-	for i := range vm.Disks {
-		disk := &vm.Disks[i]
-		testData := &api.PVCNameTemplateData{
-			VmName:       vm.Name,
-			TargetVmName: targetVmName,
-			PlanName:     r.Plan.Name,
-			DiskIndex:    i,
-			VmId:         vm.ID,
-			DiskId:       disk.ID,
+	for i, disk := range vm.Disks {
+		testData := map[string]interface{}{
+			"VmName":       vm.Name,
+			"TargetVmName": targetVmName,
+			"DiskIndex":    i,
+			"DiskId":       disk.ID,
 		}
 		_, err := planbase.ValidatePVCNameTemplate(pvcNameTemplate, testData)
 		if err != nil {
-			return false, liberr.Wrap(err, "vm", vmRef.String(), "diskIndex", i, "disk", disk.ID)
+			return false, liberr.Wrap(err, "vm", vmRef.String(), "disk", disk.ID)
 		}
 	}
 	return true, nil

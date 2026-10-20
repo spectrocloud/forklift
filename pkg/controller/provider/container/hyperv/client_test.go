@@ -15,38 +15,32 @@ import (
 
 // mockDriver implements driver.HyperVDriver for unit tests.
 type mockDriver struct {
-	clusterData       *driver.ClusterData
-	clusterNodes      []driver.ClusterNodeData
-	clusterVMs        []driver.ClusterGroupData
-	networks          []driver.Network
-	computerInfo      *driver.ComputerInfoData
-	runOnNodeFn       func(command, computerName string) (string, error)
-	listAllDomainsFn  func() ([]driver.Domain, error)
-	listAllNetworksFn func() ([]driver.Network, error)
+	clusterData  *driver.ClusterData
+	clusterNodes []driver.ClusterNodeData
+	clusterVMs   []driver.ClusterGroupData
+	networks     []driver.Network
+	computerInfo *driver.ComputerInfoData
+	runOnNodeFn  func(command, computerName string) (string, error)
 }
 
-func (m *mockDriver) Connect() error                                  { return nil }
-func (m *mockDriver) Close() error                                    { return nil }
-func (m *mockDriver) IsAlive() (bool, error)                          { return true, nil }
-func (m *mockDriver) ListAllClusterDomains() ([]driver.Domain, error) { return nil, nil }
-func (m *mockDriver) ListAllDomains() ([]driver.Domain, error) {
-	if m.listAllDomainsFn != nil {
-		return m.listAllDomainsFn()
-	}
-	return nil, nil
-}
-func (m *mockDriver) LookupDomainByName(string) (driver.Domain, error)       { return nil, nil } //nolint:nilnil
-func (m *mockDriver) LookupDomainByUUIDString(string) (driver.Domain, error) { return nil, nil } //nolint:nilnil
-func (m *mockDriver) ListAllNetworks() ([]driver.Network, error) {
-	if m.listAllNetworksFn != nil {
-		return m.listAllNetworksFn()
-	}
-	return m.networks, nil
-}
+func (m *mockDriver) Connect() error                                           { return nil }
+func (m *mockDriver) Close() error                                             { return nil }
+func (m *mockDriver) IsAlive() (bool, error)                                   { return true, nil }
+func (m *mockDriver) ListAllDomains() ([]driver.Domain, error)                 { return nil, nil }
+func (m *mockDriver) ListAllClusterDomains() ([]driver.Domain, error)          { return nil, nil }
+func (m *mockDriver) LookupDomainByName(string) (driver.Domain, error)         { return nil, nil } //nolint:nilnil
+func (m *mockDriver) LookupDomainByUUIDString(string) (driver.Domain, error)   { return nil, nil } //nolint:nilnil
 func (m *mockDriver) LookupNetworkByUUIDString(string) (driver.Network, error) { return nil, nil } //nolint:nilnil
 func (m *mockDriver) ExecuteCommand(string) (string, error)                    { return "", nil }
 func (m *mockDriver) GetCluster() (*driver.ClusterData, error)                 { return m.clusterData, nil }
 func (m *mockDriver) GetClusterNodes() ([]driver.ClusterNodeData, error)       { return m.clusterNodes, nil }
+
+func (m *mockDriver) ListAllNetworks() ([]driver.Network, error) {
+	if m.networks != nil {
+		return m.networks, nil
+	}
+	return nil, nil
+}
 
 func (m *mockDriver) GetComputerInfo() (*driver.ComputerInfoData, error) {
 	if m.computerInfo != nil {
@@ -274,7 +268,7 @@ func TestApplyBatchDetails(t *testing.T) {
 		t.Errorf("vm-linux-01: expected prefix length 24, got %d", vms[0].GuestNetworks[0].PrefixLength)
 	}
 	// MAC should be normalized to colon-separated format
-	expectedMAC := "00:15:5d:01:01:01"
+	expectedMAC := "00:15:5D:01:01:01"
 	if vms[0].GuestNetworks[0].MAC != expectedMAC {
 		t.Errorf("vm-linux-01: expected MAC '%s', got '%s'", expectedMAC, vms[0].GuestNetworks[0].MAC)
 	}
@@ -386,8 +380,8 @@ func TestApplyBatchDetails_ClusterModeBuildDisksAndNICs(t *testing.T) {
 	if len(vms[0].NICs) != 1 {
 		t.Fatalf("Expected 1 NIC, got %d", len(vms[0].NICs))
 	}
-	if vms[0].NICs[0].MAC != "00:15:5d:01:01:01" {
-		t.Errorf("Expected normalized MAC '00:15:5d:01:01:01', got '%s'", vms[0].NICs[0].MAC)
+	if vms[0].NICs[0].MAC != "00:15:5D:01:01:01" {
+		t.Errorf("Expected normalized MAC '00:15:5D:01:01:01', got '%s'", vms[0].NICs[0].MAC)
 	}
 	if vms[0].NICs[0].NetworkUUID != "switch-uuid-1" {
 		t.Errorf("Expected NetworkUUID 'switch-uuid-1', got '%s'", vms[0].NICs[0].NetworkUUID)
@@ -547,10 +541,10 @@ func TestFormatMAC(t *testing.T) {
 		input    string
 		expected string
 	}{
-		{"00155D010101", "00:15:5d:01:01:01"},
-		{"00-15-5D-01-01-01", "00:15:5d:01:01:01"},
-		{"00:15:5D:01:01:01", "00:15:5d:01:01:01"},
-		{"short", "short"},
+		{"00155D010101", "00:15:5D:01:01:01"},
+		{"00-15-5D-01-01-01", "00:15:5D:01:01:01"},
+		{"00:15:5D:01:01:01", "00:15:5D:01:01:01"},
+		{"short", "SHORT"},
 	}
 
 	for _, tc := range tests {
@@ -685,77 +679,13 @@ func TestGetClusterCache_Caching(t *testing.T) {
 		t.Errorf("Expected 1 GetCluster call (cached), got %d", callCount)
 	}
 
-	client.InvalidateCycleCache()
+	client.InvalidateClusterCache()
 	_, err = client.getClusterCache()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if callCount != 2 {
 		t.Errorf("Expected 2 GetCluster calls after invalidation, got %d", callCount)
-	}
-}
-
-func TestListVMs_Caching(t *testing.T) {
-	domainCalls := 0
-	md := &mockDriver{
-		listAllDomainsFn: func() ([]driver.Domain, error) {
-			domainCalls++
-			return nil, nil
-		},
-	}
-	client := &Client{driver: md, provider: newStandaloneProvider(), Log: testLogger()}
-
-	_, err := client.ListVMs()
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = client.ListVMs()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if domainCalls != 1 {
-		t.Errorf("Expected 1 ListAllDomains call (cached), got %d", domainCalls)
-	}
-
-	client.InvalidateCycleCache()
-	_, err = client.ListVMs()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if domainCalls != 2 {
-		t.Errorf("Expected 2 ListAllDomains calls after invalidation, got %d", domainCalls)
-	}
-}
-
-func TestListNetworks_Caching(t *testing.T) {
-	networkCalls := 0
-	md := &mockDriver{
-		listAllNetworksFn: func() ([]driver.Network, error) {
-			networkCalls++
-			return nil, nil
-		},
-	}
-	client := &Client{driver: md, Log: testLogger()}
-
-	_, err := client.ListNetworks()
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = client.ListNetworks()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if networkCalls != 1 {
-		t.Errorf("Expected 1 ListAllNetworks call (cached), got %d", networkCalls)
-	}
-
-	client.InvalidateCycleCache()
-	_, err = client.ListNetworks()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if networkCalls != 2 {
-		t.Errorf("Expected 2 ListAllNetworks calls after invalidation, got %d", networkCalls)
 	}
 }
 
@@ -893,7 +823,7 @@ func TestBuildGuestNetworks(t *testing.T) {
 	if ipv4.IP != "192.168.1.10" {
 		t.Errorf("Expected IPv4 '192.168.1.10', got '%s'", ipv4.IP)
 	}
-	if ipv4.MAC != "00:15:5d:01:01:01" {
+	if ipv4.MAC != "00:15:5D:01:01:01" {
 		t.Errorf("Expected normalized MAC, got '%s'", ipv4.MAC)
 	}
 	if ipv4.Origin != "Dhcp" {
@@ -926,7 +856,7 @@ func TestBuildGuestNetworks_DashedMAC(t *testing.T) {
 	if len(result) != 1 {
 		t.Fatalf("Expected 1 result, got %d", len(result))
 	}
-	if result[0].MAC != "00:15:5d:01:01:01" {
+	if result[0].MAC != "00:15:5D:01:01:01" {
 		t.Errorf("Expected colon-separated MAC from dashed input, got '%s'", result[0].MAC)
 	}
 }

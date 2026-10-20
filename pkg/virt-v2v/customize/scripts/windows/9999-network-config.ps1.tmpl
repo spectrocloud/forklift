@@ -21,20 +21,33 @@ function Convert-PrefixToMask($prefix) {
     return $PrefixToMaskTable[[int]$prefix]
 }
 
-function Find-AdapterByMAC($mac) {
-    $startTime = Get-Date
-    $deadline = $startTime.AddSeconds($adapterWaitSeconds)
-    Write-Host "Waiting for adapter with MAC $mac...`n"
+# Split entries by '_'
+$entries = $inputString.Split("_")
 
-    while ((Get-Date) -lt $deadline) {
+# Extract parts
+foreach ($entry in $entries) {
+    if ($entry -match "^([0-9A-Fa-f:\-]+):ip:([^,]+),([^,]+),([^,]+),([^,]+),([^,]+)$") {
+        $mac = $matches[1]
+        $mac = $mac.ToUpper()
+        $mac = $mac.Replace(":", "-")
+        $ip = $matches[2]
+        $gw = $matches[3]
+        $prefix = [int]$matches[4]
+        $dns1 = $matches[5]
+        $dns2 = $matches[6]
+        $mask = Convert-PrefixToMask $prefix
+
+        Write-Host "Searching for MAC: $mac`n"
+
         $adapters = Get-WmiObject Win32_NetworkAdapter
+        $adapter = $null
+
         foreach ($a in $adapters) {
             if ($a.MACAddress -and $a.NetConnectionID) {
                 $aMac = $a.MACAddress.ToUpper().Replace(":", "-")
                 if ($aMac -eq $mac) {
-                    $elapsed = [int]((Get-Date) - $startTime).TotalSeconds
-                    Write-Host "Found adapter '$($a.NetConnectionID)' after ${elapsed}s`n"
-                    return $a
+                    $adapter = $a
+                    break
                 }
             }
         }
@@ -142,9 +155,4 @@ foreach ($config in $networkConfigs) {
         }
         Write-Host "DNS configured ($($dnsServers.Count) servers) on $iface`n"
     }
-}
-
-if ($failCount -gt 0) {
-    Write-Warning "$failCount adapter(s) failed to configure`n"
-    exit 1
 }

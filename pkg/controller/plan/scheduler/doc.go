@@ -5,7 +5,6 @@ import (
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
 	"github.com/kubev2v/forklift/pkg/controller/plan/scheduler/hyperv"
-	"github.com/kubev2v/forklift/pkg/controller/plan/scheduler/nutanix"
 	"github.com/kubev2v/forklift/pkg/controller/plan/scheduler/ocp"
 	"github.com/kubev2v/forklift/pkg/controller/plan/scheduler/openstack"
 	"github.com/kubev2v/forklift/pkg/controller/plan/scheduler/ova"
@@ -58,11 +57,6 @@ func New(ctx *plancontext.Context) (scheduler Scheduler, err error) {
 		}
 	case api.EC2:
 		scheduler = &ec2scheduler.Scheduler{
-			Context:     ctx,
-			MaxInFlight: settings.Settings.MaxInFlight,
-		}
-	case api.Nutanix:
-		scheduler = &nutanix.Scheduler{
 			Context:     ctx,
 			MaxInFlight: settings.Settings.MaxInFlight,
 		}

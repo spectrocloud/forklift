@@ -450,7 +450,6 @@ func (r *HookRunner) runAAPJob(step *planapi.Step) (err error) {
 	if err != nil {
 		step.AddError(err.Error())
 		step.MarkCompleted()
-		err = nil
 		return
 	}
 
@@ -483,7 +482,6 @@ func (r *HookRunner) runAAPJob(step *planapi.Step) (err error) {
 	if err != nil {
 		step.AddError(err.Error())
 		step.MarkCompleted()
-		err = nil
 		return
 	}
 
@@ -527,7 +525,6 @@ func (r *HookRunner) runAAPJob(step *planapi.Step) (err error) {
 		r.Log.Error(err, "AAP job failed", "jobId", jobID)
 		step.AddError(err.Error())
 		step.MarkCompleted()
-		err = nil
 		return
 	}
 

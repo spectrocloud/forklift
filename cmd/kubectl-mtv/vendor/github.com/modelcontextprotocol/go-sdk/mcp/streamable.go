@@ -20,14 +20,12 @@ import (
 	"maps"
 	"math"
 	"math/rand/v2"
-	"mime"
 	"net"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
@@ -37,6 +35,12 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/internal/util"
 	"github.com/modelcontextprotocol/go-sdk/internal/xcontext"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+)
+
+const (
+	protocolVersionHeader = "Mcp-Protocol-Version"
+	sessionIDHeader       = "Mcp-Session-Id"
+	lastEventIDHeader     = "Last-Event-ID"
 )
 
 // A StreamableHTTPHandler is an http.Handler that serves streamable MCP
@@ -92,7 +96,7 @@ func (i *sessionInfo) startPOST() {
 	i.refs++
 }
 
-// endPOST signals that a request for this session is ending, starting the
+// endPOST sigals that a request for this session is ending, starting the
 // timeout if there are no other requests running.
 func (i *sessionInfo) endPOST() {
 	if i.timeout <= 0 {
@@ -174,15 +178,9 @@ type StreamableHTTPOptions struct {
 	// CrossOriginProtection allows to customize cross-origin protection.
 	// The deny handler set in the CrossOriginProtection through SetDenyHandler
 	// is ignored.
-	// If nil, no cross-origin protection is applied. Use the `enableoriginverification`
-	// MCPGODEBUG compatibility parameter to enable the default protection until v1.8.0.
-	//
-	// Deprecated: wrap the handler with cross-origin protection middleware
-	// instead. For example:
-	//
-	//   handler := mcp.NewStreamableHTTPHandler(...)
-	//   protection := http.NewCrossOriginProtection()
-	//   protectedHandler := protection.Handler(handler)
+	// If nil, default (zero-value) cross-origin protection will be used.
+	// Use `disablecrossoriginprotection` MCPGODEBUG compatibility parameter
+	// to disable the default protection until v1.6.0.
 	CrossOriginProtection *http.CrossOriginProtection
 }
 
@@ -202,7 +200,7 @@ func NewStreamableHTTPHandler(getServer func(*http.Request) *Server, opts *Strea
 
 	h.opts.Logger = ensureLogger(h.opts.Logger)
 
-	if h.opts.CrossOriginProtection == nil && enableoriginverification == "1" {
+	if h.opts.CrossOriginProtection == nil {
 		h.opts.CrossOriginProtection = &http.CrossOriginProtection{}
 	}
 
@@ -235,22 +233,15 @@ func (h *StreamableHTTPHandler) closeAll() {
 // disablelocalhostprotection is a compatibility parameter that allows to disable
 // DNS rebinding protection, which was added in the 1.4.0 version of the SDK.
 // See the documentation for the mcpgodebug package for instructions how to enable it.
-// The option will be removed in the 1.8.0 version of the SDK.
+// The option will be removed in the 1.6.0 version of the SDK.
 var disablelocalhostprotection = mcpgodebug.Value("disablelocalhostprotection")
 
-// enableoriginverification is a compatibility parameter that restores the
-// default cross-origin protection behavior from v1.4.1-v1.5.0. When set to
-// "1", a zero-value CrossOriginProtection will be applied if none is
-// explicitly provided in StreamableHTTPOptions.
-// See the documentation for the mcpgodebug package for instructions how to enable it.
-// The option will be removed in the 1.8.0 version of the SDK.
-var enableoriginverification = mcpgodebug.Value("enableoriginverification")
-
-// disablecontenttypecheck is a compatibility parameter that allows to disable
-// Content-Type validation on POST requests.
-// See the documentation for the mcpgodebug package for instructions how to enable it.
-// The option will be removed in the 1.8.0 version of the SDK.
-var disablecontenttypecheck = mcpgodebug.Value("disablecontenttypecheck")
+// disablecrossoriginprotection is a compatibility parameter that allows to disable
+// the verification of the 'Origin' and 'Content-Type' headers, which was added in
+// the 1.4.1 version of the SDK. See the documentation for the mcpgodebug package
+// for instructions how to enable it.
+// The option will be removed in the 1.6.0 version of the SDK.
+var disablecrossoriginprotection = mcpgodebug.Value("disablecrossoriginprotection")
 
 func (h *StreamableHTTPHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// DNS rebinding protection: auto-enabled for localhost servers.
@@ -264,23 +255,37 @@ func (h *StreamableHTTPHandler) ServeHTTP(w http.ResponseWriter, req *http.Reque
 		}
 	}
 
-	if h.opts.CrossOriginProtection != nil {
+	if disablecrossoriginprotection != "1" {
 		// Verify the 'Origin' header to protect against CSRF attacks.
 		if err := h.opts.CrossOriginProtection.Check(req); err != nil {
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
-	}
-
-	// Validate 'Content-Type' header.
-	if disablecontenttypecheck != "1" && req.Method == http.MethodPost && baseMediaType(req.Header.Get("Content-Type")) != "application/json" {
-		http.Error(w, "Content-Type must be 'application/json'", http.StatusUnsupportedMediaType)
-		return
+		// Validate 'Content-Type' header.
+		if req.Method == http.MethodPost {
+			contentType := req.Header.Get("Content-Type")
+			if contentType != "application/json" {
+				http.Error(w, "Content-Type must be 'application/json'", http.StatusUnsupportedMediaType)
+				return
+			}
+		}
 	}
 
 	// Allow multiple 'Accept' headers.
 	// https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Accept#syntax
-	jsonOK, streamOK := streamableAccepts(req.Header.Values("Accept"))
+	accept := strings.Split(strings.Join(req.Header.Values("Accept"), ","), ",")
+	var jsonOK, streamOK bool
+	for _, c := range accept {
+		switch strings.TrimSpace(c) {
+		case "application/json", "application/*":
+			jsonOK = true
+		case "text/event-stream", "text/*":
+			streamOK = true
+		case "*/*":
+			jsonOK = true
+			streamOK = true
+		}
+	}
 
 	if req.Method == http.MethodGet {
 		if !streamOK {
@@ -543,34 +548,6 @@ func (h *StreamableHTTPHandler) ServeHTTP(w http.ResponseWriter, req *http.Reque
 	}
 
 	sessInfo.transport.ServeHTTP(w, req)
-}
-
-func streamableAccepts(values []string) (jsonOK, streamOK bool) {
-	for _, value := range values {
-		for _, raw := range strings.Split(value, ",") {
-			token := strings.TrimSpace(raw)
-			// Ignore Accept parameters like ";charset=utf-8"; match the base media type.
-			base, _, _ := strings.Cut(token, ";")
-			switch strings.ToLower(strings.TrimSpace(base)) {
-			case "application/json", "application/*":
-				jsonOK = true
-			case "text/event-stream", "text/*":
-				streamOK = true
-			case "*/*":
-				jsonOK = true
-				streamOK = true
-			}
-		}
-	}
-	return jsonOK, streamOK
-}
-
-func baseMediaType(value string) string {
-	mediaType, _, err := mime.ParseMediaType(value)
-	if err != nil {
-		return ""
-	}
-	return mediaType
 }
 
 // A StreamableServerTransport implements the server side of the MCP streamable
@@ -1067,9 +1044,9 @@ func (c *streamableServerConn) acquireStream(ctx context.Context, w http.Respons
 		// Issue #410: the standalone SSE stream is likely not to receive messages
 		// for a long time. Ensure that headers are flushed.
 		w.WriteHeader(http.StatusOK)
-		rc := http.NewResponseController(w)
-		// Ignore returned error as flushing is best-effort.
-		_ = rc.Flush()
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
 	}
 
 	for _, data := range toReplay {
@@ -1191,24 +1168,6 @@ func (c *streamableServerConn) servePOST(w http.ResponseWriter, req *http.Reques
 		}
 	}
 
-	// Validate MCP standard headers (Mcp-Method, Mcp-Name)
-	if !isBatch && len(incoming) == 1 {
-		if err := validateMcpHeaders(req.Header, incoming[0]); err != nil {
-			resp := &jsonrpc.Response{
-				Error: jsonrpc2.NewError(CodeHeaderMismatch, err.Error()),
-			}
-			if jreq, ok := incoming[0].(*jsonrpc.Request); ok {
-				resp.ID = jreq.ID
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			if data, err := jsonrpc2.EncodeMessage(resp); err == nil {
-				w.Write(data)
-			}
-			return
-		}
-	}
-
 	// The prime and close events were added in protocol version 2025-11-25 (SEP-1699).
 	// Use the version from InitializeParams if this is an initialize request,
 	// otherwise use the protocol version header.
@@ -1243,7 +1202,7 @@ func (c *streamableServerConn) servePOST(w http.ResponseWriter, req *http.Reques
 	//
 	// Create a logical stream to track its responses.
 	// Important: don't publish the incoming messages until the stream is
-	// registered, as the server may attempt to respond to incoming messages as
+	// registered, as the server may attempt to respond to imcoming messages as
 	// soon as they're published.
 	stream, err := c.newStream(req.Context(), calls, crand.Text())
 	if err != nil {
@@ -1556,12 +1515,8 @@ var (
 	// reconnectInitialDelay is the base delay for the first reconnect attempt.
 	//
 	// Mutable for testing.
-	reconnectInitialDelay atomic.Int64
+	reconnectInitialDelay = 1 * time.Second
 )
-
-func init() {
-	reconnectInitialDelay.Store(int64(1 * time.Second))
-}
 
 // Connect implements the [Transport] interface.
 //
@@ -1702,7 +1657,7 @@ func (c *streamableClientConn) connectStandaloneSSE() {
 		resp.Body.Close()
 		return
 	}
-	if baseMediaType(resp.Header.Get("Content-Type")) != "text/event-stream" {
+	if resp.Header.Get("Content-Type") != "text/event-stream" {
 		// modelcontextprotocol/go-sdk#736: some servers return 200 OK or redirect with
 		// non-SSE content type instead of text/event-stream for the standalone
 		// SSE stream.
@@ -1813,17 +1768,14 @@ func (c *streamableClientConn) Write(ctx context.Context, msg jsonrpc.Message) e
 			// Failure to set headers means that the request was not sent.
 			// Wrap with ErrRejected so the jsonrpc2 connection doesn't set writeErr
 			// and permanently break the connection.
-			return nil, nil, fmt.Errorf("%s: %w: %w", requestSummary, jsonrpc2.ErrRejected, err)
+			return nil, nil, fmt.Errorf("%s: %w: %v", requestSummary, jsonrpc2.ErrRejected, err)
 		}
-		// Keep this after the setMCPHeaders call to ensure that the
-		// protocol version header is set.
-		setStandardHeaders(req.Header, msg)
 		resp, err := c.client.Do(req)
 		if err != nil {
 			// Any error from client.Do means the request didn't reach the server.
 			// Wrap with ErrRejected so the jsonrpc2 connection doesn't set writeErr
 			// and permanently break the connection.
-			err = fmt.Errorf("%s: %w: %w", requestSummary, jsonrpc2.ErrRejected, err)
+			err = fmt.Errorf("%s: %w: %v", requestSummary, jsonrpc2.ErrRejected, err)
 		}
 		return req, resp, err
 	}
@@ -1835,22 +1787,6 @@ func (c *streamableClientConn) Write(ctx context.Context, msg jsonrpc.Message) e
 
 	if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && c.oauthHandler != nil {
 		if err := c.oauthHandler.Authorize(ctx, req, resp); err != nil {
-			// If the caller's context was cancelled while we were running the
-			// authorization flow, treat the connection as failed so subsequent
-			// operations on it (e.g. the cancellation notify the call layer
-			// sends in response to ctx cancellation) short-circuit instead of
-			// re-invoking the OAuth handler. Otherwise the user gets prompted
-			// to authorize a request they have already abandoned. See #882.
-			//
-			// We check ctx.Err() rather than the error returned by Authorize,
-			// because the handler is user-implemented and may return an error
-			// that does not wrap context.Canceled (e.g. a custom sentinel or
-			// a fmt.Errorf with %v). The context itself is the authoritative
-			// source for whether the caller abandoned the request.
-			ctxErr := ctx.Err()
-			if errors.Is(ctxErr, context.Canceled) || errors.Is(ctxErr, context.DeadlineExceeded) {
-				c.fail(fmt.Errorf("%s: authorization cancelled: %w", requestSummary, err))
-			}
 			// Wrap with ErrRejected so the jsonrpc2 connection doesn't set writeErr
 			// and permanently break the connection.
 			// Wrap the authorization error as well for client inspection.
@@ -1905,7 +1841,7 @@ func (c *streamableClientConn) Write(ctx context.Context, msg jsonrpc.Message) e
 		return nil
 	}
 
-	contentType := baseMediaType(resp.Header.Get("Content-Type"))
+	contentType := strings.TrimSpace(strings.SplitN(resp.Header.Get("Content-Type"), ";", 2)[0])
 	switch contentType {
 	case "application/json":
 		go c.handleJSON(requestSummary, resp)
@@ -1953,7 +1889,6 @@ func (c *streamableClientConn) setMCPHeaders(req *http.Request) error {
 	if c.sessionID != "" {
 		req.Header.Set(sessionIDHeader, c.sessionID)
 	}
-
 	return nil
 }
 
@@ -2261,7 +2196,7 @@ func calculateReconnectDelay(attempt int) time.Duration {
 		return 0
 	}
 	// Calculate the exponential backoff using the grow factor.
-	backoffDuration := time.Duration(float64(reconnectInitialDelay.Load()) * math.Pow(reconnectGrowFactor, float64(attempt-1)))
+	backoffDuration := time.Duration(float64(reconnectInitialDelay) * math.Pow(reconnectGrowFactor, float64(attempt-1)))
 	// Cap the backoffDuration at maxDelay.
 	backoffDuration = min(backoffDuration, reconnectMaxDelay)
 

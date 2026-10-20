@@ -146,9 +146,7 @@ func (op OpType) String() string {
 
 // Node represents a generic AST node
 type Node struct {
-	Kind NodeKind
-	// Value must be an immutable type (string, float64, bool, time.Time, or nil).
-	// Clone performs a shallow copy of this field.
+	Kind     NodeKind
 	Value    interface{}
 	Operator OpType
 	Left     *Node

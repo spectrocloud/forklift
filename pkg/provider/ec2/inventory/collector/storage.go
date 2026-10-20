@@ -32,8 +32,8 @@ func (r *Collector) collectStorageTypes(ctx context.Context) error {
 	for _, volType := range ebsVolumeTypes {
 		m := &model.Storage{}
 
-		// ID is just the volume type since each provider has its own database
-		m.ID = volType.Type
+		// UID is just the volume type since each provider has its own database
+		m.UID = volType.Type
 		m.Name = volType.Type // Use type code as name for storage map lookups
 		m.Kind = "Storage"
 		m.Provider = string(r.provider.UID)
@@ -49,7 +49,7 @@ func (r *Collector) collectStorageTypes(ctx context.Context) error {
 
 		// Check if record exists and has changed
 		existing := &model.Storage{}
-		existing.ID = m.ID
+		existing.UID = m.UID
 		if err := r.db.Get(existing); err == nil {
 			// Record exists - check if it changed
 			if !existing.HasChanged(m) {

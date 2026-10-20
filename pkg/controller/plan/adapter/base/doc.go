@@ -13,14 +13,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// Labels
-const (
-	// LabelVMUUID is the PVC/DV label that carries the source VM UUID,
-	// used by resume-conversion and conversion-only flows to discover
-	// PVCs across migration boundaries.
-	LabelVMUUID = "vmUUID"
-)
-
 // Annotations
 const (
 	// JSON map of original → sanitized label/annotation keys on the destination VM.
@@ -276,6 +268,8 @@ type Validator interface {
 	UdnStaticIPs(vmRef ref.Ref, client client.Client) (ok bool, err error)
 	// Validate the shared disk, returns msg and category as the errors depends on the provider implementations
 	SharedDisks(vmRef ref.Ref, client client.Client) (ok bool, msg string, category string, err error)
+	// Validate excludeDisks. Returns msg and category; providers that do not support disk exclusion should no-op (ok=true).
+	ExcludedDisks(vmRef ref.Ref) (ok bool, msg string, category string, err error)
 	// Validate that the vm has the change tracking enabled
 	ChangeTrackingEnabled(vmRef ref.Ref) (bool, error)
 	// Validate that VM has no pre-existing snapshots for warm migration

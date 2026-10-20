@@ -30,7 +30,6 @@ const (
 	ConnectionTestFailed    = "ConnectionTestFailed"
 	InMaintenance           = "InMaintenance"
 	NotHealthy              = "NotHealthy"
-	HostStatusNotGreen      = "HostStatusNotGreen"
 )
 
 // Categories
@@ -296,7 +295,17 @@ func (r *Reconciler) testConnection(host *api.Host) (err error) {
 				},
 			)
 		}
-		setOverallStatusConditions(host, hostModel.Status)
+		if hostModel.Status != "green" {
+			host.Status.SetCondition(
+				libcnd.Condition{
+					Type:     NotHealthy,
+					Status:   True,
+					Reason:   StateEvaluated,
+					Category: Critical,
+					Message:  "Host status not 'green'.",
+				},
+			)
+		}
 		secret.Data["thumbprint"] = []byte(hostModel.Thumbprint)
 		h := adapter.EsxHost{
 			Secret: secret,
@@ -341,32 +350,4 @@ func (r *Reconciler) testConnection(host *api.Host) (err error) {
 	}
 
 	return
-}
-
-// setOverallStatusConditions maps vSphere HostSystem.overallStatus onto Host
-// conditions. Only red blocks Ready (Critical NotHealthy), any non-green value
-// is surfaced as a Warn concern.
-func setOverallStatusConditions(host *api.Host, overallStatus string) {
-	if overallStatus != "green" {
-		host.Status.SetCondition(
-			libcnd.Condition{
-				Type:     HostStatusNotGreen,
-				Status:   True,
-				Reason:   StateEvaluated,
-				Category: Warn,
-				Message:  fmt.Sprintf("Host overallStatus is %q (expected green).", overallStatus),
-			},
-		)
-	}
-	if overallStatus == "red" {
-		host.Status.SetCondition(
-			libcnd.Condition{
-				Type:     NotHealthy,
-				Status:   True,
-				Reason:   StateEvaluated,
-				Category: Critical,
-				Message:  "Host overallStatus is red.",
-			},
-		)
-	}
 }

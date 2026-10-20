@@ -87,6 +87,11 @@ func (r *Validator) SharedDisks(vmRef ref.Ref, client client.Client) (ok bool, s
 	return
 }
 
+func (r *Validator) ExcludedDisks(vmRef ref.Ref) (ok bool, msg string, category string, err error) {
+	ok = true
+	return
+}
+
 // HasSnapshot - OVF-based providers don't support warm migration, so no snapshot validation needed
 func (r *Validator) HasSnapshot(vmRef ref.Ref) (ok bool, msg string, category string, err error) {
 	ok = true
@@ -182,29 +187,10 @@ func (r *Validator) VMMigrationType(vmRef ref.Ref) (ok bool, err error) {
 	return
 }
 
+// NO-OP
 func (r *Validator) PVCNameTemplate(vmRef ref.Ref, pvcNameTemplate string) (ok bool, err error) {
-	vm := &model.VM{}
-	err = r.Source.Inventory.Find(vm, vmRef)
-	if err != nil {
-		return false, liberr.Wrap(err, "vm", vmRef.String())
-	}
-
-	targetVmName := planbase.ResolveTargetVmName(r.Plan, vmRef.ID, vmRef.Name)
-
-	for i := range vm.Disks {
-		testData := &api.PVCNameTemplateData{
-			VmName:       vmRef.Name,
-			TargetVmName: targetVmName,
-			PlanName:     r.Plan.Name,
-			DiskIndex:    i,
-			VmId:         vmRef.ID,
-		}
-		_, err = planbase.ValidatePVCNameTemplate(pvcNameTemplate, testData)
-		if err != nil {
-			return false, liberr.Wrap(err, "vm", vmRef.String(), "diskIndex", i)
-		}
-	}
-	return true, nil
+	ok = true
+	return
 }
 
 // NO-OP

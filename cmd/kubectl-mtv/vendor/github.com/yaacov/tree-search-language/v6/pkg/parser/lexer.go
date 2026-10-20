@@ -21,10 +21,9 @@ const (
 
 // Lexer represents a lexical analyzer for TSL
 type Lexer struct {
-	input   string // original input string
-	runes   []rune // input as runes for proper UTF-8 handling
-	pos     int    // current position (rune index)
-	start   int    // start of current token (rune index)
+	input   string
+	pos     int // current position
+	start   int // start of current token
 	tokens  []Token
 	current int // current token index
 }
@@ -59,7 +58,6 @@ var (
 func NewLexer(input string) *Lexer {
 	return &Lexer{
 		input:   input,
-		runes:   []rune(input),
 		pos:     0,
 		start:   0,
 		tokens:  make([]Token, 0),
@@ -82,7 +80,7 @@ func (l *Lexer) Tokenize() error {
 
 // isAtEnd checks if we're at the end of input
 func (l *Lexer) isAtEnd() bool {
-	return l.pos >= len(l.runes)
+	return l.pos >= len(l.input)
 }
 
 // peek returns the current character without advancing
@@ -90,15 +88,15 @@ func (l *Lexer) peek() rune {
 	if l.isAtEnd() {
 		return 0
 	}
-	return l.runes[l.pos]
+	return rune(l.input[l.pos])
 }
 
 // peekNext returns the next character without advancing
 func (l *Lexer) peekNext() rune {
-	if l.pos+1 >= len(l.runes) {
+	if l.pos+1 >= len(l.input) {
 		return 0
 	}
-	return l.runes[l.pos+1]
+	return rune(l.input[l.pos+1])
 }
 
 // advance consumes and returns the current character
@@ -106,14 +104,14 @@ func (l *Lexer) advance() rune {
 	if l.isAtEnd() {
 		return 0
 	}
-	c := l.runes[l.pos]
+	c := rune(l.input[l.pos])
 	l.pos++
 	return c
 }
 
 // match checks if current character matches expected and advances if so
 func (l *Lexer) match(expected rune) bool {
-	if l.isAtEnd() || l.runes[l.pos] != expected {
+	if l.isAtEnd() || rune(l.input[l.pos]) != expected {
 		return false
 	}
 	l.pos++
@@ -229,11 +227,11 @@ func (l *Lexer) scanToken() error {
 // isDateTimePattern checks if the current position starts a date or time pattern
 func (l *Lexer) isDateTimePattern() bool {
 	// Look ahead to see if this matches a date or RFC3339 pattern
-	remaining := l.runes[l.pos:]
+	remaining := l.input[l.pos:]
 
 	// Try to match date pattern (YYYY-MM-DD)
 	if len(remaining) >= 10 {
-		dateCandidate := string(remaining[:10])
+		dateCandidate := remaining[:10]
 		if datePattern.MatchString(dateCandidate) {
 			// Check if it continues as RFC3339 (has T after date)
 			if len(remaining) > 10 && remaining[10] == 'T' {
@@ -242,12 +240,12 @@ func (l *Lexer) isDateTimePattern() bool {
 					c := remaining[i]
 					if c == ' ' || c == '\t' || c == '\n' || c == ')' || c == ',' {
 						// End of potential timestamp
-						candidate := string(remaining[:i])
+						candidate := remaining[:i]
 						return rfc3339Pattern.MatchString(candidate)
 					}
 				}
 				// Check the whole remaining string
-				return rfc3339Pattern.MatchString(string(remaining))
+				return rfc3339Pattern.MatchString(remaining)
 			}
 			return true // Just a date
 		}
@@ -269,7 +267,7 @@ func (l *Lexer) scanDateTime() error {
 		l.advance()
 	}
 
-	value := string(l.runes[start:l.pos])
+	value := l.input[start:l.pos]
 
 	// Check if it's a date or RFC3339 format
 	if rfc3339Pattern.MatchString(value) {
@@ -393,7 +391,7 @@ func (l *Lexer) scanNumber() error {
 		}
 	}
 
-	value := string(l.runes[start:l.pos])
+	value := l.input[start:l.pos]
 	l.addToken(NUMERIC_LITERAL, value)
 	return nil
 }
@@ -432,7 +430,7 @@ func (l *Lexer) scanIdentifier() error {
 		}
 	}
 
-	value := string(l.runes[start:l.pos])
+	value := l.input[start:l.pos]
 
 	// Check if it's a keyword (case-insensitive)
 	lowerValue := strings.ToLower(value)
@@ -448,7 +446,7 @@ func (l *Lexer) scanIdentifier() error {
 // NextToken returns the next token for the parser
 func (l *Lexer) NextToken() Token {
 	if l.current >= len(l.tokens) {
-		return Token{Type: EOF, Value: "", Position: len(l.runes)}
+		return Token{Type: EOF, Value: "", Position: len(l.input)}
 	}
 	token := l.tokens[l.current]
 	l.current++
@@ -458,7 +456,7 @@ func (l *Lexer) NextToken() Token {
 // Peek returns the current token without advancing
 func (l *Lexer) PeekToken() Token {
 	if l.current >= len(l.tokens) {
-		return Token{Type: EOF, Value: "", Position: len(l.runes)}
+		return Token{Type: EOF, Value: "", Position: len(l.input)}
 	}
 	return l.tokens[l.current]
 }

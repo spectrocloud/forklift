@@ -79,8 +79,7 @@ func (r *Scheduler) Next() (vm *plan.VMStatus, hasNext bool, err error) {
 		r.Log.Info(
 			"Next scheduled VM.",
 			"vm",
-			vm.String(),
-		)
+			vm.String())
 	}
 
 	return
@@ -106,8 +105,7 @@ func (r *Scheduler) buildSchedule() (err error) {
 		"inflight",
 		r.inFlight,
 		"pending",
-		r.pending,
-	)
+		r.pending)
 
 	return
 }
@@ -251,24 +249,13 @@ func (r *Scheduler) migratesSharedDisks(vmStatus *plan.VMStatus) bool {
 
 func (r *Scheduler) cost(vm *model.VM, vmStatus *plan.VMStatus) int {
 	useV2vForTransfer, _ := r.Plan.ShouldUseV2vForTransfer(vmStatus.Ref)
-	if useV2vForTransfer {
+	if useV2vForTransfer || r.Plan.IsUsingOffloadPlugin() {
 		switch vmStatus.Phase {
 		case CreateVM, PostHook, Completed:
 			// In these phases we already have the disk transferred and are left only to create the VM
 			// By setting the cost to 0 other VMs can start migrating
 			return 0
 		default:
-			return 1
-		}
-	} else if r.Plan.IsUsingOffloadPlugin() {
-		switch vmStatus.Phase {
-		case CreateVM, PostHook, Completed, ConvertGuest, CreateGuestConversionPod:
-			// In these phases we already have the disk transferred and are left only to create the VM
-			// By setting the cost to 0 other VMs can start migrating
-			return 0
-		default:
-			// Once all disks have been copied by the offload plugin, release the host slot
-			// so that other VMs can start migrating without waiting for conversion to begin.
 			return 1
 		}
 	} else {
@@ -288,7 +275,7 @@ func (r *Scheduler) cost(vm *model.VM, vmStatus *plan.VMStatus) int {
 // finishedDisks returns a number of the disks that have completed the disk transfer
 // This can reduce the migration time as VMs with one large disks and many small disks won't halt the scheduler
 func (r *Scheduler) finishedDisks(vmStatus *plan.VMStatus) int {
-	resp := 0
+	var resp = 0
 	for _, step := range vmStatus.Pipeline {
 		switch step.Name {
 		case DiskTransfer, DiskTransferV2v, DiskAllocation:

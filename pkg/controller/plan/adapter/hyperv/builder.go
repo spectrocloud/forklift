@@ -36,68 +36,6 @@ const (
 	Ignored = "ignored"
 )
 
-// Template label keys
-const (
-	templateOSLabel       = "os.template.kubevirt.io/%s"
-	templateWorkloadLabel = "workload.template.kubevirt.io/server"
-	templateFlavorLabel   = "flavor.template.kubevirt.io/medium"
-	redHatGuestOS         = "red hat"
-	centosGuestOS         = "centos"
-	defaultTemplateOS     = "rhel8.1"
-)
-
-// mapHypervGuestOS maps Hyper-V guest OS name strings (from KVP exchange) to
-// KubeVirt template OS identifiers.
-func mapHypervGuestOS(guestOS string) string {
-	os := strings.ToLower(guestOS)
-	switch {
-	case strings.Contains(os, "windows server 2022"):
-		return "win2k22"
-	case strings.Contains(os, "windows server 2019"):
-		return "win2k19"
-	case strings.Contains(os, "windows server 2016"):
-		return "win2k16"
-	case strings.Contains(os, "windows server 2012 r2"):
-		return "win2k12r2"
-	case strings.Contains(os, "windows server 2012"):
-		return "win2k12r2"
-	case strings.Contains(os, "windows 11"):
-		return "win11"
-	case strings.Contains(os, "windows 10"):
-		return "win10"
-	case strings.Contains(os, "windows"):
-		return "win10"
-	case strings.Contains(os, redHatGuestOS) && (strings.Contains(os, " 9.") || strings.Contains(os, " 9 ") || strings.HasSuffix(os, " 9")):
-		return "rhel9.4"
-	case strings.Contains(os, redHatGuestOS) && (strings.Contains(os, " 8.") || strings.Contains(os, " 8 ") || strings.HasSuffix(os, " 8")):
-		return defaultTemplateOS
-	case strings.Contains(os, redHatGuestOS) && (strings.Contains(os, " 7.") || strings.Contains(os, " 7 ") || strings.HasSuffix(os, " 7")):
-		return "rhel7.7"
-	case strings.Contains(os, redHatGuestOS):
-		return defaultTemplateOS
-	case strings.Contains(os, centosGuestOS) && (strings.Contains(os, " 9.") || strings.Contains(os, " 9 ") || strings.HasSuffix(os, " 9")):
-		return "centos-stream9"
-	case strings.Contains(os, centosGuestOS) && (strings.Contains(os, " 8.") || strings.Contains(os, " 8 ") || strings.HasSuffix(os, " 8")):
-		return "centos8"
-	case strings.Contains(os, centosGuestOS) && (strings.Contains(os, " 7.") || strings.Contains(os, " 7 ") || strings.HasSuffix(os, " 7")):
-		return "centos7.0"
-	case strings.Contains(os, centosGuestOS):
-		return "centos7.0"
-	case strings.Contains(os, "ubuntu"):
-		return "ubuntu18.04"
-	case strings.Contains(os, "debian"):
-		return "debian10"
-	case strings.Contains(os, "fedora"):
-		return "fedora31"
-	case strings.Contains(os, "suse") || strings.Contains(os, "sles"):
-		return "opensuse15.0"
-	case strings.Contains(os, "linux"):
-		return defaultTemplateOS
-	default:
-		return defaultTemplateOS
-	}
-}
-
 type Builder struct {
 	*plancontext.Context
 }
@@ -354,7 +292,9 @@ func (r *Builder) mapMemory(vm *model.VM, object *cnv.VirtualMachineSpec, usesIn
 		return
 	}
 	memory := resource.NewQuantity(int64(vm.MemoryMB)*1024*1024, resource.BinarySI)
-	object.Template.Spec.Domain.Memory = &cnv.Memory{Guest: memory}
+	object.Template.Spec.Domain.Resources.Requests = core.ResourceList{
+		core.ResourceMemory: *memory,
+	}
 }
 
 func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, configMap *core.ConfigMap, dvTemplate *cdi.DataVolume, vddkConfigMap *core.ConfigMap) (dvs []cdi.DataVolume, err error) {
@@ -365,8 +305,8 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, configMap *cor
 		return
 	}
 
-	for i, disk := range vm.Disks {
-		dv, dvErr := r.mapDataVolume(vm, disk, i, dvTemplate)
+	for _, disk := range vm.Disks {
+		dv, dvErr := r.mapDataVolume(disk, dvTemplate)
 		if dvErr != nil {
 			err = dvErr
 			return
@@ -376,7 +316,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, configMap *cor
 	return
 }
 
-func (r *Builder) mapDataVolume(vm *model.VM, disk hyperv.Disk, diskIndex int, dvTemplate *cdi.DataVolume) (*cdi.DataVolume, error) {
+func (r *Builder) mapDataVolume(disk hyperv.Disk, dvTemplate *cdi.DataVolume) (*cdi.DataVolume, error) {
 	storageClass := r.getStorageClass()
 	dvSource := cdi.DataVolumeSource{
 		Blank: &cdi.DataVolumeBlankImage{},
@@ -399,19 +339,6 @@ func (r *Builder) mapDataVolume(vm *model.VM, disk hyperv.Disk, diskIndex int, d
 		dv.ObjectMeta.Annotations = make(map[string]string)
 	}
 	dv.ObjectMeta.Annotations[planbase.AnnDiskSource] = disk.ID
-
-	templateData := &api.PVCNameTemplateData{
-		VmName:       vm.Name,
-		TargetVmName: planbase.ResolveTargetVmName(r.Plan, vm.ID, vm.Name),
-		PlanName:     r.Plan.Name,
-		DiskIndex:    diskIndex,
-		VmId:         vm.ID,
-		DiskId:       disk.ID,
-	}
-	pvcNameTemplate := planbase.GetPVCNameTemplate(r.Plan, vm.ID)
-	if err := planbase.SetPVCNameOnObject(&dv.ObjectMeta, pvcNameTemplate, planbase.GetPVCNameTemplateUseGenerateName(r.Plan), templateData); err != nil {
-		return nil, liberr.Wrap(err, "vm", vm.ID, "disk", disk.ID, "diskIndex", diskIndex)
-	}
 	return dv, nil
 }
 
@@ -447,21 +374,8 @@ func (r *Builder) Tasks(vmRef ref.Ref) (tasks []*plan.Task, err error) {
 	return
 }
 
-func (r *Builder) TemplateLabels(vmRef ref.Ref) (labels map[string]string, err error) {
-	vm := &model.VM{}
-	err = r.Source.Inventory.Find(vm, vmRef)
-	if err != nil {
-		err = liberr.Wrap(err, "vm", vmRef.String())
-		return
-	}
-
-	os := mapHypervGuestOS(vm.GuestOS)
-
+func (r *Builder) TemplateLabels(_ ref.Ref) (labels map[string]string, err error) {
 	labels = make(map[string]string)
-	labels[fmt.Sprintf(templateOSLabel, os)] = "true"
-	labels[templateWorkloadLabel] = "true"
-	labels[templateFlavorLabel] = "true"
-
 	return
 }
 

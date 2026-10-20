@@ -2,6 +2,8 @@ package graphemes
 
 import (
 	"bufio"
+
+	"github.com/clipperhouse/stringish"
 )
 
 // is determines if lookup intersects propert(ies)
@@ -26,7 +28,7 @@ const (
 // See https://unicode.org/reports/tr29/#Grapheme_Cluster_Boundaries.
 var SplitFunc bufio.SplitFunc = splitFunc[[]byte]
 
-func splitFunc[T ~string | ~[]byte](data T, atEOF bool) (advance int, token T, err error) {
+func splitFunc[T stringish.Interface](data T, atEOF bool) (advance int, token T, err error) {
 	var empty T
 	if len(data) == 0 {
 		return 0, empty, nil

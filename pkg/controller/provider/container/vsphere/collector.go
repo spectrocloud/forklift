@@ -80,30 +80,28 @@ const (
 	fDrsVmBehavior = "configuration.drsConfig.defaultVmBehavior"
 	fDrsVmCfg      = "configuration.drsVmConfig"
 	// Host
-	fVm                      = "vm"
-	fOverallStatus           = "overallStatus"
-	fProductName             = "config.product.name"
-	fProductVersion          = "config.product.version"
-	fVSwitch                 = "config.network.vswitch"
-	fPortGroup               = "config.network.portgroup"
-	fPNIC                    = "config.network.pnic"
-	fVNIC                    = "config.network.vnic"
-	fVirtualNicManagerNet    = "config.virtualNicManagerInfo.netConfig"
-	fTimezone                = "config.dateTimeInfo.timeZone.name"
-	fInMaintMode             = "summary.runtime.inMaintenanceMode"
-	fCpuSockets              = "summary.hardware.numCpuPkgs"
-	fCpuCores                = "summary.hardware.numCpuCores"
-	fHostMemorySize          = "summary.hardware.memorySize"
-	fThumbprint              = "summary.config.sslThumbprint"
-	fMgtServerIp             = "summary.managementServerIp"
-	fScsiLun                 = "config.storageDevice.scsiLun"
-	fHostBusAdapter          = "config.storageDevice.hostBusAdapter"
-	fScsiTopology            = "config.storageDevice.scsiTopology.adapter"
-	fAdvancedOption          = "configManager.advancedOption"
-	fmodel                   = "hardware.systemInfo.model"
-	fvendor                  = "hardware.systemInfo.vendor"
-	fVMotionSupported        = "capability.vmotionSupported"
-	fStorageVMotionSupported = "capability.storageVMotionSupported"
+	fVm                   = "vm"
+	fOverallStatus        = "overallStatus"
+	fProductName          = "config.product.name"
+	fProductVersion       = "config.product.version"
+	fVSwitch              = "config.network.vswitch"
+	fPortGroup            = "config.network.portgroup"
+	fPNIC                 = "config.network.pnic"
+	fVNIC                 = "config.network.vnic"
+	fVirtualNicManagerNet = "config.virtualNicManagerInfo.netConfig"
+	fTimezone             = "config.dateTimeInfo.timeZone.name"
+	fInMaintMode          = "summary.runtime.inMaintenanceMode"
+	fCpuSockets           = "summary.hardware.numCpuPkgs"
+	fCpuCores             = "summary.hardware.numCpuCores"
+	fHostMemorySize       = "summary.hardware.memorySize"
+	fThumbprint           = "summary.config.sslThumbprint"
+	fMgtServerIp          = "summary.managementServerIp"
+	fScsiLun              = "config.storageDevice.scsiLun"
+	fHostBusAdapter       = "config.storageDevice.hostBusAdapter"
+	fScsiTopology         = "config.storageDevice.scsiTopology.adapter"
+	fAdvancedOption       = "configManager.advancedOption"
+	fmodel                = "hardware.systemInfo.model"
+	fvendor               = "hardware.systemInfo.vendor"
 	// Network
 	fTag     = "tag"
 	fSummary = "summary"
@@ -116,13 +114,11 @@ const (
 	// ResourcePool
 	fResourcePool = "resourcePool"
 	// Datastore
-	fDsType                           = "summary.type"
-	fCapacity                         = "summary.capacity"
-	fFreeSpace                        = "summary.freeSpace"
-	fDsMaintMode                      = "summary.maintenanceMode"
-	fVmfsExtent                       = "info"
-	fDsCapabilityStorageIORMSupported = "capability.storageIORMSupported"
-	fIormConfiguration                = "iormConfiguration"
+	fDsType      = "summary.type"
+	fCapacity    = "summary.capacity"
+	fFreeSpace   = "summary.freeSpace"
+	fDsMaintMode = "summary.maintenanceMode"
+	fVmfsExtent  = "info"
 	// VM
 	fUUID                     = "config.uuid"
 	fInstanceUUID             = "config.instanceUuid"
@@ -304,6 +300,10 @@ type Collector struct {
 	// Cached missing privileges from the last check.
 	missingPrivs   *privilegeCheckResult
 	missingPrivsMu *sync.RWMutex
+	// Committed provider-global custom field definitions (keyed by field key)
+	// so repeated per-VM upserts can be skipped via in-memory comparison.
+	customFieldDefs   map[int32]model.CustomFieldDef
+	customFieldDefsMu *sync.RWMutex
 }
 
 // New collector.
@@ -314,12 +314,14 @@ func New(db libmodel.DB, provider *api.Provider, secret *core.Secret) *Collector
 			provider.GetNamespace(),
 			provider.GetName()))
 	return &Collector{
-		url:            provider.Spec.URL,
-		provider:       provider,
-		secret:         secret,
-		db:             db,
-		log:            nlog,
-		missingPrivsMu: &sync.RWMutex{},
+		url:               provider.Spec.URL,
+		provider:          provider,
+		secret:            secret,
+		db:                db,
+		log:               nlog,
+		missingPrivsMu:    &sync.RWMutex{},
+		customFieldDefs:   map[int32]model.CustomFieldDef{},
+		customFieldDefsMu: &sync.RWMutex{},
 	}
 }
 
@@ -378,7 +380,14 @@ func (r *Collector) Follow(moRef interface{}, p []string, dst interface{}) error
 	if err != nil {
 		return err
 	}
-	defer client.CloseIdleConnections()
+	defer func() {
+		// Every Login here must be paired with a Logout, otherwise each Follow
+		// call leaks a vCenter session for the lifetime of the inventory API.
+		if logoutErr := client.Logout(context.Background()); logoutErr != nil {
+			r.log.V(1).Info("vsphere logout (Follow) failed", "err", logoutErr)
+		}
+		client.CloseIdleConnections()
+	}()
 	return client.RetrieveOne(ctx, ref, p, dst)
 }
 
@@ -387,11 +396,9 @@ func (r *Collector) Test() (status int, err error) {
 	ctx := context.Background()
 	ctx, cancel := context.WithTimeout(ctx, ConnectionTimeout)
 	defer cancel()
+	// Release the client even when connect() fails part-way.
+	defer r.close()
 	status, err = r.connect(ctx)
-	if err == nil {
-		r.close()
-	}
-
 	return
 }
 
@@ -551,11 +558,13 @@ func (r *Collector) getUpdates(ctx context.Context) error {
 			err = tx.Commit()
 			if err != nil {
 				r.log.Error(err, "tx commit failed.")
+				r.resetCustomFieldDefs()
 			}
 		} else {
 			if endErr := tx.End(); endErr != nil {
 				r.log.Error(endErr, "tx rollback failed.")
 			}
+			r.resetCustomFieldDefs()
 		}
 		if err == nil && (updateSet.Truncated == nil || !*updateSet.Truncated) {
 			if !r.parity {
@@ -858,8 +867,15 @@ func (r *Collector) buildClient(ctx context.Context) (*govmomi.Client, error) {
 		SessionManager: session.NewManager(vimClient),
 		Client:         vimClient,
 	}
-	err = client.Login(ctx, url.User)
-	return client, err
+	if err = client.Login(ctx, url.User); err != nil {
+		// Mirror govmomi.NewClient: on Login failure best-effort Logout (a
+		// partial session may exist), release keep-alive sockets, and return a
+		// nil client so callers cannot reference a half-built one.
+		_ = client.Logout(context.Background())
+		client.CloseIdleConnections()
+		return nil, err
+	}
+	return client, nil
 
 }
 
@@ -999,8 +1015,6 @@ func (r *Collector) propertySpec() []types.PropertySpec {
 				fScsiTopology,
 				fmodel,
 				fvendor,
-				fVMotionSupported,
-				fStorageVMotionSupported,
 			},
 		},
 		{ // Network
@@ -1049,8 +1063,6 @@ func (r *Collector) propertySpec() []types.PropertySpec {
 				fDsMaintMode,
 				fVmfsExtent,
 				fHost,
-				fDsCapabilityStorageIORMSupported,
-				fIormConfiguration,
 			},
 		},
 		{ // VM
@@ -1271,7 +1283,7 @@ func (r *Collector) selectAdapter(u types.ObjectUpdate) (Adapter, bool) {
 }
 
 // Object created.
-func (r Collector) applyEnter(tx *libmodel.Tx, u types.ObjectUpdate) error {
+func (r *Collector) applyEnter(tx *libmodel.Tx, u types.ObjectUpdate) error {
 	adapter, selected := r.selectAdapter(u)
 	if !selected {
 		return nil
@@ -1282,12 +1294,16 @@ func (r Collector) applyEnter(tx *libmodel.Tx, u types.ObjectUpdate) error {
 	if err != nil {
 		return liberr.Wrap(err)
 	}
+	err = r.upsertCustomFieldDefs(tx, u)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
 
 	return nil
 }
 
 // Object modified.
-func (r Collector) applyModify(tx *libmodel.Tx, u types.ObjectUpdate) error {
+func (r *Collector) applyModify(tx *libmodel.Tx, u types.ObjectUpdate) error {
 	adapter, selected := r.selectAdapter(u)
 	if !selected {
 		return nil
@@ -1302,8 +1318,99 @@ func (r Collector) applyModify(tx *libmodel.Tx, u types.ObjectUpdate) error {
 	if err != nil {
 		return liberr.Wrap(err)
 	}
+	err = r.upsertCustomFieldDefs(tx, u)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
 
 	return nil
+}
+
+// Upsert the custom field definitions reported on a VirtualMachine update
+// into the provider-global CustomFieldDef table. The same global definition
+// set is reported per-VM, so inserting by key naturally de-duplicates it.
+//
+// The set of definitions is provider-global and identical for every VM, so it
+// is cached in memory. When the reported set matches the cache, the DB
+// upserts are skipped entirely, avoiding repeated inserts on every VM update.
+func (r *Collector) upsertCustomFieldDefs(tx *libmodel.Tx, u types.ObjectUpdate) (err error) {
+	if u.Obj.Type != VirtualMachine {
+		return nil
+	}
+	var reported []types.CustomFieldDef
+	for _, p := range u.ChangeSet {
+		if p.Name != fAvailableField {
+			continue
+		}
+		customFields, ok := p.Val.(types.ArrayOfCustomFieldDef)
+		if !ok {
+			return nil
+		}
+		reported = customFields.CustomFieldDef
+	}
+	if len(reported) == 0 {
+		return nil
+	}
+
+	incoming := make(map[int32]model.CustomFieldDef, len(reported))
+	for _, f := range reported {
+		incoming[f.Key] = model.CustomFieldDef{
+			Name:              f.Name,
+			Key:               f.Key,
+			ManagedObjectType: f.ManagedObjectType,
+		}
+	}
+
+	r.customFieldDefsMu.RLock()
+	equal := equalCustomFieldDefs(r.customFieldDefs, incoming)
+	r.customFieldDefsMu.RUnlock()
+	if equal {
+		return nil
+	}
+
+	for _, f := range reported {
+		def := &model.CustomFieldDef{
+			Name:              f.Name,
+			Key:               f.Key,
+			ManagedObjectType: f.ManagedObjectType,
+		}
+		if err = tx.Insert(def); err != nil {
+			return liberr.Wrap(err)
+		}
+	}
+
+	// The cache is updated in place. If the surrounding transaction is rolled
+	// back, resetCustomFieldDefs drops it so a later retry reinserts the defs
+	// rather than skipping them on a stale cache.
+	r.customFieldDefsMu.Lock()
+	r.customFieldDefs = incoming
+	r.customFieldDefsMu.Unlock()
+
+	return nil
+}
+
+// resetCustomFieldDefs drops the cached custom field definitions. It is called
+// when the transaction that updated them is rolled back, so that the cache
+// never reflects definitions that were not committed to the DB.
+func (r *Collector) resetCustomFieldDefs() {
+	r.customFieldDefsMu.Lock()
+	r.customFieldDefs = map[int32]model.CustomFieldDef{}
+	r.customFieldDefsMu.Unlock()
+}
+
+// equalCustomFieldDefs reports whether the two provider-global custom field
+// definition sets are identical.
+func equalCustomFieldDefs(a, b map[int32]model.CustomFieldDef) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok || av != bv {
+			return false
+		}
+	}
+	return true
 }
 
 // Object deleted.

@@ -266,10 +266,8 @@ func TestNetworksMapped_TrulyDisconnectedNICSkipped(t *testing.T) {
 		t.Error("expected ok=true: truly disconnected NIC (empty name and ID) should be skipped")
 	}
 }
+
 func TestPVCNameTemplate_UsesInventoryVMIdentity(t *testing.T) {
-	// lookupID differs from inventoryID to prove that Find() resolves the
-	// actual inventory VM, and ResolveTargetVmName uses the inventory vm.ID
-	// (not the vmRef.ID from the caller).
 	lookupID := "lookup-ref-id"
 	inventoryID := "358ce831-f790-4ad9-8ee0-ee272b0ecac4"
 	inventoryName := "rhel9-node_2"
@@ -297,8 +295,6 @@ func TestPVCNameTemplate_UsesInventoryVMIdentity(t *testing.T) {
 		},
 	}
 
-	// Template that only produces a valid name when TargetVmName equals the
-	// explicit targetName from the plan spec.
 	tmpl := `{{if eq .TargetVmName "my-custom-target"}}ok-{{.DiskIndex}}{{else}}INVALID{{end}}`
 
 	ok, err := v.PVCNameTemplate(ref.Ref{ID: lookupID}, tmpl)

@@ -22,14 +22,14 @@ func (r *Collector) collectNetworks(ctx context.Context) error {
 		m := &model.Network{}
 
 		if awsVpc.VpcId != nil {
-			m.ID = *awsVpc.VpcId
+			m.UID = *awsVpc.VpcId
 		} else {
 			continue
 		}
 
 		m.Name = getNameFromTags(awsVpc.Tags)
 		if m.Name == "" {
-			m.Name = m.ID
+			m.Name = m.UID
 		}
 
 		m.Kind = "Network"
@@ -44,7 +44,7 @@ func (r *Collector) collectNetworks(ctx context.Context) error {
 
 		// Check if record exists and has changed
 		existing := &model.Network{}
-		existing.ID = m.ID
+		existing.UID = m.UID
 		if err := r.db.Get(existing); err == nil {
 			// Record exists - check if it changed
 			if !existing.HasChanged(m) {
@@ -54,7 +54,7 @@ func (r *Collector) collectNetworks(ctx context.Context) error {
 			// Changed - update with incremented revision
 			m.Revision = existing.Revision + 1
 			if err := r.db.Update(m); err != nil {
-				r.log.Error(err, "Failed to update VPC", "vpcId", m.ID)
+				r.log.Error(err, "Failed to update VPC", "vpcId", m.UID)
 				continue
 			}
 			totalUpdated++
@@ -62,7 +62,7 @@ func (r *Collector) collectNetworks(ctx context.Context) error {
 			// New record - insert
 			m.Revision = 1
 			if err := r.db.Insert(m); err != nil {
-				r.log.Error(err, "Failed to insert VPC", "vpcId", m.ID)
+				r.log.Error(err, "Failed to insert VPC", "vpcId", m.UID)
 				continue
 			}
 			totalCreated++
@@ -81,14 +81,14 @@ func (r *Collector) collectNetworks(ctx context.Context) error {
 		m := &model.Network{}
 
 		if awsSubnet.SubnetId != nil {
-			m.ID = *awsSubnet.SubnetId
+			m.UID = *awsSubnet.SubnetId
 		} else {
 			continue
 		}
 
 		m.Name = getNameFromTags(awsSubnet.Tags)
 		if m.Name == "" {
-			m.Name = m.ID
+			m.Name = m.UID
 		}
 
 		m.Kind = "Network"
@@ -103,7 +103,7 @@ func (r *Collector) collectNetworks(ctx context.Context) error {
 
 		// Check if record exists and has changed
 		existing := &model.Network{}
-		existing.ID = m.ID
+		existing.UID = m.UID
 		if err := r.db.Get(existing); err == nil {
 			// Record exists - check if it changed
 			if !existing.HasChanged(m) {
@@ -113,7 +113,7 @@ func (r *Collector) collectNetworks(ctx context.Context) error {
 			// Changed - update with incremented revision
 			m.Revision = existing.Revision + 1
 			if err := r.db.Update(m); err != nil {
-				r.log.Error(err, "Failed to update Subnet", "subnetId", m.ID)
+				r.log.Error(err, "Failed to update Subnet", "subnetId", m.UID)
 				continue
 			}
 			totalUpdated++
@@ -121,7 +121,7 @@ func (r *Collector) collectNetworks(ctx context.Context) error {
 			// New record - insert
 			m.Revision = 1
 			if err := r.db.Insert(m); err != nil {
-				r.log.Error(err, "Failed to insert Subnet", "subnetId", m.ID)
+				r.log.Error(err, "Failed to insert Subnet", "subnetId", m.UID)
 				continue
 			}
 			totalCreated++

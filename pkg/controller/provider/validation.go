@@ -18,7 +18,6 @@ import (
 	"github.com/kubev2v/forklift/pkg/controller/provider/container"
 	vsphereCollector "github.com/kubev2v/forklift/pkg/controller/provider/container/vsphere"
 	vsphere "github.com/kubev2v/forklift/pkg/controller/provider/model/vsphere"
-	providervalidation "github.com/kubev2v/forklift/pkg/controller/provider/validation"
 	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	"github.com/kubev2v/forklift/pkg/lib/inventory/model"
@@ -125,11 +124,29 @@ func (r *Reconciler) validate(provider *api.Provider) error {
 	if err != nil {
 		return liberr.Wrap(err)
 	}
+	err = r.validateVSpherePrivileges(provider)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
 	err = r.inventoryCreated(provider)
 	if err != nil {
 		return liberr.Wrap(err)
 	}
-	err = providervalidation.Build(r, r.Client).Validate(provider, secret)
+
+	// Validate SSH readiness for vSphere providers when SSH method is enabled
+	err = r.validateSSHReadiness(provider, secret)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+
+	// Validate SMB CSI driver for HyperV providers
+	err = r.validateSMBCSI(provider)
+	if err != nil {
+		return liberr.Wrap(err)
+	}
+
+	// Validate Hyper-V settings (managementType)
+	err = r.validateHyperVSettings(provider)
 	if err != nil {
 		return liberr.Wrap(err)
 	}
@@ -412,23 +429,6 @@ func (r *Reconciler) validateSecret(provider *api.Provider) (secret *core.Secret
 		}
 		tlsURL := buildTLSURL(provider.Spec.URL, hvutil.WinRMPort(provider.Spec.Settings))
 		r.validateTLSConnection(provider, secret, tlsURL, insecureSkipVerify)
-	case api.Nutanix:
-		keyList = []string{
-			"user",
-			"password",
-		}
-
-		// Check insecure flag once and use it for both validation and connection status
-		insecureSkipVerify := base.GetInsecureSkipVerifyFlag(secret)
-
-		// Validate required keys based on TLS settings
-		if !insecureSkipVerify && !util.HasCACert(secret) {
-			keyList = append(keyList, "ca.crt")
-			break
-		}
-
-		// Validate connection status
-		r.validateTLSConnection(provider, secret, provider.Spec.URL, insecureSkipVerify)
 	}
 	for _, key := range keyList {
 		if _, found := secret.Data[key]; !found {
@@ -505,7 +505,7 @@ func (r *Reconciler) testConnection(provider *api.Provider, secret *core.Secret)
 }
 
 // Validate vSphere service account privileges.
-func (r *Reconciler) ValidateVSpherePrivileges(provider *api.Provider) error {
+func (r *Reconciler) validateVSpherePrivileges(provider *api.Provider) error {
 	if provider.Type() != api.VSphere {
 		return nil
 	}
@@ -1049,7 +1049,7 @@ func (r *Reconciler) loadHostIPs(provider *api.Provider) map[string]string {
 }
 
 // validateSSHReadiness validates SSH readiness for vSphere providers when SSH method is enabled
-func (r *Reconciler) ValidateSSHReadiness(provider *api.Provider, secret *core.Secret) error {
+func (r *Reconciler) validateSSHReadiness(provider *api.Provider, secret *core.Secret) error {
 	// Only validate SSH for vSphere providers
 	if provider.Type() != api.VSphere {
 		r.Log.V(3).Info("SSH validation: skipping non-vSphere provider",
@@ -1335,7 +1335,7 @@ func isValidSMBPath(smbPath string) bool {
 
 // validateSMBCSI validates that the SMB CSI driver is installed for HyperV providers.
 // HyperV migrations require the SMB CSI driver (smb.csi.k8s.io) to mount SMB shares.
-func (r *Reconciler) ValidateSMBCSI(provider *api.Provider) error {
+func (r *Reconciler) validateSMBCSI(provider *api.Provider) error {
 	if provider.Type() != api.HyperV {
 		return nil
 	}
@@ -1364,7 +1364,7 @@ func (r *Reconciler) ValidateSMBCSI(provider *api.Provider) error {
 	return nil
 }
 
-func (r *Reconciler) ValidateHyperVSettings(provider *api.Provider) error {
+func (r *Reconciler) validateHyperVSettings(provider *api.Provider) error {
 	if provider.Type() != api.HyperV {
 		return nil
 	}

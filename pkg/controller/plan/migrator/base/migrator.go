@@ -61,10 +61,6 @@ func (r *BaseMigrator) Reset(vm *plan.VMStatus, pipeline []*plan.Step) {
 	vm.Phase = step.Name
 	vm.Pipeline = pipeline
 	vm.Error = nil
-	if r.IsResumeConversion() {
-		return
-	}
-	vm.DisksCopied = false
 	if r.Context.Plan.IsWarm() {
 		vm.Warm = &plan.Warm{}
 	}
@@ -85,7 +81,8 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 						Progress:    libitr.Progress{Total: 1},
 						Phase:       api.StepPending,
 					},
-				})
+				},
+			)
 		case api.PhasePreHook:
 			pipeline = append(
 				pipeline,
@@ -96,7 +93,8 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 						Progress:    libitr.Progress{Total: 1},
 						Phase:       api.StepPending,
 					},
-				})
+				},
+			)
 		case api.PhaseAllocateDisks, api.PhaseCopyDisks, api.PhaseCopyDisksVirtV2V, api.PhaseConvertOpenstackSnapshot:
 			tasks, pErr := r.builder.Tasks(vm.Ref)
 			if pErr != nil {
@@ -140,7 +138,8 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 						Phase: api.StepPending,
 					},
 					Tasks: tasks,
-				})
+				},
+			)
 		case api.PhaseFinalize:
 			tasks, pErr := r.builder.Tasks(vm.Ref)
 			if pErr != nil {
@@ -165,7 +164,8 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 						},
 					},
 					Tasks: tasks,
-				})
+				},
+			)
 		case api.PhaseConvertGuest:
 			pipeline = append(
 				pipeline,
@@ -176,7 +176,8 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 						Progress:    libitr.Progress{Total: 1},
 						Phase:       api.StepPending,
 					},
-				})
+				},
+			)
 		case api.PhasePostHook:
 			pipeline = append(
 				pipeline,
@@ -187,7 +188,8 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 						Progress:    libitr.Progress{Total: 1},
 						Phase:       api.StepPending,
 					},
-				})
+				},
+			)
 		case api.PhaseCreateVM:
 			pipeline = append(
 				pipeline,
@@ -198,7 +200,8 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 						Phase:       api.StepPending,
 						Progress:    libitr.Progress{Total: 1},
 					},
-				})
+				},
+			)
 		case api.PhaseWaitForGuestReboots:
 			pipeline = append(
 				pipeline,
@@ -209,7 +212,8 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 						Phase:       api.StepPending,
 						Progress:    libitr.Progress{Total: 1},
 					},
-				})
+				},
+			)
 		case api.PhasePreflightInspection:
 			pipeline = append(
 				pipeline,
@@ -220,7 +224,8 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 						Phase:       api.StepPending,
 						Progress:    libitr.Progress{Total: 1},
 					},
-				})
+				},
+			)
 		case api.PhaseWaitForFinalSnapshotRemoval:
 			pipeline = append(
 				pipeline,
@@ -231,7 +236,8 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 						Phase:       api.StepPending,
 						Progress:    libitr.Progress{Total: 1},
 					},
-				})
+				},
+			)
 		}
 		next, done, _ := itinerary.Next(step.Name)
 		if !done {
@@ -249,19 +255,18 @@ func (r *BaseMigrator) Pipeline(vm plan.VM) (pipeline []*plan.Step, err error) {
 	r.Log.V(2).Info(
 		"Pipeline built.",
 		"vm",
-		vm.String())
+		vm.String(),
+	)
 	return
 }
 
 func (r *BaseMigrator) Itinerary(vm plan.VM) (itinerary *libitr.Itinerary) {
-	switch {
-	case r.IsResumeConversion():
-		itinerary = r.resumeConversionItinerary()
-	case r.Plan.Spec.Type == api.MigrationOnlyConversion:
+	// Plan.Spec.Type supersedes the deprecated Warm boolean.
+	if r.Context.Plan.Spec.Type == api.MigrationOnlyConversion {
 		itinerary = r.onlyConversionItinerary()
-	case r.Plan.IsWarm():
+	} else if r.Context.Plan.IsWarm() {
 		itinerary = r.warmItinerary()
-	default:
+	} else {
 		itinerary = r.coldItinerary()
 	}
 	itinerary.Predicate = &BasePredicate{vm: &vm, context: r.Context}
@@ -407,56 +412,22 @@ func (r *BaseMigrator) onlyConversionItinerary() *libitr.Itinerary {
 	}
 }
 
-// resumeConversionItinerary skips disk copy AND power-off (source was already
-// powered off during the original migration's cutover).
-func (r *BaseMigrator) resumeConversionItinerary() *libitr.Itinerary {
-	return &libitr.Itinerary{
-		Name: "ResumeConversion",
-		Pipeline: libitr.Pipeline{
-			{Name: api.PhaseStarted},
-			{Name: api.PhasePreHook, All: HasPreHook},
-			{Name: api.PhaseCreateGuestConversionPod, All: RequiresConversion},
-			{Name: api.PhaseConvertGuest, All: RequiresConversion},
-			{Name: api.PhaseCreateVM},
-			{Name: api.PhaseWaitForGuestReboots, All: WindowsWaitForGuestReboot},
-			{Name: api.PhasePostHook, All: HasPostHook},
-			{Name: api.PhaseCompleted},
-		},
-	}
-}
-
 // Step predicate.
 type BasePredicate struct {
 	// VM listed on the plan.
 	vm *plan.VM
 	// Plan context
 	context *plancontext.Context
-	// Cached ShouldUseV2vForTransfer result (one destination API path per VM per pipeline build).
-	useV2vForTransfer *bool
-	useV2vResolved    bool
-	useV2vErr         error
-}
-
-// ensureUseV2vForTransfer loads and caches ShouldUseV2vForTransfer at most once per BasePredicate.
-func (r *BasePredicate) ensureUseV2vForTransfer() (bool, error) {
-	if r.useV2vResolved {
-		if r.useV2vErr != nil {
-			return false, r.useV2vErr
-		}
-		return *r.useV2vForTransfer, nil
-	}
-	result, vErr := r.context.Plan.ShouldUseV2vForTransfer(r.vm.Ref)
-	r.useV2vResolved = true
-	if vErr != nil {
-		r.useV2vErr = vErr
-		return false, vErr
-	}
-	r.useV2vForTransfer = &result
-	return result, nil
 }
 
 // Evaluate predicate flags.
 func (r *BasePredicate) Evaluate(flag libitr.Flag) (allowed bool, err error) {
+	useV2vForTransfer, vErr := r.context.Plan.ShouldUseV2vForTransfer(r.vm.Ref)
+	if vErr != nil {
+		err = vErr
+		return
+	}
+
 	switch flag {
 	case HasPreHook:
 		_, allowed = r.vm.FindHook(api.PhasePreHook)
@@ -465,18 +436,8 @@ func (r *BasePredicate) Evaluate(flag libitr.Flag) (allowed bool, err error) {
 	case RequiresConversion:
 		allowed = r.context.Source.Provider.RequiresConversion() && !r.context.Plan.Spec.SkipGuestConversion
 	case CDIDiskCopy:
-		var useV2vForTransfer bool
-		useV2vForTransfer, err = r.ensureUseV2vForTransfer()
-		if err != nil {
-			return
-		}
 		allowed = !useV2vForTransfer
 	case VirtV2vDiskCopy:
-		var useV2vForTransfer bool
-		useV2vForTransfer, err = r.ensureUseV2vForTransfer()
-		if err != nil {
-			return
-		}
 		allowed = useV2vForTransfer
 	case OpenstackImageMigration:
 		allowed = r.context.Plan.IsSourceProviderOpenstack()

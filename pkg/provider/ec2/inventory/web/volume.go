@@ -53,7 +53,7 @@ func (h *VolumeHandler) List(ctx *gin.Context) {
 	var result []interface{}
 	for _, volume := range list {
 		r := &Volume{}
-		r.ID = volume.ID
+		r.ID = volume.UID
 		r.Name = volume.Name
 		r.Revision = volume.Revision
 		r.Link(h.Provider)
@@ -77,7 +77,7 @@ func (h *VolumeHandler) Get(ctx *gin.Context) {
 	}
 
 	volume := &model.Volume{}
-	volume.ID = ctx.Param("id")
+	volume.UID = ctx.Param("id")
 
 	db := h.Collector.DB()
 	err = db.Get(volume)
@@ -87,7 +87,7 @@ func (h *VolumeHandler) Get(ctx *gin.Context) {
 	}
 
 	r := &Volume{}
-	r.ID = volume.ID
+	r.ID = volume.UID
 	r.Name = volume.Name
 	r.Revision = volume.Revision
 	r.Link(h.Provider)
@@ -114,7 +114,7 @@ func (h *VolumeHandler) watch(ctx *gin.Context) {
 		func(in libmodel.Model) (r interface{}) {
 			m := in.(*model.Volume)
 			volume := &Volume{}
-			volume.ID = m.ID
+			volume.ID = m.UID
 			volume.Name = m.Name
 			volume.Revision = m.Revision
 			volume.Link(h.Provider)

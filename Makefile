@@ -9,7 +9,6 @@
 .DEFAULT_GOAL := help
 
 GOOS ?= $(shell go env GOOS)
-GOARCH ?= $(shell go env GOARCH)
 GOPATH ?= $(shell go env GOPATH)
 GOBIN ?= $(GOPATH)/bin
 # GO111MODULE is enabled by default in modern Go; uncomment to force
@@ -40,13 +39,6 @@ ifneq ($(PLATFORM),)
 PLATFORM_FLAG := --platform $(PLATFORM)
 else
 PLATFORM_FLAG :=
-endif
-
-# Docker buildx adds attestation manifests by default, turning single-platform
-# images into manifest lists. This breaks `docker manifest create` which expects
-# plain images. Disable provenance to keep images as single-platform manifests.
-ifeq ($(CONTAINER_RUNTIME),docker)
-PLATFORM_FLAG += --provenance=false
 endif
 
 # Extract architecture from PLATFORM for image tag suffix
@@ -86,11 +78,6 @@ OPM_OPTS ?=
 # By default use the controller gen installed by the
 # 'controller-gen' target
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
-
-# By default use the operator-sdk installed by the
-# 'operator-sdk' target
-OPERATOR_SDK ?= $(LOCALBIN)/operator-sdk
-OPERATOR_SDK_VERSION ?= v1.42.3
 
 # By default use the kubectl installed by the
 # 'kubectl' target
@@ -171,7 +158,7 @@ help: ## Show this help message
 		/^[a-zA-Z_0-9-]+:.*?## / { printf "  \033[36m%-40s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 .PHONY: ci
-ci: all tidy vendor generate-verify lint ## Run full CI pipeline
+ci: all tidy vendor generate-verify lint validate-forklift-controller-crd ## Run full CI pipeline
 
 .PHONY: all
 all: test forklift-controller ## Run tests and build controller binary
@@ -208,6 +195,11 @@ e2e-sanity-ova: ## Run OVA e2e tests
 .PHONY: validation-test
 validation-test: opa-bin ## Run OPA validation policy tests
 	ENVIRONMENT=test ${OPA} test validation/policies --explain fails
+
+.PHONY: validate-forklift-controller-crd
+validate-forklift-controller-crd: ## Validate ForkliftController CRD schema
+	@echo "Validating ForkliftController CRD..."
+	python3 hack/validate_forklift_controller_crd.py
 
 # CRD API changelog (hack/crd_changelog_diff.py)
 TO_REF ?= HEAD
@@ -288,12 +280,6 @@ generate-verify: generate ## Verify generated code is up to date
 manifests: controller-gen ## Generate CRD and webhook manifests
 	$(CONTROLLER_GEN) crd rbac:roleName=manager-role webhook paths="./pkg/apis/..." output:dir=operator/config/crd/bases
 
-.PHONY: generate-csv
-generate-csv: operator-sdk ## Generate CSV specDescriptors from Go markers
-	cd operator && $(OPERATOR_SDK) generate kustomize manifests \
-		--plugins go.kubebuilder.io/v4 --package $(OPERATOR_NAME) \
-		--apis-dir ../pkg/apis --interactive=false -q
-
 MANIFEST_VARS = $${CSV_NAME} $${CSV_DISPLAYNAME} $${NAMESPACE} $${CSV_CERTIFIED} $${CSV_SUPPORT} $${MAINTAINER_NAME} $${MAINTAINER_EMAIL} $${PROVIDER} $${DOCS_LINK_NAME} $${DOCS_LINK_URL}
 
 .PHONY: generate-manifests
@@ -304,7 +290,7 @@ generate-manifests: kubectl manifests ## Generate upstream and downstream manife
 		$(KUBECTL) kustomize operator/streams/downstream | envsubst '$(MANIFEST_VARS)' > operator/.downstream_manifests
 
 .PHONY: update-manifests
-update-manifests: generate generate-csv generate-manifests ## Regenerate all code and manifests
+update-manifests: generate generate-manifests ## Regenerate all code and manifests
 	@echo "All manifests updated successfully!"
 	@echo "  - Upstream deployment: operator/.upstream_manifests"
 	@echo "  - Downstream deployment: operator/.downstream_manifests"
@@ -372,6 +358,13 @@ push-virt-v2v-xfs-image: build-virt-v2v-xfs-image
 		$(CONTAINER_CMD) push $(VIRT_V2V_IMAGE_RHEL9)$(PLATFORM_SUFFIX); \
 	fi
 
+build-virt-v2v-fedora-image: check_container_runtime
+	$(eval VIRT_V2V_IMAGE=$(REGISTRY)/$(REGISTRY_ORG)/forklift-virt-v2v:$(REGISTRY_TAG))
+	$(CONTAINER_CMD) build $(PLATFORM_FLAG) -t $(VIRT_V2V_IMAGE)$(PLATFORM_SUFFIX) -f build/virt-v2v/Containerfile-upstream-fedora .
+
+push-virt-v2v-fedora-image: build-virt-v2v-fedora-image
+	$(CONTAINER_CMD) push $(VIRT_V2V_IMAGE)$(PLATFORM_SUFFIX)
+
 build-operator-bundle-image: check_container_runtime
 	$(CONTAINER_CMD) build $(PLATFORM_FLAG) $(BUILD_LABEL_ARGS) \
 		-t $(OPERATOR_BUNDLE_IMAGE)$(PLATFORM_SUFFIX) \
@@ -393,7 +386,8 @@ build-operator-bundle-image: check_container_runtime
 		--build-arg HYPERV_PROVIDER_SERVER_IMAGE=$(HYPERV_PROVIDER_SERVER_IMAGE)$(PLATFORM_SUFFIX) \
 		--build-arg OVA_PROXY_IMAGE=$(OVA_PROXY_IMAGE)$(PLATFORM_SUFFIX) \
 		--build-arg VSPHERE_COPY_OFFLOAD_POPULATOR_IMAGE=$(VSPHERE_COPY_OFFLOAD_POPULATOR_IMAGE)$(PLATFORM_SUFFIX) \
-		--build-arg VIRT_V2V_IMAGE_RHEL9=$(VIRT_V2V_IMAGE_RHEL9)$(PLATFORM_SUFFIX)
+		--build-arg VIRT_V2V_IMAGE_RHEL9=$(VIRT_V2V_IMAGE_RHEL9)$(PLATFORM_SUFFIX) \
+		--build-arg DEEP_INSPECTION_IMAGE=$(DEEP_INSPECTION_IMAGE)$(PLATFORM_SUFFIX)
 
 push-operator-bundle-image: build-operator-bundle-image
 	$(CONTAINER_CMD) push $(OPERATOR_BUNDLE_IMAGE)$(PLATFORM_SUFFIX)
@@ -486,7 +480,7 @@ build-deep-inspection-image: check_container_runtime ## Build forklift-deep-insp
 		echo "Notice: deep-inspection image build is only supported on amd64 platform."; \
 		echo "Current platform: $(PLATFORM) - skipping deep-inspection image build."; \
 	else \
-		$(CONTAINER_CMD) build $(PLATFORM_FLAG) $(BUILD_LABEL_ARGS) -t $(DEEP_INSPECTION_IMAGE)$(PLATFORM_SUFFIX) -f build/deep-inspection/Containerfile-upstream .; \
+		$(CONTAINER_CMD) build $(PLATFORM_FLAG) $(BUILD_LABEL_ARGS) -t $(DEEP_INSPECTION_IMAGE)$(PLATFORM_SUFFIX) -f build/deep-inspection/Containerfile .; \
 	fi
 
 push-deep-inspection-image: build-deep-inspection-image ## Push forklift-deep-inspection image
@@ -498,7 +492,6 @@ push-deep-inspection-image: build-deep-inspection-image ## Push forklift-deep-in
 	fi
 
 build-all-images: ## Build all container images
-# NOTE: build-deep-inspection-image is excluded until build/deep-inspection/Containerfile-upstream exists
 build-all-images: build-api-image \
                   build-controller-image \
                   build-validation-image \
@@ -513,11 +506,11 @@ build-all-images: build-api-image \
                   build-hyperv-provider-server-image \
                   build-cli-download-image \
                   build-ova-proxy-image \
+                  build-deep-inspection-image \
                   build-operator-bundle-image \
                   build-operator-index-image
 
 push-all-images: ## Push all container images
-# NOTE: push-deep-inspection-image is excluded until build/deep-inspection/Containerfile-upstream exists
 push-all-images:  push-api-image \
                   push-controller-image \
                   push-validation-image \
@@ -532,6 +525,7 @@ push-all-images:  push-api-image \
                   push-hyperv-provider-server-image \
                   push-cli-download-image \
                   push-ova-proxy-image \
+                  push-deep-inspection-image \
                   push-operator-bundle-image \
                   push-operator-index-image
 
@@ -714,15 +708,12 @@ deploy-ocp-controller: kubectl ## Deploy ForkliftController CR on OpenShift. Usa
 	fi; \
 	KUBECTL=$(KUBECTL) ./hack/deploy-ocp-controller.sh $$NAMESPACE
 
-.PHONY: deploy-all
-deploy-all: deploy-operator-index deploy-ocp deploy-ocp-controller ## Deploy operator index, OLM subscription, and ForkliftController CR in sequence
-
 .PHONY: remove-deployment
 remove-deployment: ## Remove all Forklift resources from the cluster. Usage: make remove-deployment [NAMESPACE=konveyor-forklift] [DRY_RUN=true]
 	@ARGS=""; \
 	if [ "$(DRY_RUN)" = "true" ]; then ARGS="$$ARGS --dry-run"; fi; \
 	if [ -n "$(NAMESPACE)" ]; then ARGS="$$ARGS --namespace $(NAMESPACE)"; fi; \
-	KUBECTL=$(KUBECTL) bash ./hack/remove-deployment.sh $$ARGS
+	KUBECTL=$(KUBECTL) ./hack/remove-deployment.sh $$ARGS
 
 ##@ Tool Installation
 
@@ -734,19 +725,12 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 .PHONY: kubectl
 kubectl: $(KUBECTL) ## Install kubectl
 $(DEFAULT_KUBECTL):
-	curl -L https://dl.k8s.io/release/v1.25.10/bin/$(GOOS)/$(GOARCH)/kubectl -o $(GOBIN)/kubectl && chmod +x $(GOBIN)/kubectl
+	curl -L https://dl.k8s.io/release/v1.25.10/bin/linux/amd64/kubectl -o $(GOBIN)/kubectl && chmod +x $(GOBIN)/kubectl
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Install kustomize
 $(DEFAULT_KUSTOMIZE):
 	go install sigs.k8s.io/kustomize/kustomize/v5@v5.7.0
-
-.PHONY: operator-sdk
-operator-sdk: $(OPERATOR_SDK) ## Install operator-sdk tool
-$(OPERATOR_SDK): $(LOCALBIN)
-	curl -sSLo $(OPERATOR_SDK) https://github.com/operator-framework/operator-sdk/releases/download/$(OPERATOR_SDK_VERSION)/operator-sdk_$(GOOS)_$(shell go env GOARCH)
-	chmod +x $(OPERATOR_SDK)
-	codesign --force --sign - $(OPERATOR_SDK) 2>/dev/null || true
 
 mockgen-install:
 	go install go.uber.org/mock/mockgen@v0.4.0

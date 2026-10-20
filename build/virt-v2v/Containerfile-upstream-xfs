@@ -56,6 +56,28 @@ RUN cp /usr/sbin/xfs_repair /usr/sbin/xfs_repair.original && \
     chmod 755 /usr/sbin/xfs_repair && \
     echo '/usr/sbin/xfs_repair.original' >> /usr/lib64/guestfs/supermin.d/hostfiles
 
+# libguestfs >= 1.52 gives the appliance its network via passt, which sandboxes
+# itself by dropping to "nobody" before creating its namespaces -- and the kernel
+# clears capabilities on that setuid(), so the sandbox setup fails with EPERM and
+# the appliance never gets its network. The wrapper keeps uid 0 so it succeeds;
+# see the file for the full explanation.
+#
+# /usr/bin/passt is the generic build, which re-execs "<its own path>.avx2" on an
+# AVX2-capable CPU, so the original we move aside needs its .avx2 beside it too --
+# otherwise passt keeps its generic code path and logs "Can't run AVX2 build,
+# using non-AVX2 version" on every run.
+COPY build/virt-v2v/passt_wrapper.sh /tmp/passt_wrapper.sh
+RUN if [ -x /usr/bin/passt ]; then \
+        mv /usr/bin/passt /usr/bin/passt.orig && \
+        cp /tmp/passt_wrapper.sh /usr/bin/passt && \
+        chmod 755 /usr/bin/passt && \
+        if [ -x /usr/bin/passt.avx2 ]; then \
+            ln -sf /usr/bin/passt.avx2 /usr/bin/passt.orig.avx2; \
+        fi; \
+    else \
+        echo 'passt is not installed, no wrapper needed'; \
+    fi
+
 # This prevents libvirt from attempting to create files in the root directory,
 # which would lead to permission errors.
 # Refer to: https://issues.redhat.com/browse/RHEL-105490

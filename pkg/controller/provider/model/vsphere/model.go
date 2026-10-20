@@ -1,12 +1,13 @@
 package vsphere
 
 import (
+	"strconv"
+
 	"github.com/kubev2v/forklift/pkg/controller/provider/model/base"
 	libmodel "github.com/kubev2v/forklift/pkg/lib/inventory/model"
 )
 
 type ProtocolType string
-type IORMThresholdMode string
 
 // Variants.
 const (
@@ -27,9 +28,6 @@ const (
 	ProtocolPCIe         ProtocolType = "PCIe"         // PCI Express storage interface
 	ProtocolRDMA         ProtocolType = "RDMA"         // Remote Direct Memory Access
 	ProtocolTCP          ProtocolType = "TCP"          // Generic TCP-based adapter
-	// IORM Congestion Threshold Mode
-	IORMThresholdModeAutomatic IORMThresholdMode = "automatic"
-	IORMThresholdModeManual    IORMThresholdMode = "manual"
 )
 
 // Bus types
@@ -151,29 +149,27 @@ type Cluster struct {
 
 type Host struct {
 	Base
-	Cluster                 string             `sql:"d0,index(cluster)"`
-	Status                  string             `sql:""`
-	InMaintenanceMode       bool               `sql:""`
-	ManagementServerIp      string             `sql:""`
-	ManagementIPs           []string           `sql:""`
-	Thumbprint              string             `sql:""`
-	Timezone                string             `sql:""`
-	CpuSockets              int16              `sql:""`
-	CpuCores                int16              `sql:""`
-	MemoryBytes             int64              `sql:""`
-	ProductName             string             `sql:""`
-	ProductVersion          string             `sql:""`
-	Model                   string             `sql:""`
-	Vendor                  string             `sql:""`
-	Network                 HostNetwork        `sql:""`
-	Networks                []Ref              `sql:""`
-	Datastores              []Ref              `sql:""`
-	HostScsiDisks           []HostScsiDisk     `sql:""`
-	AdvancedOptions         Ref                `sql:""`
-	HbaDiskInfo             []HbaDiskInfo      `sql:""`
-	HostScsiTopology        []HostScsiTopology `sql:""`
-	VMotionSupported        bool               `sql:""`
-	StorageVMotionSupported bool               `sql:""`
+	Cluster            string             `sql:"d0,index(cluster)"`
+	Status             string             `sql:""`
+	InMaintenanceMode  bool               `sql:""`
+	ManagementServerIp string             `sql:""`
+	ManagementIPs      []string           `sql:""`
+	Thumbprint         string             `sql:""`
+	Timezone           string             `sql:""`
+	CpuSockets         int16              `sql:""`
+	CpuCores           int16              `sql:""`
+	MemoryBytes        int64              `sql:""`
+	ProductName        string             `sql:""`
+	ProductVersion     string             `sql:""`
+	Model              string             `sql:""`
+	Vendor             string             `sql:""`
+	Network            HostNetwork        `sql:""`
+	Networks           []Ref              `sql:""`
+	Datastores         []Ref              `sql:""`
+	HostScsiDisks      []HostScsiDisk     `sql:""`
+	AdvancedOptions    Ref                `sql:""`
+	HbaDiskInfo        []HbaDiskInfo      `sql:""`
+	HostScsiTopology   []HostScsiTopology `sql:""`
 }
 
 type HostScsiDisk struct {
@@ -297,19 +293,14 @@ type DVSHost struct {
 
 type Datastore struct {
 	Base
-	Type                        string            `sql:""`
-	Capacity                    int64             `sql:""`
-	Free                        int64             `sql:""`
-	MaintenanceMode             string            `sql:""`
-	BackingDevicesNames         []string          `sql:""`
-	NasRemoteHost               string            `sql:""`
-	NasRemotePath               string            `sql:""`
-	NasRemoteHostNames          []string          `sql:""`
-	StorageIORMSupported        bool              `sql:""`
-	IORMEnabled                 bool              `sql:""`
-	IORMCongestionThreshold     int32             `sql:""`
-	IORMCongestionThresholdMode IORMThresholdMode `sql:""`
-	IORMPercentOfPeakThroughput int32             `sql:""`
+	Type                string   `sql:""`
+	Capacity            int64    `sql:""`
+	Free                int64    `sql:""`
+	MaintenanceMode     string   `sql:""`
+	BackingDevicesNames []string `sql:""`
+	NasRemoteHost       string   `sql:""`
+	NasRemotePath       string   `sql:""`
+	NasRemoteHostNames  []string `sql:""`
 }
 
 type VM struct {
@@ -353,14 +344,12 @@ type VM struct {
 	GuestNetworks            []GuestNetwork     `sql:""`
 	GuestDisks               []DiskMountPoint   `sql:""`
 	GuestIpStacks            []GuestIpStack     `sql:""`
-	GuestApps                []GuestApp         `sql:""`
 	SecureBoot               bool               `sql:""`
 	ToolsStatus              string             `sql:""`
 	ToolsRunningStatus       string             `sql:""`
 	ToolsVersionStatus       string             `sql:""`
 	DiskEnableUuid           bool               `sql:""`
 	NestedHVEnabled          bool               `sql:""`
-	CustomDef                []CustomFieldDef   `sql:""`
 	CustomValues             []CustomFieldValue `sql:""`
 	Tags                     []Tag              `sql:""`
 	ConsolidationNeeded      bool               `sql:""`
@@ -371,17 +360,12 @@ func (m *VM) Validated() bool {
 	return m.RevisionValidated == m.Revision
 }
 
-// Guest application.
-type GuestApp struct {
-	Name    string `json:"name"`
-	Version string `json:"version,omitempty"`
-}
-
 // Virtual Controller.
 type Controller struct {
-	Key   int32   `json:"key"`
-	Bus   string  `json:"bus"`
-	Disks []int32 `sql:""`
+	Key       int32   `json:"key"`
+	BusNumber int32   `json:"busNumber"`
+	Bus       string  `json:"bus"`
+	Disks     []int32 `sql:""`
 }
 
 // Virtual Disk.
@@ -389,6 +373,7 @@ type Disk struct {
 	Key                   int32  `json:"key"`
 	UnitNumber            int32  `json:"unitNumber"`
 	ControllerKey         int32  `json:"controllerKey"`
+	BusNumber             int32  `json:"busNumber"`
 	File                  string `json:"file"`
 	Datastore             Ref    `json:"datastore"`
 	Capacity              int64  `json:"capacity"`
@@ -396,6 +381,7 @@ type Disk struct {
 	RDM                   bool   `json:"rdm"`
 	PhysicalMode          bool   `json:"physicalMode,omitempty"`
 	Bus                   string `json:"bus"`
+	BusAddress            string `json:"busAddress,omitempty"` // e.g. scsi0:0
 	Mode                  string `json:"mode,omitempty"`
 	Serial                string `json:"serial,omitempty"`
 	WinDriveLetter        string `json:"winDriveLetter,omitempty"`
@@ -423,12 +409,11 @@ type PciBridge struct {
 
 // Virtual ethernet card.
 type NIC struct {
-	Network        Ref    `json:"network"`
-	MAC            string `json:"mac"`
-	Index          int    `json:"order"`
-	DeviceKey      int32  `json:"deviceKey"`
-	PciAddress     string `json:"pciAddress"`
-	StartConnected bool   `json:"startConnected"`
+	Network    Ref    `json:"network"`
+	MAC        string `json:"mac"`
+	Index      int    `json:"order"`
+	DeviceKey  int32  `json:"deviceKey"`
+	PciAddress string `json:"pciAddress"`
 }
 
 // Guest network.
@@ -479,8 +464,13 @@ type DiskMountPoint struct {
 
 type CustomFieldDef struct {
 	Name              string `json:"name"`
-	Key               int32  `json:"key"`
+	Key               int32  `json:"key" sql:"pk"`
 	ManagedObjectType string `json:"managedObjectType,omitempty"`
+}
+
+// Get the primary key.
+func (m *CustomFieldDef) Pk() string {
+	return strconv.Itoa(int(m.Key))
 }
 
 type CustomFieldValue struct {

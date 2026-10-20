@@ -3383,8 +3383,6 @@ spec:
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  annotations:
-    controller-gen.kubebuilder.io/version: v0.17.3
   name: forkliftcontrollers.forklift.konveyor.io
 spec:
   group: forklift.konveyor.io
@@ -3399,843 +3397,672 @@ spec:
     schema:
       openAPIV3Schema:
         description: ForkliftController is the Schema for the forkliftcontrollers
-          API.
+          API
         properties:
           apiVersion:
-            description: |-
-              APIVersion defines the versioned schema of this representation of an object.
-              Servers should convert recognized schemas to the latest internal value, and
-              may reject unrecognized values.
-              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            description: 'APIVersion defines the versioned schema of this representation
+              of an object. Servers should convert recognized schemas to the latest
+              internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
             type: string
           kind:
-            description: |-
-              Kind is a string value representing the REST resource this object represents.
-              Servers may infer this from the endpoint the client submits requests to.
-              Cannot be updated.
-              In CamelCase.
-              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            description: 'Kind is a string value representing the REST resource this
+              object represents. Servers may infer this from the endpoint the client
+              submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
             type: string
           metadata:
             type: object
           spec:
-            description: ForkliftControllerSpec defines the desired state of ForkliftController.
+            additionalProperties: true
+            description: Spec defines the desired state of ForkliftController
             properties:
               aap_ca_secret_name:
-                description: 'Name of the Secret containing a custom CA certificate
-                  (data key: ca.crt) for AAP TLS verification.'
+                description: 'Name of the Secret in the operator namespace containing
+                  a custom CA certificate (data key: ca.crt) for verifying the AAP
+                  server TLS certificate. Optional; when unset, the system CA bundle
+                  is used.'
                 type: string
               aap_insecure_skip_verify:
-                default: "false"
-                description: Skip TLS certificate verification when connecting to
-                  AAP.
+                description: 'Skip TLS certificate verification when connecting to
+                  AAP (default: false). Use only for testing or when the AAP server
+                  uses a self-signed certificate and no CA is provided.'
                 enum:
                 - "true"
                 - "false"
                 type: string
               aap_timeout:
                 description: Default timeout in seconds for AAP HTTP calls and job
-                  polling.
-                format: int32
-                minimum: 1
-                type: integer
+                  polling when Hook spec.deadline is 0 (optional).
+                x-kubernetes-int-or-string: true
               aap_token_secret_name:
-                description: 'Name of the Secret containing the AAP API Bearer token
-                  (data key: token).'
+                description: 'Name of the Secret in the operator namespace containing
+                  the AAP API Bearer token (data key: token). Required for centralized
+                  AAP connection together with aap_url; omit when hooks use per-hook
+                  spec.aap.url and tokenSecret.'
                 type: string
               aap_url:
-                description: |-
-                  Ansible Automation Platform base URL.
-                  Required for centralized AAP connection together with aap_token_secret_name.
+                description: Ansible Automation Platform base URL (e.g. https://aap.example.com).
+                  Required for centralized AAP connection together with aap_token_secret_name;
+                  omit when hooks use spec.aap.url and spec.aap.tokenSecret.
                 type: string
               api_container_limits_cpu:
-                default: 1000m
-                description: API service CPU limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'API service CPU limit (default: 1000m)'
+                example: 2000m
                 type: string
               api_container_limits_memory:
-                default: 1Gi
-                description: API service memory limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'API service memory limit (default: 1Gi)'
+                example: 2Gi
                 type: string
               api_container_requests_cpu:
-                default: 100m
-                description: API service CPU request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'API service CPU request (default: 100m)'
+                example: 200m
                 type: string
               api_container_requests_memory:
-                default: 150Mi
-                description: API service memory request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'API service memory request (default: 150Mi)'
+                example: 300Mi
                 type: string
               api_image_fqin:
-                description: API service image. Optional. If left empty, the operator
-                  automatically sets this from the release payload.
+                description: API service image
+                example: quay.io/kubev2v/forklift-api:latest
                 type: string
               cli_download_container_limits_cpu:
-                default: 1000m
-                description: CLI download service CPU limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'CLI download service CPU limit (default: 100m)'
+                example: 200m
                 type: string
               cli_download_container_limits_memory:
-                default: 1Gi
-                description: CLI download service memory limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'CLI download service memory limit (default: 128Mi)'
+                example: 256Mi
                 type: string
               cli_download_container_requests_cpu:
-                default: 100m
-                description: CLI download service CPU request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'CLI download service CPU request (default: 50m)'
+                example: 100m
                 type: string
               cli_download_container_requests_memory:
-                default: 512Mi
-                description: CLI download service memory request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'CLI download service memory request (default: 64Mi)'
+                example: 128Mi
                 type: string
               cli_download_image_fqin:
-                description: CLI download service image. Optional. If left empty,
-                  the operator automatically sets this from the release payload.
+                description: CLI download service image
+                example: quay.io/kubev2v/forklift-cli-download:latest
                 type: string
               controller_block_overhead:
-                default: 0
-                description: Block overhead in bytes.
-                format: int32
-                minimum: 0
-                type: integer
+                description: 'Block overhead in bytes (default: 0)'
+                x-kubernetes-int-or-string: true
               controller_blocker_grace_period_minutes:
-                default: 5
-                description: How long Critical/Error blocker conditions must persist
-                  before failing an active migration, in minutes.
-                format: int32
-                minimum: 1
-                type: integer
+                description: 'How long Critical/Error blocker conditions must persist
+                  before failing an active migration, in minutes (default: 5)'
+                x-kubernetes-int-or-string: true
               controller_cleanup_retries:
-                default: 10
-                description: Cleanup retry count.
-                format: int32
-                minimum: 1
-                type: integer
+                description: 'Cleanup retry count (default: 10)'
+                x-kubernetes-int-or-string: true
               controller_container_limits_cpu:
-                default: "2"
-                description: Controller CPU limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Controller CPU limit (default: 500m)'
+                example: 1000m
                 type: string
               controller_container_limits_memory:
-                default: 800Mi
-                description: Controller memory limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Controller memory limit (default: 800Mi)'
+                example: 1Gi
                 type: string
               controller_container_requests_cpu:
-                default: 100m
-                description: Controller CPU request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Controller CPU request (default: 100m)'
+                example: 200m
                 type: string
               controller_container_requests_memory:
-                default: 350Mi
-                description: Controller memory request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Controller memory request (default: 350Mi)'
+                example: 500Mi
                 type: string
               controller_filesystem_overhead:
-                default: 10
-                description: Filesystem overhead percentage.
-                format: int32
-                minimum: 0
-                type: integer
+                description: 'Filesystem overhead percentage (default: 10)'
+                x-kubernetes-int-or-string: true
               controller_host_lease_duration_seconds:
-                default: 10
-                description: Host lease duration in seconds.
-                format: int32
-                minimum: 1
-                type: integer
+                description: 'Host lease duration in seconds (default: 10)'
+                x-kubernetes-int-or-string: true
               controller_host_lease_namespace:
-                default: openshift-mtv
-                description: Namespace for host lease objects.
+                description: 'Namespace for host lease objects (default: openshift-mtv)'
+                example: openshift-mtv
                 type: string
               controller_hyperv_refresh_interval:
-                default: 10s
-                description: HyperV inventory refresh interval as a Go duration.
-                pattern: ^[0-9]+(s|m|h)$
+                description: 'HyperV inventory refresh interval as a Go duration (default:
+                  10s)'
+                example: 30s
                 type: string
               controller_hyperv_validation_timeout:
-                default: 30s
-                description: Timeout for HyperV SMB disk validation HTTP calls as
-                  a Go duration.
-                pattern: ^[0-9]+(s|m|h)$
+                description: 'Timeout for HyperV SMB disk validation HTTP calls as
+                  a Go duration (default: 30s)'
+                example: 60s
                 type: string
               controller_image_fqin:
-                description: Controller pod image. Optional. If left empty, the operator
-                  automatically sets this from the release payload.
+                description: Controller pod image
+                example: quay.io/kubev2v/forklift-controller:latest
                 type: string
               controller_log_level:
-                default: 3
-                description: Log verbosity level.
-                format: int32
-                minimum: 0
-                type: integer
+                description: 'Log verbosity level (default: 3)'
+                x-kubernetes-int-or-string: true
               controller_max_concurrent_reconciles:
-                default: 10
-                description: Max concurrent reconciles.
-                format: int32
-                minimum: 1
-                type: integer
+                description: 'Max concurrent reconciles (default: 10)'
+                x-kubernetes-int-or-string: true
               controller_max_parent_backing_retries:
-                default: 10
-                description: Max retries when getting parent disks.
-                format: int32
-                minimum: 1
-                type: integer
+                description: 'Max retries when getting parent disks (default: 10)'
+                x-kubernetes-int-or-string: true
               controller_max_populator_inflight:
-                default: 20
-                description: Max concurrent populator pods per ESXi host.
-                format: int32
-                minimum: 1
-                type: integer
+                description: 'Max concurrent populator pods per ESXi host (default:
+                  20)'
+                example: 10
+                x-kubernetes-int-or-string: true
               controller_max_vm_inflight:
-                default: 20
-                description: Max concurrent VM migrations.
-                format: int32
-                minimum: 1
-                type: integer
+                description: 'Max concurrent VM migrations (default: 20)'
+                x-kubernetes-int-or-string: true
               controller_migration_service_account:
-                description: |-
-                  Global default ServiceAccount for migration pods in the target namespace.
-                  Overridden by Plan-level serviceAccount.
-                type: string
-              controller_ocp_pvc_name_template:
-                description: |-
-                  Global default Go template for generating PVC names during OpenShift (OCP) migrations.
-                  Used when the Plan-level pvcNameTemplate is empty. When this field is also empty,
-                  the controller falls back to "\{\{.SourcePVCName\}\}" (preserves the source PVC name).
-                  Does not apply to non-OCP providers (see controller_pvc_name_template).
-
-                  IMPORTANT: Curly braces must be escaped with a backslash (\{ and \}) to avoid
-                  conflicts with the operator's Ansible/Jinja2 templating engine.
-                  The controller unescapes them before parsing the Go template.
-
-                  Example: "\{\{.SourcePVCNamespace\}\}-\{\{.SourcePVCName\}\}"
-                pattern: ^([^{}\\]|\\.)*$
+                description: Global default ServiceAccount for migration pods in the
+                  target namespace. Overridden by Plan-level serviceAccount.
+                example: custom-migration-sa
                 type: string
               controller_ovirt_warm_migration:
-                default: "true"
-                description: Enable oVirt warm migration.
+                description: 'Enable oVirt warm migration (default: true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               controller_precopy_interval:
-                default: 60
-                description: Precopy interval in minutes.
-                format: int32
-                minimum: 1
-                type: integer
-              controller_pvc_name_template:
-                description: |-
-                  Global default Go template for generating PVC names during non-OCP migrations.
-                  Used when the Plan-level pvcNameTemplate is empty. When this field is also empty,
-                  the controller falls back to the hardcoded default:
-                  "\{\{trunc 15 .PlanName\}\}-\{\{trunc 15 .TargetVmName\}\}-disk-\{\{.DiskIndex\}\}".
-                  Does not apply to OpenShift sources (see controller_ocp_pvc_name_template).
-
-                  IMPORTANT: Curly braces must be escaped with a backslash (\{ and \}) to avoid
-                  conflicts with the operator's Ansible/Jinja2 templating engine.
-                  The controller unescapes them before parsing the Go template.
-
-                  Example: "\{\{trunc 10 .PlanName\}\}-\{\{.TargetVmName\}\}-\{\{.DiskIndex\}\}"
-                pattern: ^([^{}\\]|\\.)*$
-                type: string
+                description: 'Precopy interval in minutes (default: 60)'
+                x-kubernetes-int-or-string: true
               controller_retain_populator_pods:
-                default: "false"
-                description: Retain populator pods after migration for debugging.
+                description: 'Retain populator pods after migration for debugging
+                  (default: false)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               controller_retain_precopy_importer_pods:
-                default: "false"
-                description: Retain precopy pods.
+                description: 'Retain precopy pods (default: false)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               controller_snapshot_removal_check_retries:
-                default: 20
-                description: Snapshot removal retries.
-                format: int32
-                minimum: 1
-                type: integer
+                description: 'Snapshot removal retries (default: 20)'
+                x-kubernetes-int-or-string: true
               controller_snapshot_removal_timeout_minuts:
-                default: 120
-                description: Snapshot removal timeout in minutes.
-                format: int32
-                minimum: 1
-                type: integer
+                description: 'Snapshot removal timeout in minutes (default: 120)'
+                x-kubernetes-int-or-string: true
               controller_snapshot_status_check_rate_seconds:
-                default: 10
-                description: Snapshot status check rate in seconds.
-                format: int32
-                minimum: 1
-                type: integer
+                description: 'Snapshot status check rate in seconds (default: 10)'
+                x-kubernetes-int-or-string: true
               controller_static_udn_ip_addresses:
-                default: "true"
-                description: Enable static UDN IP addresses feature.
+                description: 'Enable static udn IP addresses feature (default: false)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               controller_tls_connection_timeout_sec:
-                default: 5
-                description: TLS connection timeout seconds.
-                format: int32
-                minimum: 1
-                type: integer
+                description: 'TLS connection timeout seconds (default: 5)'
+                x-kubernetes-int-or-string: true
               controller_transfer_network:
                 description: 'Optional NAD name for controller pod transfer network
-                  (format: ''namespace/network-name'').'
+                  (format: ''namespace/network-name'')'
+                example: openshift-mtv/transfer-network
                 type: string
               controller_vddk_job_active_deadline_sec:
-                default: 300
-                description: VDDK job timeout in seconds.
-                format: int32
-                minimum: 1
-                type: integer
+                description: 'VDDK job timeout in seconds (default: 300)'
+                x-kubernetes-int-or-string: true
               controller_vsphere_incremental_backup:
-                default: "true"
-                description: Use vSphere incremental backup.
+                description: 'Use vSphere incremental backup (default: true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               controller_windows_reboot_timeout:
-                default: 1800
-                description: Timeout in seconds for the wait-for-reboot step.
-                format: int32
+                description: 'Timeout in seconds for the wait-for-reboot step (default:
+                  1800)'
                 minimum: 1
                 type: integer
               deep_inspection_image_fqin:
-                description: Deep inspection image. Optional. If left empty, the operator
-                  automatically sets this from the release payload.
+                description: Deep inspection image used by deep-inspection pods
+                example: quay.io/kubev2v/deep-inspection:latest
                 type: string
               deep_inspection_image_xfs_fqin:
-                description: Deep inspection XFS image. Optional. If left empty, the
-                  operator automatically sets this from the release payload.
+                description: Deep inspection image built on RHEL9, used when xfsCompatibility
+                  is enabled
+                example: quay.io/kubev2v/deep-inspection-rhel9:latest
                 type: string
               feature_auth_required:
-                default: "true"
-                description: Require authentication.
+                description: 'Require authentication (default: true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_cli_download:
-                default: "true"
-                description: Enable CLI download service.
+                description: 'Enable CLI download service (default: true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_copy_offload:
-                default: "true"
-                description: Enable copy offload plugins.
+                description: 'Enable copy offload plugins (default: true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_mcp_server:
-                default: "false"
-                description: Enable MCP server deployment (requires OpenShift with
-                  Lightspeed).
+                description: 'Enable MCP server deployment (requires OpenShift with
+                  Lightspeed) (default: false)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_ocp_live_migration:
-                default: "true"
-                description: Enable OCP live migration.
+                description: 'Enable OCP live migration (default: false)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_ova_appliance_management:
-                default: "true"
-                description: Enable OVF-based appliance management endpoints (OVA,
-                  HyperV).
+                description: 'Enable OVF-based appliance management endpoints (OVA,
+                  HyperV)  (default: false)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_ui_plugin:
-                default: "true"
-                description: Enable UI plugin.
+                description: 'Enable UI plugin (default: true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_use_conversion_cr:
-                default: "true"
-                description: Delegate VM conversion to Conversion CRs instead of managing
-                  it directly.
+                description: 'Delegate VM conversion to Conversion CRs instead of
+                  managing it directly (default: true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_validation:
-                default: "true"
-                description: Enable validation service.
+                description: 'Enable validation service (default: true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_vmware_system_serial_number:
-                default: "true"
-                description: Use VMware system serial numbers.
+                description: 'Use VMware system serial numbers (default: true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_volume_populator:
-                default: "true"
-                description: Enable volume populators.
+                description: 'Enable volume populators (default: true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_vsphere_vmware_driver_removal:
-                default: "false"
-                description: Run VMware driver removal scripts during Windows vSphere
-                  conversion.
+                description: 'Run VMware driver removal scripts during Windows vSphere
+                  conversion (default: false)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_windows_registry_network_config:
-                default: "false"
-                description: Use registry-based network configuration scripts for
-                  Windows static IP setup.
+                description: 'Use registry-based network configuration scripts for
+                  Windows static IP setup (default: false)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_windows_wait_for_reboot:
-                default: "true"
-                description: Enable automatic wait-for-reboot step for Windows VM
-                  migrations.
+                description: 'Enable automatic wait-for-reboot step for Windows VM
+                  migrations (default: true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               feature_xfs_repair_ignore:
-                default: "false"
-                description: Ignore xfs_repair exit status during conversion.
+                description: 'Ignore xfs_repair exit status during conversion (default:
+                  false)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               hooks_container_limits_cpu:
-                default: 1000m
-                description: Hooks CPU limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Hooks CPU limit (default: 1000m)'
+                example: 2000m
                 type: string
               hooks_container_limits_memory:
-                default: 1Gi
-                description: Hooks memory limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Hooks memory limit (default: 1Gi)'
+                example: 2Gi
                 type: string
               hooks_container_requests_cpu:
-                default: 100m
-                description: Hooks CPU request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Hooks CPU request (default: 100m)'
+                example: 200m
                 type: string
               hooks_container_requests_memory:
-                default: 150Mi
-                description: Hooks memory request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Hooks memory request (default: 150Mi)'
+                example: 300Mi
                 type: string
               hyperv_container_limits_cpu:
-                default: 1000m
-                description: HyperV CPU limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'HyperV CPU limit (default: 1000m)'
+                example: 2000m
                 type: string
               hyperv_container_limits_memory:
-                default: 1Gi
-                description: HyperV memory limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'HyperV memory limit (default: 1Gi)'
+                example: 2Gi
                 type: string
               hyperv_container_requests_cpu:
-                default: 100m
-                description: HyperV CPU request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'HyperV CPU request (default: 100m)'
+                example: 200m
                 type: string
               hyperv_container_requests_memory:
-                default: 512Mi
-                description: HyperV memory request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'HyperV memory request (default: 512Mi)'
+                example: 300Mi
                 type: string
               hyperv_provider_server_fqin:
-                description: HyperV provider server image. Optional. If left empty,
-                  the operator automatically sets this from the release payload.
+                description: HyperV provider server image
+                example: quay.io/kubev2v/forklift-hyperv-provider-server:latest
                 type: string
               image_pull_policy:
-                default: Always
-                description: Image pull policy.
+                description: 'Image pull policy (default: Always)'
                 enum:
                 - Always
                 - IfNotPresent
                 - Never
                 type: string
               inventory_container_limits_cpu:
-                default: "2"
-                description: Inventory CPU limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Inventory CPU limit (default: 1000m)'
+                example: 2000m
                 type: string
               inventory_container_limits_memory:
-                default: 1Gi
-                description: Inventory memory limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Inventory memory limit (default: 1Gi)'
+                example: 2Gi
                 type: string
               inventory_container_requests_cpu:
-                default: 500m
-                description: Inventory CPU request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Inventory CPU request (default: 500m)'
+                example: 1000m
                 type: string
               inventory_container_requests_memory:
-                default: 500Mi
-                description: Inventory memory request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Inventory memory request (default: 500Mi)'
+                example: 1Gi
                 type: string
               inventory_route_timeout:
-                default: 360s
-                description: Inventory route timeout.
-                pattern: ^[0-9]+(s|m|h)$
+                description: 'Inventory route timeout (default: 360s)'
+                example: 600s
                 type: string
               k8s_cluster:
-                default: "false"
-                description: Whether running on Kubernetes (vs OpenShift).
+                description: 'Whether running on Kubernetes (vs OpenShift) (default:
+                  false)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               mcp_server_container_limits_cpu:
-                default: 1000m
-                description: MCP server CPU limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'MCP server CPU limit (default: 1000m)'
+                example: 2000m
                 type: string
               mcp_server_container_limits_memory:
-                default: 512Mi
-                description: MCP server memory limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'MCP server memory limit (default: 512Mi)'
+                example: 1Gi
                 type: string
               mcp_server_container_requests_cpu:
-                default: 100m
-                description: MCP server CPU request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'MCP server CPU request (default: 100m)'
+                example: 200m
                 type: string
               mcp_server_container_requests_memory:
-                default: 256Mi
-                description: MCP server memory request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'MCP server memory request (default: 256Mi)'
+                example: 512Mi
                 type: string
               mcp_server_kube_insecure:
-                default: "true"
-                description: Skip TLS verification for in-cluster MCP calls.
+                description: 'Skip TLS verification for in-cluster MCP calls (default:
+                  true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               mcp_server_lightspeed_integration:
-                default: "true"
-                description: Register MCP server with OpenShift Lightspeed.
+                description: 'Register MCP server with OpenShift Lightspeed (default:
+                  true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               mcp_server_lightspeed_set_mcp_gate:
-                default: "false"
-                description: Add MCPServer to OLSConfig featureGates when registering
-                  with Lightspeed.
+                description: 'Add MCPServer to OLSConfig featureGates when registering
+                  with Lightspeed (default: false)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               mcp_server_max_response_chars:
-                default: 0
-                description: MCP server max response chars, 0 for unlimited.
-                format: int32
-                minimum: 0
-                type: integer
+                description: 'MCP server max response chars, 0 for unlimited (default:
+                  0)'
+                x-kubernetes-int-or-string: true
               mcp_server_output_format:
-                default: markdown
-                description: MCP server output format.
-                enum:
-                - markdown
-                - text
-                - json
+                description: 'MCP server output format (default: markdown)'
+                example: markdown
                 type: string
               mcp_server_read_only:
-                default: "false"
-                description: Run MCP server in read-only mode.
+                description: 'Run MCP server in read-only mode (default: false)'
                 enum:
                 - "true"
                 - "false"
                 type: string
               mcp_server_verbose:
-                default: 2
-                description: MCP server verbosity level.
-                format: int32
-                minimum: 0
-                type: integer
+                description: 'MCP server verbosity level (default: 2)'
+                x-kubernetes-int-or-string: true
               metric_interval:
-                default: 30s
-                description: Metrics scrape interval.
-                pattern: ^[0-9]+(s|m|h)$
+                description: 'Metrics scrape interval (default: 30s)'
+                example: 60s
                 type: string
               must_gather_image_fqin:
-                description: Must-gather debugging image. Optional. If left empty,
-                  the operator automatically sets this from the release payload.
+                description: Must-gather debugging image
+                example: quay.io/kubev2v/forklift-must-gather:latest
                 type: string
               naa_oui_map_configmap_name:
-                default: forklift-naa-oui-map
-                description: ConfigMap name for custom NAA OUI to storage vendor mappings.
+                description: 'ConfigMap name for custom NAA OUI to storage vendor
+                  mappings (default: forklift-naa-oui-map)'
+                example: custom-naa-oui-map
                 type: string
               ova_container_limits_cpu:
-                default: 1000m
-                description: OVA CPU limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'OVA CPU limit (default: 1000m)'
+                example: 2000m
                 type: string
               ova_container_limits_memory:
-                default: 1Gi
-                description: OVA memory limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'OVA memory limit (default: 1Gi)'
+                example: 2Gi
                 type: string
               ova_container_requests_cpu:
-                default: 100m
-                description: OVA CPU request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'OVA CPU request (default: 100m)'
+                example: 200m
                 type: string
               ova_container_requests_memory:
-                default: 512Mi
-                description: OVA memory request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'OVA memory request (default: 150Mi)'
+                example: 300Mi
                 type: string
               ova_provider_server_fqin:
-                description: OVA provider server image. Optional. If left empty, the
-                  operator automatically sets this from the release payload.
+                description: OVA provider server image
+                example: quay.io/kubev2v/ova-provider-server:latest
                 type: string
               ova_proxy_container_limits_cpu:
-                default: 1000m
-                description: OVA Proxy CPU limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'OVA Proxy CPU limit (default: 1000m)'
+                example: 2000m
                 type: string
               ova_proxy_container_limits_memory:
-                default: 1Gi
-                description: OVA Proxy memory limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'OVA Proxy memory limit (default: 1Gi)'
+                example: 2Gi
                 type: string
               ova_proxy_container_requests_cpu:
-                default: 250m
-                description: OVA Proxy CPU request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'OVA Proxy CPU request (default: 250m)'
+                example: 200m
                 type: string
               ova_proxy_container_requests_memory:
-                default: 512Mi
-                description: OVA Proxy memory request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'OVA Proxy memory request (default: 512Mi)'
+                example: 300Mi
                 type: string
               ova_proxy_fqin:
-                description: OVA inventory proxy image. Optional. If left empty, the
-                  operator automatically sets this from the release payload.
+                description: OVA inventory proxy image
+                example: quay.io/kubev2v/forklift-ova-proxy:latest
                 type: string
               ova_proxy_route_timeout:
-                default: 360s
-                description: OVA Proxy route timeout.
-                pattern: ^[0-9]+(s|m|h)$
+                description: 'OVA Proxy route timeout (default: 360s)'
+                example: 600s
                 type: string
               ovirt_osmap_configmap_name:
-                default: forklift-ovirt-osmap
-                description: ConfigMap name for oVirt OS mappings.
+                description: 'ConfigMap name for oVirt OS mappings (default: forklift-ovirt-osmap)'
+                example: custom-ovirt-osmap
                 type: string
               populator_container_limits_cpu:
-                default: 1000m
-                description: Volume Populator CPU limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Volume Populator CPU limit (default: 1000m)'
+                example: 2000m
                 type: string
               populator_container_limits_memory:
-                default: 1Gi
-                description: Volume Populator memory limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Volume Populator memory limit (default: 1Gi)'
+                example: 2Gi
                 type: string
               populator_container_requests_cpu:
-                default: 100m
-                description: Volume Populator CPU request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Volume Populator CPU request (default: 100m)'
+                example: 200m
                 type: string
               populator_container_requests_memory:
-                default: 512Mi
-                description: Volume Populator memory request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Volume Populator memory request (default: 512Mi)'
+                example: 300Mi
                 type: string
               populator_controller_image_fqin:
-                description: Volume populator controller image. Optional. If left
-                  empty, the operator automatically sets this from the release payload.
+                description: Volume populator controller image
+                example: quay.io/kubev2v/populator-controller:latest
                 type: string
               populator_openstack_image_fqin:
-                description: OpenStack populator image. Optional. If left empty, the
-                  operator automatically sets this from the release payload.
+                description: OpenStack populator image
+                example: quay.io/kubev2v/openstack-populator:latest
                 type: string
               populator_ovirt_image_fqin:
-                description: oVirt populator image. Optional. If left empty, the operator
-                  automatically sets this from the release payload.
+                description: oVirt populator image
+                example: quay.io/kubev2v/ovirt-populator:latest
                 type: string
               populator_vsphere_copy_offload_image_fqin:
-                description: vSphere xcopy populator image. Optional. If left empty,
-                  the operator automatically sets this from the release payload.
+                description: vSphere xcopy populator image
+                example: quay.io/kubev2v/vsphere-populator:latest
                 type: string
               ui_plugin_container_limits_cpu:
-                default: 100m
-                description: UI plugin CPU limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'UI plugin CPU limit (default: 100m)'
+                example: 200m
                 type: string
               ui_plugin_container_limits_memory:
-                default: 800Mi
-                description: UI plugin memory limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'UI plugin memory limit (default: 800Mi)'
+                example: 1Gi
                 type: string
               ui_plugin_container_requests_cpu:
-                default: 100m
-                description: UI plugin CPU request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'UI plugin CPU request (default: 100m)'
+                example: 200m
                 type: string
               ui_plugin_container_requests_memory:
-                default: 150Mi
-                description: UI plugin memory request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'UI plugin memory request (default: 150Mi)'
+                example: 300Mi
                 type: string
               ui_plugin_image_fqin:
-                description: UI plugin image. Optional. If left empty, the operator
-                  automatically sets this from the release payload.
+                description: UI plugin image
+                example: quay.io/kubev2v/forklift-ui-plugin:latest
                 type: string
               validation_container_limits_cpu:
-                default: 1000m
-                description: Validation CPU limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Validation CPU limit (default: 1000m)'
+                example: 2000m
                 type: string
               validation_container_limits_memory:
-                default: 300Mi
-                description: Validation memory limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Validation memory limit (default: 300Mi)'
+                example: 500Mi
                 type: string
               validation_container_requests_cpu:
-                default: 400m
-                description: Validation CPU request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Validation CPU request (default: 400m)'
+                example: 500m
                 type: string
               validation_container_requests_memory:
-                default: 50Mi
-                description: Validation memory request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'Validation memory request (default: 50Mi)'
+                example: 100Mi
                 type: string
               validation_extra_volume_mountpath:
-                default: /usr/share/opa/policies/extra
-                description: Mount path for extra validation rules.
+                description: 'Mount path for extra validation rules (default: /usr/share/opa/policies/extra)'
+                example: /custom/validation/path
                 type: string
               validation_extra_volume_name:
-                default: validation-extra-rules
-                description: Volume name for extra validation rules.
+                description: 'Volume name for extra validation rules (default: validation-extra-rules)'
+                example: custom-validation-rules
                 type: string
               validation_image_fqin:
-                description: Validation service image. Optional. If left empty, the
-                  operator automatically sets this from the release payload.
+                description: Validation service image
+                example: quay.io/kubev2v/forklift-validation:latest
                 type: string
               validation_policy_agent_search_interval:
-                default: 120
-                description: Policy agent search interval in seconds.
-                format: int32
-                minimum: 1
-                type: integer
+                description: 'Policy agent search interval in seconds (default: 120)'
+                x-kubernetes-int-or-string: true
               vddk_image:
-                description: VDDK image for VMware disk access. Optional. If left
-                  empty, no VDDK image is configured.
+                description: VDDK image for VMware disk access
+                example: quay.io/kubev2v/vddk:7.0.3
                 type: string
               virt_customize_configmap_name:
-                default: forklift-virt-customize
-                description: ConfigMap name for virt-customize configuration.
+                description: 'ConfigMap name for virt-customize configuration (default:
+                  forklift-virt-customize)'
+                example: custom-virt-customize
                 type: string
               virt_v2v_container_limits_cpu:
-                default: 4000m
-                description: Virt-v2v CPU limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'virt-v2v CPU limit (default: 4000m)'
+                example: 8000m
                 type: string
               virt_v2v_container_limits_memory:
-                default: 8Gi
-                description: Virt-v2v memory limit.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'virt-v2v memory limit (default: 8Gi)'
+                example: 16Gi
                 type: string
               virt_v2v_container_requests_cpu:
-                default: 1000m
-                description: Virt-v2v CPU request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'virt-v2v CPU request (default: 1000m)'
+                example: 2000m
                 type: string
               virt_v2v_container_requests_memory:
-                default: 1Gi
-                description: Virt-v2v memory request.
-                pattern: ^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$
+                description: 'virt-v2v memory request (default: 1Gi)'
+                example: 2Gi
                 type: string
               virt_v2v_dont_request_kvm:
-                description: Don't request KVM for virt-v2v. Optional. If left empty,
-                  the operator automatically sets this from the environment.
+                description: Don't request KVM for virt-v2v
                 enum:
                 - "true"
                 - "false"
                 type: string
               virt_v2v_extra_args:
-                description: Additional arguments for virt-v2v conversion. Optional.
-                  If left empty, the operator automatically sets this from the environment.
+                description: Additional arguments for virt-v2v conversion
+                example: --parallel 4
                 type: string
               virt_v2v_extra_conf_config_map:
-                description: ConfigMap name containing extra virt-v2v configuration.
-                  Optional. If left empty, the operator automatically sets this from
-                  the environment.
+                description: ConfigMap name containing extra virt-v2v configuration
                 type: string
               virt_v2v_image_fqin:
-                description: Virt-v2v conversion image. Optional. If left empty, the
-                  operator automatically sets this from the release payload.
+                description: Virt-v2v conversion image used by migration pods
+                example: quay.io/kubev2v/forklift-virt-v2v:latest
                 type: string
               virt_v2v_image_xfs_fqin:
-                description: Virt-v2v XFS conversion image. Optional. If left empty,
-                  the operator automatically sets this from the release payload.
+                description: Virt-v2v XFS conversion image used by migration pods
+                example: quay.io/kubev2v/forklift-virt-v2v-xfs:latest
                 type: string
               virt_v2v_inspector_extra_args:
-                description: Additional arguments for virt-v2v-inspector. Optional.
-                  If left empty, the operator automatically sets this from the environment.
+                description: Additional arguments for virt-v2v-inspector
+                example: --root first
                 type: string
               virt_v2v_memsize:
-                description: Memory (in MB) allocated for the virt-v2v conversion
-                  appliance.
-                format: int32
-                minimum: 1
+                description: 'Memory (in MB) allocated for the virt-v2v conversion
+                  appliance (default: virt-v2v chooses)'
+                example: 4096
                 type: integer
               virt_v2v_smp:
-                description: Number of virtual CPUs for the virt-v2v conversion appliance.
-                format: int32
-                minimum: 1
+                description: 'Number of virtual CPUs for the virt-v2v conversion appliance
+                  (default: virt-v2v chooses)'
+                example: 8
                 type: integer
               vsphere_osmap_configmap_name:
-                default: forklift-vsphere-osmap
-                description: ConfigMap name for vSphere OS mappings.
+                description: 'ConfigMap name for vSphere OS mappings (default: forklift-vsphere-osmap)'
+                example: custom-vsphere-osmap
                 type: string
               wait_for_final_snapshot_consolidation:
-                default: "true"
-                description: Wait for final snapshot removal and consolidation in
-                  a VMware warm migration.
+                description: 'Wait for final snapshot removal and consolidation in
+                  a VMware warm migration (default: true)'
                 enum:
                 - "true"
                 - "false"
                 type: string
             type: object
           status:
-            description: |-
-              ForkliftControllerStatus defines the observed state of ForkliftController.
-              Status is managed by the Ansible operator and may contain arbitrary fields
-              including conditions with Ansible-specific metadata.
+            description: Status defines the observed state of ForkliftController
             type: object
             x-kubernetes-preserve-unknown-fields: true
         type: object
@@ -4979,34 +4806,6 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
-              resumeConversion:
-                description: |-
-                  ResumeConversion skips disk copy and runs only the virt-v2v
-                  conversion step, reusing PVCs from a previous failed migration.
-                  Valid for any plan whose disk copy and conversion are separate
-                  phases and whose disk copy completed before conversion failed.
-                type: boolean
-              vmCutover:
-                description: Per-VM cutover times. Overrides spec.cutover for the
-                  listed VMs.
-                items:
-                  description: VMCutover associates a VM with a per-VM cutover time.
-                  properties:
-                    cutover:
-                      description: Date and time to finalize the warm migration for
-                        this VM.
-                      format: date-time
-                      type: string
-                    id:
-                      description: The VM ID (e.g. the vSphere managed object ID).
-                        Required.
-                      minLength: 1
-                      type: string
-                  required:
-                  - cutover
-                  - id
-                  type: object
-                type: array
             required:
             - plan
             type: object
@@ -5133,12 +4932,6 @@ spec:
                       description: Boot disk index (0-based) detected by virt-v2v.
                         nil means undetected.
                       type: integer
-                    disksCopied:
-                      description: |-
-                        DisksCopied is set to true when all disk transfer tasks complete
-                        successfully. Used to determine if conversion can be resumed
-                        without re-copying disks.
-                      type: boolean
                     enableNestedVirtualization:
                       description: |-
                         EnableNestedVirtualization controls whether nested virtualization CPU features (vmx/svm)
@@ -5169,6 +4962,16 @@ spec:
                       - phase
                       - reasons
                       type: object
+                    excludeDisks:
+                      description: |-
+                        ExcludeDisks lists vSphere bus addresses to skip during migration (e.g. "scsi0:1").
+                        Empty or omitted: migrate all disks (subject to migrateSharedDisks).
+                        When set, matching disks are not imported and are not attached to the target VM.
+                        Excluding every disk is rejected. Excluding the root/boot disk is allowed with a warning.
+                        vSphere only; other providers ignore this field.
+                      items:
+                        type: string
+                      type: array
                     firmware:
                       description: The firmware type detected from the OVF file produced
                         by virt-v2v.
@@ -5495,19 +5298,12 @@ spec:
                         names for VM disks.\nGenerated names must be valid DNS-1123
                         labels (lowercase alphanumerics, '-' allowed, max 63 chars).\nIt
                         follows Go template syntax and has access to provider-specific
-                        variables.\n\nWARNING: The PVC name is reused as a building
-                        block in other K8s resource names\n(e.g., \"scratch-dv-{pvcName}-xxxxx\",
-                        \"convert-{pvcName}-xxxxx\").\nTo avoid exceeding the 63-char
-                        DNS1123 label limit on derived resources,\nkeep the template
-                        output to at most 40 characters (46 if UseGenerateName is
-                        false).\nThe built-in default uses trunc 15 for plan and VM
-                        names to stay within this budget.\n\nCommon variables (all
-                        providers):\n  - .VmName: name of the VM in the source cluster
-                        (original source name)\n  - .TargetVmName: final VM name in
-                        the target cluster (may equal .VmName if no rename/normalization)\n
-                        \ - .PlanName: name of the migration plan\n  - .DiskIndex:
-                        initial volume index of the disk\n  - .VmId: source VM identifier
-                        from the provider\n\nVMware (vSphere) specific variables:\n
+                        variables.\n\nCommon variables (all providers):\n  - .VmName:
+                        name of the VM in the source cluster (original source name)\n
+                        \ - .TargetVmName: final VM name in the target cluster (may
+                        equal .VmName if no rename/normalization)\n  - .PlanName:
+                        name of the migration plan\n  - .DiskIndex: initial volume
+                        index of the disk\n\nVMware (vSphere) specific variables:\n
                         \ - .WinDriveLetter: Windows drive letter (lowercase, if applicable,
                         e.g. \"c\", requires guest agent)\n  - .RootDiskIndex: index
                         of the root disk\n  - .Shared: true if the volume is shared
@@ -5515,19 +5311,11 @@ spec:
                         file in the source provider (filename includes the .vmdk suffix)\n\nOpenShift
                         specific variables:\n  - .SourcePVCName: name of the PVC in
                         the source cluster\n  - .SourcePVCNamespace: namespace of
-                        the PVC in the source cluster\n\nEC2 specific variables:\n
-                        \ - .VolumeID: original EBS volume ID\n  - .SnapshotID: snapshot
-                        ID used to create the volume\n\nHyper-V / oVirt specific variables:\n
-                        \ - .DiskId: provider-specific disk identifier (Hyper-V VHDX
-                        GUID, oVirt disk attachment ID)\n\nNote:\n  Optional. Overrides
-                        the plan-level template when set.\n  When empty, falls back
-                        to plan-level, then ForkliftController globals, then hardcoded
-                        defaults.\n  OCP hardcoded default is \"{{.SourcePVCName}}\"
-                        (exact name).\nExamples:\n  \"{{.TargetVmName}}-disk-{{.DiskIndex}}\"\n
+                        the PVC in the source cluster\n\nNote:\n  This template overrides
+                        the plan level template.\nExamples:\n  \"{{.TargetVmName}}-disk-{{.DiskIndex}}\"\n
                         \ \"{{if eq .DiskIndex .RootDiskIndex}}root{{else}}data{{end}}-{{.DiskIndex}}\"
-                        (VMware)\n  \"{{.TargetVmName}}-{{.SourcePVCName}}\" (OpenShift)\n
-                        \ \"{{.PlanName}}-{{.VmId}}\" (plan + provider VM ID)\n  \"{{.VmName}}-{{.DiskId}}\"
-                        (Hyper-V / oVirt stable disk identity)\nSee:\n\t https://github.com/kubev2v/forklift/tree/main/pkg/templateutil
+                        (VMware)\n  \"{{.TargetVmName}}-{{.SourcePVCName}}\" (OpenShift)\nSee:\n\t
+                        https://github.com/kubev2v/forklift/tree/main/pkg/templateutil
                         for template functions."
                       type: string
                     rdmAsLun:
@@ -5552,6 +5340,20 @@ spec:
                         When explicitly set to true, shared RDM LUNs for this VM get lun.reservation=true.
                         When explicitly set to false, shared RDM LUNs for this VM get lun.reservation=false.
                       type: boolean
+                    selinuxRelabelAtBoot:
+                      description: |-
+                        SelinuxRelabelAtBoot overrides the plan-level selinuxRelabelAtBoot for this VM.
+                        When nil (default), the plan-level value is used.
+                      type: boolean
+                    selinuxRelabelExclude:
+                      description: |-
+                        SelinuxRelabelExclude overrides the plan-level selinuxRelabelExclude for this VM.
+                        When nil (default), the plan-level value is used.
+                        Use carefully: changes made inside excluded directories during customization may retain incorrect
+                        SELinux labels and cause failures later. Only exclude directories that are known not to need relabeling.
+                      items:
+                        type: string
+                      type: array
                     started:
                       description: Started timestamp.
                       format: date-time
@@ -7366,10 +7168,6 @@ spec:
                   ConvertorNodeSelector constrains the scheduler to only schedule virt-v2v convertor pods on nodes
                   which contain the specified labels. This is useful for dedicating specific nodes for disk conversion
                   workloads that require high I/O performance or network access to source VMware infrastructure.
-                  For vSphere warm migrations that use CDI VDDK DataVolumes for disk transfer,
-                  this selector is also propagated to the CDI importer pods via the VDDK extra-args
-                  ConfigMap (requires CDI with CNV-84595 support). The ConfigMap is automatically
-                  cleaned up when the migration completes.
                   See Pod NodeSelector documentation for more details,
                   https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector
                 type: object
@@ -7708,55 +7506,49 @@ spec:
                 description: "PVCNameTemplate is a template for generating PVC names
                   for VM disks.\nGenerated names must be valid DNS-1123 labels (lowercase
                   alphanumerics, '-' allowed, max 63 chars).\nIt follows Go template
-                  syntax and has access to provider-specific variables.\n\nWARNING:
-                  The PVC name is reused as a building block in other K8s resource
-                  names\n(e.g., \"scratch-dv-{pvcName}-xxxxx\", \"convert-{pvcName}-xxxxx\").\nTo
-                  avoid exceeding the 63-char DNS1123 label limit on derived resources,\nkeep
-                  the template output to at most 40 characters (46 if UseGenerateName
-                  is false).\nThe built-in default uses trunc 15 for plan and VM names
-                  to stay within this budget.\n\nAvailable template variables:\n\nAll
-                  providers:\n  - .VmName: original source VM name\n  - .TargetVmName:
-                  DNS1123-safe target VM name\n  - .PlanName: migration plan name\n
-                  \ - .DiskIndex: sequential index of the disk being migrated\n  -
-                  .VmId: source VM identifier from the provider\n\nvSphere only (empty
-                  for other providers):\n  - .WinDriveLetter: Windows drive letter
-                  (lowercase, e.g. \"c\"; requires guest agent)\n  - .RootDiskIndex:
-                  index of the root/boot disk\n  - .Shared: true if the disk is shared
-                  by multiple VMs\n  - .FileName: source VMDK file name including
-                  the .vmdk suffix\n\nOpenShift only (empty for other providers):\n
-                  \ - .SourcePVCName: name of the PVC in the source cluster\n  - .SourcePVCNamespace:
-                  namespace of the PVC in the source cluster\n\nEC2 only (empty for
-                  other providers):\n  - .VolumeID: original EBS volume ID\n  - .SnapshotID:
-                  snapshot ID used to create the volume\n\nHyper-V / oVirt only (empty
-                  for other providers):\n  - .DiskId: provider-specific disk identifier
-                  (Hyper-V VHDX GUID, oVirt disk attachment ID)\n\nNote:\n  Optional.
-                  When empty, falls back at runtime to ForkliftController\n  controller_pvc_name_template
-                  (non-OCP) or controller_ocp_pvc_name_template (OCP),\n  then to
-                  the hardcoded default. Non-OCP hardcoded default is\n  \"{{trunc
-                  15 .PlanName}}-{{trunc 15 .TargetVmName}}-disk-{{.DiskIndex}}\".\n
-                  \ OCP hardcoded default is \"{{.SourcePVCName}}\" (exact name, preserves
-                  source PVC name).\n  This template can be overridden at the individual
-                  VM level.\n  Provider-specific variables are empty (zero value)
-                  when used with a different provider.\nExamples:\n  \"{{.TargetVmName}}-disk-{{.DiskIndex}}\"\n
-                  \ \"{{if eq .DiskIndex .RootDiskIndex}}root{{else}}data{{end}}-{{.DiskIndex}}\"
-                  (vSphere)\n  \"{{.TargetVmName}}-{{.SourcePVCName}}\" (OpenShift)\n
-                  \ \"{{.PlanName}}-{{.VmId}}\" (plan + provider VM ID)\n  \"{{.VmName}}-{{.DiskId}}\"
-                  (Hyper-V / oVirt stable disk identity)\nSee:\n\t https://github.com/kubev2v/forklift/tree/main/pkg/templateutil
-                  for template functions."
+                  syntax and has access to provider-specific variables.\n\nCommon
+                  variables (all providers):\n  - .VmName: name of the VM in the source
+                  cluster (original source name)\n  - .TargetVmName: final VM name
+                  in the target cluster (may equal .VmName if no rename/normalization)\n
+                  \ - .PlanName: name of the migration plan\n  - .DiskIndex: initial
+                  volume index of the disk\n\nVMware (vSphere) specific variables:\n
+                  \ - .WinDriveLetter: Windows drive letter (lowercase, if applicable,
+                  e.g. \"c\", requires guest agent)\n  - .RootDiskIndex: index of
+                  the root disk\n  - .Shared: true if the volume is shared by multiple
+                  VMs, false otherwise\n  - .FileName: name of the file in the source
+                  provider (filename includes the .vmdk suffix)\n\nOpenShift specific
+                  variables:\n  - .SourcePVCName: name of the PVC in the source cluster\n
+                  \ - .SourcePVCNamespace: namespace of the PVC in the source cluster\n\nDefault
+                  behavior when not set:\n  - VMware: generates names like \"{{trunc
+                  4 .PlanName}}-{{trunc 4 .VmName}}-disk-{{.DiskIndex}}\"\n  - OpenShift:
+                  uses the original source PVC name (\"{{.SourcePVCName}}\")\n\nNote:\n
+                  \ This template can be overridden at the individual VM level.\nExamples:\n
+                  \ \"{{.TargetVmName}}-disk-{{.DiskIndex}}\"\n  \"{{if eq .DiskIndex
+                  .RootDiskIndex}}root{{else}}data{{end}}-{{.DiskIndex}}\" (VMware)\n
+                  \ \"{{.TargetVmName}}-{{.SourcePVCName}}\" (OpenShift)\nSee:\n\t
+                  https://github.com/kubev2v/forklift/tree/main/pkg/templateutil for
+                  template functions."
                 type: string
               pvcNameTemplateUseGenerateName:
+                default: true
                 description: |-
                   PVCNameTemplateUseGenerateName indicates if the PVC name template should use generateName instead of name.
                   This field controls whether the template output is used as an exact name or as a prefix for generated names.
 
-                    - true: Template output is used as generateName prefix, Kubernetes adds a random suffix
+                  Provider-specific behavior:
+
+                  VMware (vSphere):
+                    - true (default): Template output is used as generateName prefix, Kubernetes adds a random suffix
                       (e.g., "my-vm-disk-0-" becomes "my-vm-disk-0-abc12")
                     - false: Template output is used as the exact PVC name
                       **DANGER**: May cause conflicts if the generated name is not unique
 
-                  When unset (nil), defaults at runtime by source provider:
-                    - OpenShift (OCP): false (exact name; pairs with default "{{.SourcePVCName}}")
-                    - All other providers: true (generateName)
+                  OpenShift:
+                    - Supported when a custom pvcNameTemplate is set (plan-level or VM-level).
+                    - When no custom template is set, the default "{{.SourcePVCName}}" always uses exact names
+                      regardless of this field.
+                    - true: Template output is used as generateName prefix, Kubernetes adds a random suffix
+                    - false: Template output is used as the exact PVC name
                 type: boolean
               rdmAsLun:
                 description: |-
@@ -7783,6 +7575,20 @@ spec:
                   which is required for workloads that use SCSI PR-based fencing (e.g. shared-disk clusters).
                   Can be overridden per VM via spec.vms[].scsiReservation.
                 type: boolean
+              selinuxRelabelAtBoot:
+                description: |-
+                  SelinuxRelabelAtBoot defers SELinux relabeling until the guest's first boot after conversion.
+                  Passed to virt-v2v as --selinux-relabel-at-boot. Can be overridden per VM via spec.vms[].selinuxRelabelAtBoot.
+                type: boolean
+              selinuxRelabelExclude:
+                description: |-
+                  SelinuxRelabelExclude lists guest directories excluded from SELinux relabeling during conversion.
+                  Passed to virt-v2v as --selinux-relabel-exclude. Can be overridden per VM via spec.vms[].selinuxRelabelExclude.
+                  Use carefully: changes made inside excluded directories during customization may retain incorrect
+                  SELinux labels and cause failures later. Only exclude directories that are known not to need relabeling.
+                items:
+                  type: string
+                type: array
               serviceAccount:
                 description: |-
                   ServiceAccount is the name of the ServiceAccount to use for migration
@@ -8898,6 +8704,16 @@ spec:
                         Both vmx and svm are added together so the VM is portable across Intel and AMD hosts.
                         The "optional" policy activates only the feature the host CPU supports; the other is ignored.
                       type: boolean
+                    excludeDisks:
+                      description: |-
+                        ExcludeDisks lists vSphere bus addresses to skip during migration (e.g. "scsi0:1").
+                        Empty or omitted: migrate all disks (subject to migrateSharedDisks).
+                        When set, matching disks are not imported and are not attached to the target VM.
+                        Excluding every disk is rejected. Excluding the root/boot disk is allowed with a warning.
+                        vSphere only; other providers ignore this field.
+                      items:
+                        type: string
+                      type: array
                     hooks:
                       description: Enable hooks.
                       items:
@@ -9059,19 +8875,12 @@ spec:
                         names for VM disks.\nGenerated names must be valid DNS-1123
                         labels (lowercase alphanumerics, '-' allowed, max 63 chars).\nIt
                         follows Go template syntax and has access to provider-specific
-                        variables.\n\nWARNING: The PVC name is reused as a building
-                        block in other K8s resource names\n(e.g., \"scratch-dv-{pvcName}-xxxxx\",
-                        \"convert-{pvcName}-xxxxx\").\nTo avoid exceeding the 63-char
-                        DNS1123 label limit on derived resources,\nkeep the template
-                        output to at most 40 characters (46 if UseGenerateName is
-                        false).\nThe built-in default uses trunc 15 for plan and VM
-                        names to stay within this budget.\n\nCommon variables (all
-                        providers):\n  - .VmName: name of the VM in the source cluster
-                        (original source name)\n  - .TargetVmName: final VM name in
-                        the target cluster (may equal .VmName if no rename/normalization)\n
-                        \ - .PlanName: name of the migration plan\n  - .DiskIndex:
-                        initial volume index of the disk\n  - .VmId: source VM identifier
-                        from the provider\n\nVMware (vSphere) specific variables:\n
+                        variables.\n\nCommon variables (all providers):\n  - .VmName:
+                        name of the VM in the source cluster (original source name)\n
+                        \ - .TargetVmName: final VM name in the target cluster (may
+                        equal .VmName if no rename/normalization)\n  - .PlanName:
+                        name of the migration plan\n  - .DiskIndex: initial volume
+                        index of the disk\n\nVMware (vSphere) specific variables:\n
                         \ - .WinDriveLetter: Windows drive letter (lowercase, if applicable,
                         e.g. \"c\", requires guest agent)\n  - .RootDiskIndex: index
                         of the root disk\n  - .Shared: true if the volume is shared
@@ -9079,19 +8888,11 @@ spec:
                         file in the source provider (filename includes the .vmdk suffix)\n\nOpenShift
                         specific variables:\n  - .SourcePVCName: name of the PVC in
                         the source cluster\n  - .SourcePVCNamespace: namespace of
-                        the PVC in the source cluster\n\nEC2 specific variables:\n
-                        \ - .VolumeID: original EBS volume ID\n  - .SnapshotID: snapshot
-                        ID used to create the volume\n\nHyper-V / oVirt specific variables:\n
-                        \ - .DiskId: provider-specific disk identifier (Hyper-V VHDX
-                        GUID, oVirt disk attachment ID)\n\nNote:\n  Optional. Overrides
-                        the plan-level template when set.\n  When empty, falls back
-                        to plan-level, then ForkliftController globals, then hardcoded
-                        defaults.\n  OCP hardcoded default is \"{{.SourcePVCName}}\"
-                        (exact name).\nExamples:\n  \"{{.TargetVmName}}-disk-{{.DiskIndex}}\"\n
+                        the PVC in the source cluster\n\nNote:\n  This template overrides
+                        the plan level template.\nExamples:\n  \"{{.TargetVmName}}-disk-{{.DiskIndex}}\"\n
                         \ \"{{if eq .DiskIndex .RootDiskIndex}}root{{else}}data{{end}}-{{.DiskIndex}}\"
-                        (VMware)\n  \"{{.TargetVmName}}-{{.SourcePVCName}}\" (OpenShift)\n
-                        \ \"{{.PlanName}}-{{.VmId}}\" (plan + provider VM ID)\n  \"{{.VmName}}-{{.DiskId}}\"
-                        (Hyper-V / oVirt stable disk identity)\nSee:\n\t https://github.com/kubev2v/forklift/tree/main/pkg/templateutil
+                        (VMware)\n  \"{{.TargetVmName}}-{{.SourcePVCName}}\" (OpenShift)\nSee:\n\t
+                        https://github.com/kubev2v/forklift/tree/main/pkg/templateutil
                         for template functions."
                       type: string
                     rdmAsLun:
@@ -9113,6 +8914,20 @@ spec:
                         When explicitly set to true, shared RDM LUNs for this VM get lun.reservation=true.
                         When explicitly set to false, shared RDM LUNs for this VM get lun.reservation=false.
                       type: boolean
+                    selinuxRelabelAtBoot:
+                      description: |-
+                        SelinuxRelabelAtBoot overrides the plan-level selinuxRelabelAtBoot for this VM.
+                        When nil (default), the plan-level value is used.
+                      type: boolean
+                    selinuxRelabelExclude:
+                      description: |-
+                        SelinuxRelabelExclude overrides the plan-level selinuxRelabelExclude for this VM.
+                        When nil (default), the plan-level value is used.
+                        Use carefully: changes made inside excluded directories during customization may retain incorrect
+                        SELinux labels and cause failures later. Only exclude directories that are known not to need relabeling.
+                      items:
+                        type: string
+                      type: array
                     targetName:
                       description: |-
                         TargetName specifies a custom name for the VM in the target cluster.
@@ -9516,12 +9331,6 @@ spec:
                           description: Boot disk index (0-based) detected by virt-v2v.
                             nil means undetected.
                           type: integer
-                        disksCopied:
-                          description: |-
-                            DisksCopied is set to true when all disk transfer tasks complete
-                            successfully. Used to determine if conversion can be resumed
-                            without re-copying disks.
-                          type: boolean
                         enableNestedVirtualization:
                           description: |-
                             EnableNestedVirtualization controls whether nested virtualization CPU features (vmx/svm)
@@ -9552,6 +9361,16 @@ spec:
                           - phase
                           - reasons
                           type: object
+                        excludeDisks:
+                          description: |-
+                            ExcludeDisks lists vSphere bus addresses to skip during migration (e.g. "scsi0:1").
+                            Empty or omitted: migrate all disks (subject to migrateSharedDisks).
+                            When set, matching disks are not imported and are not attached to the target VM.
+                            Excluding every disk is rejected. Excluding the root/boot disk is allowed with a warning.
+                            vSphere only; other providers ignore this field.
+                          items:
+                            type: string
+                          type: array
                         firmware:
                           description: The firmware type detected from the OVF file
                             produced by virt-v2v.
@@ -9879,42 +9698,25 @@ spec:
                             PVC names for VM disks.\nGenerated names must be valid
                             DNS-1123 labels (lowercase alphanumerics, '-' allowed,
                             max 63 chars).\nIt follows Go template syntax and has
-                            access to provider-specific variables.\n\nWARNING: The
-                            PVC name is reused as a building block in other K8s resource
-                            names\n(e.g., \"scratch-dv-{pvcName}-xxxxx\", \"convert-{pvcName}-xxxxx\").\nTo
-                            avoid exceeding the 63-char DNS1123 label limit on derived
-                            resources,\nkeep the template output to at most 40 characters
-                            (46 if UseGenerateName is false).\nThe built-in default
-                            uses trunc 15 for plan and VM names to stay within this
-                            budget.\n\nCommon variables (all providers):\n  - .VmName:
-                            name of the VM in the source cluster (original source
-                            name)\n  - .TargetVmName: final VM name in the target
-                            cluster (may equal .VmName if no rename/normalization)\n
-                            \ - .PlanName: name of the migration plan\n  - .DiskIndex:
-                            initial volume index of the disk\n  - .VmId: source VM
-                            identifier from the provider\n\nVMware (vSphere) specific
-                            variables:\n  - .WinDriveLetter: Windows drive letter
-                            (lowercase, if applicable, e.g. \"c\", requires guest
-                            agent)\n  - .RootDiskIndex: index of the root disk\n  -
-                            .Shared: true if the volume is shared by multiple VMs,
-                            false otherwise\n  - .FileName: name of the file in the
-                            source provider (filename includes the .vmdk suffix)\n\nOpenShift
+                            access to provider-specific variables.\n\nCommon variables
+                            (all providers):\n  - .VmName: name of the VM in the source
+                            cluster (original source name)\n  - .TargetVmName: final
+                            VM name in the target cluster (may equal .VmName if no
+                            rename/normalization)\n  - .PlanName: name of the migration
+                            plan\n  - .DiskIndex: initial volume index of the disk\n\nVMware
+                            (vSphere) specific variables:\n  - .WinDriveLetter: Windows
+                            drive letter (lowercase, if applicable, e.g. \"c\", requires
+                            guest agent)\n  - .RootDiskIndex: index of the root disk\n
+                            \ - .Shared: true if the volume is shared by multiple
+                            VMs, false otherwise\n  - .FileName: name of the file
+                            in the source provider (filename includes the .vmdk suffix)\n\nOpenShift
                             specific variables:\n  - .SourcePVCName: name of the PVC
                             in the source cluster\n  - .SourcePVCNamespace: namespace
-                            of the PVC in the source cluster\n\nEC2 specific variables:\n
-                            \ - .VolumeID: original EBS volume ID\n  - .SnapshotID:
-                            snapshot ID used to create the volume\n\nHyper-V / oVirt
-                            specific variables:\n  - .DiskId: provider-specific disk
-                            identifier (Hyper-V VHDX GUID, oVirt disk attachment ID)\n\nNote:\n
-                            \ Optional. Overrides the plan-level template when set.\n
-                            \ When empty, falls back to plan-level, then ForkliftController
-                            globals, then hardcoded defaults.\n  OCP hardcoded default
-                            is \"{{.SourcePVCName}}\" (exact name).\nExamples:\n  \"{{.TargetVmName}}-disk-{{.DiskIndex}}\"\n
+                            of the PVC in the source cluster\n\nNote:\n  This template
+                            overrides the plan level template.\nExamples:\n  \"{{.TargetVmName}}-disk-{{.DiskIndex}}\"\n
                             \ \"{{if eq .DiskIndex .RootDiskIndex}}root{{else}}data{{end}}-{{.DiskIndex}}\"
-                            (VMware)\n  \"{{.TargetVmName}}-{{.SourcePVCName}}\" (OpenShift)\n
-                            \ \"{{.PlanName}}-{{.VmId}}\" (plan + provider VM ID)\n
-                            \ \"{{.VmName}}-{{.DiskId}}\" (Hyper-V / oVirt stable
-                            disk identity)\nSee:\n\t https://github.com/kubev2v/forklift/tree/main/pkg/templateutil
+                            (VMware)\n  \"{{.TargetVmName}}-{{.SourcePVCName}}\" (OpenShift)\nSee:\n\t
+                            https://github.com/kubev2v/forklift/tree/main/pkg/templateutil
                             for template functions."
                           type: string
                         rdmAsLun:
@@ -9939,6 +9741,20 @@ spec:
                             When explicitly set to true, shared RDM LUNs for this VM get lun.reservation=true.
                             When explicitly set to false, shared RDM LUNs for this VM get lun.reservation=false.
                           type: boolean
+                        selinuxRelabelAtBoot:
+                          description: |-
+                            SelinuxRelabelAtBoot overrides the plan-level selinuxRelabelAtBoot for this VM.
+                            When nil (default), the plan-level value is used.
+                          type: boolean
+                        selinuxRelabelExclude:
+                          description: |-
+                            SelinuxRelabelExclude overrides the plan-level selinuxRelabelExclude for this VM.
+                            When nil (default), the plan-level value is used.
+                            Use carefully: changes made inside excluded directories during customization may retain incorrect
+                            SELinux labels and cause failures later. Only exclude directories that are known not to need relabeling.
+                          items:
+                            type: string
+                          type: array
                         started:
                           description: Started timestamp.
                           format: date-time
@@ -10374,7 +10190,6 @@ spec:
                                 array vendor.
                               enum:
                               - primera3par
-                              - ontap
                               type: string
                           required:
                           - secretRef
@@ -10385,13 +10200,6 @@ spec:
                             VSphereXcopyPluginConfig works with the Vsphere Xcopy Volume Populator
                             to offload the copy to Vsphere and the storage array.
                           properties:
-                            dedicatedMigrationHosts:
-                              description: |-
-                                DedicatedMigrationHosts is a list of ESXi host IDs to use for
-                                XCOPY migrations instead of the VM's registered host.
-                              items:
-                                type: string
-                              type: array
                             secretRef:
                               description: |-
                                 SecretRef is the name of the secret with the storage credentials for the plugin.
@@ -10667,11 +10475,6 @@ spec:
             type: object
           spec:
             properties:
-              migrationHost:
-                description: |-
-                  MigrationHost is the ESXi host ID to use for the XCOPY operation.
-                  If empty, the host where the source VM is registered will be used.
-                type: string
               secretName:
                 description: The secret name with vsphere and storage credentials
                 type: string
@@ -11537,12 +11340,6 @@ rules:
   - watch
   - update
   - patch
-- apiGroups:
-  - networking.k8s.io
-  resources:
-  - networkpolicies
-  verbs:
-  - '*'
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -11912,7 +11709,7 @@ spec:
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:radio:true
         - urn:alm:descriptor:com.tectonic.ui:radio:false
-      - description: Enable OCP live migration
+      - description: Enable OCP live migration (default false)
         displayName: Enable OCP Live Migration
         path: feature_ocp_live_migration
         x-descriptors:
@@ -11969,7 +11766,7 @@ spec:
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:radio:true
         - urn:alm:descriptor:com.tectonic.ui:radio:false
-      - description: Enable OVA appliance management endpoints
+      - description: Enable OVA appliance management endpoints (default false)
         displayName: Enable OVA Appliance Management
         path: feature_ova_appliance_management
         x-descriptors:
@@ -12060,7 +11857,7 @@ spec:
         path: ova_proxy_fqin
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:hidden
-      - description: Controller CPU limit
+      - description: Controller CPU limit (default 500m)
         displayName: Controller CPU Limit
         path: controller_container_limits_cpu
         x-descriptors:
@@ -12080,7 +11877,7 @@ spec:
         path: controller_container_requests_memory
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:hidden
-      - description: Inventory CPU limit
+      - description: Inventory CPU limit (default 1000m)
         displayName: Inventory CPU Limit
         path: inventory_container_limits_cpu
         x-descriptors:
@@ -12125,22 +11922,22 @@ spec:
         path: api_container_requests_memory
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:hidden
-      - description: CLI download service CPU limit
+      - description: CLI download service CPU limit (default 100m)
         displayName: CLI Download CPU Limit
         path: cli_download_container_limits_cpu
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:hidden
-      - description: CLI download service memory limit
+      - description: CLI download service memory limit (default 128Mi)
         displayName: CLI Download Memory Limit
         path: cli_download_container_limits_memory
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:hidden
-      - description: CLI download service CPU request
+      - description: CLI download service CPU request (default 50m)
         displayName: CLI Download CPU Request
         path: cli_download_container_requests_cpu
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:hidden
-      - description: CLI download service memory request
+      - description: CLI download service memory request (default 64Mi)
         displayName: CLI Download Memory Request
         path: cli_download_container_requests_memory
         x-descriptors:

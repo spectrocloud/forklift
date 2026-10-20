@@ -118,9 +118,7 @@ func (r *Migrator) ExecutePhase(vm *planapi.VMStatus) (ok bool, err error) {
 		}
 	case api.PhaseStorePowerState:
 		ok = false
-	case api.PhaseCreateGuestConversionPod:
-		ok = false
-	case api.PhaseConvertGuest:
+	case api.PhaseCreateGuestConversionPod, api.PhaseConvertGuest:
 		ok = false
 	case api.PhaseFinalize:
 		ok = false

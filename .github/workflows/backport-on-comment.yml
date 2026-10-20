@@ -33,13 +33,13 @@ jobs:
           read -ra words <<< "$COMMENT_BODY"
 
           if [[ ${#words[@]} -lt 2 ]]; then
-            echo "::error::Usage: /backport release-X.Y [--dry-run]"
+            echo "::error::Usage: /backport rc-X.Y [--dry-run]"
             exit 1
           fi
 
           branch="${words[1]}"
-          if [[ ! "$branch" =~ ^release-[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Branch must match release-X.Y (e.g. release-2.7)"
+          if [[ ! "$branch" =~ ^(rc|release)-[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Branch must match rc-X.Y or release-X.Y (e.g. rc-4.10)"
             exit 1
           fi
 

@@ -2,6 +2,7 @@ package plan
 
 import (
 	"strconv"
+	"strings"
 
 	k8snet "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
@@ -1292,6 +1293,16 @@ var _ = ginkgo.Describe("Template Validation", func() {
 			validatorContainer := job.Spec.Template.Spec.Containers[0]
 			gomega.Expect(validatorContainer.Image).To(gomega.Equal(globalImage))
 		})
+
+		ginkgo.It("should accept libvixDiskLib or nbdkit-nfc plugin in /opt", func() {
+			p := newPlanWithVddkProvider()
+			job := createVddkCheckJob(p)
+
+			cmd := strings.Join(job.Spec.Template.Spec.Containers[0].Command, " ")
+			gomega.Expect(cmd).To(gomega.ContainSubstring("libvixDiskLib.so"))
+			gomega.Expect(cmd).To(gomega.ContainSubstring("/opt/nbdkit-nfc-plugin.so"))
+			gomega.Expect(cmd).To(gomega.ContainSubstring("/usr/lib64/nbdkit/plugins/nbdkit-nfc-plugin.so"))
+		})
 	})
 })
 
@@ -1519,121 +1530,5 @@ var _ = ginkgo.Describe("validateVirtV2vImage", func() {
 		err := reconciler.validateVirtV2vImage(plan)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		gomega.Expect(plan.Status.HasCondition(VirtV2vImageNotValid)).To(gomega.BeFalse())
-	})
-})
-
-var _ = ginkgo.Describe("checkConversionResumable", func() {
-	var reconciler *Reconciler
-
-	ginkgo.BeforeEach(func() {
-		reconciler = &Reconciler{
-			base.Reconciler{},
-			nil,
-		}
-	})
-
-	ginkgo.It("should set ConversionResumable when plan is failed and VM has DisksCopied", func() {
-		p := &api.Plan{}
-		p.Status.SetCondition(libcnd.Condition{
-			Type:   Failed,
-			Status: True,
-		})
-		p.Status.Migration.VMs = []*apisplan.VMStatus{
-			{
-				VM:          apisplan.VM{Ref: ref.Ref{Name: "test-vm"}},
-				DisksCopied: true,
-			},
-		}
-		p.Status.Migration.VMs[0].SetCondition(libcnd.Condition{
-			Type:   api.ConditionFailed,
-			Status: True,
-		})
-
-		reconciler.checkConversionResumable(p)
-		gomega.Expect(p.Status.HasCondition(ConversionResumable)).To(gomega.BeTrue())
-	})
-
-	ginkgo.It("should not set ConversionResumable when plan is not failed", func() {
-		p := &api.Plan{}
-		p.Status.SetCondition(libcnd.Condition{
-			Type:   Succeeded,
-			Status: True,
-		})
-		p.Status.Migration.VMs = []*apisplan.VMStatus{
-			{
-				VM:          apisplan.VM{Ref: ref.Ref{Name: "test-vm"}},
-				DisksCopied: true,
-			},
-		}
-
-		reconciler.checkConversionResumable(p)
-		gomega.Expect(p.Status.HasCondition(ConversionResumable)).To(gomega.BeFalse())
-	})
-
-	ginkgo.It("should not set ConversionResumable when no VMs have DisksCopied", func() {
-		p := &api.Plan{}
-		p.Status.SetCondition(libcnd.Condition{
-			Type:   Failed,
-			Status: True,
-		})
-		p.Status.Migration.VMs = []*apisplan.VMStatus{
-			{
-				VM:          apisplan.VM{Ref: ref.Ref{Name: "test-vm"}},
-				DisksCopied: false,
-			},
-		}
-		p.Status.Migration.VMs[0].SetCondition(libcnd.Condition{
-			Type:   api.ConditionFailed,
-			Status: True,
-		})
-
-		reconciler.checkConversionResumable(p)
-		gomega.Expect(p.Status.HasCondition(ConversionResumable)).To(gomega.BeFalse())
-	})
-
-	ginkgo.It("should clear ConversionResumable on successful resume", func() {
-		p := &api.Plan{}
-		p.Status.SetCondition(libcnd.Condition{
-			Type:   ConversionResumable,
-			Status: True,
-		})
-		p.Status.SetCondition(libcnd.Condition{
-			Type:   Succeeded,
-			Status: True,
-		})
-
-		reconciler.checkConversionResumable(p)
-		gomega.Expect(p.Status.HasCondition(ConversionResumable)).To(gomega.BeFalse())
-	})
-
-	ginkgo.It("should only count VMs that are both DisksCopied and Failed", func() {
-		p := &api.Plan{}
-		p.Status.SetCondition(libcnd.Condition{
-			Type:   Failed,
-			Status: True,
-		})
-		succeededVM := &apisplan.VMStatus{
-			VM:          apisplan.VM{Ref: ref.Ref{Name: "succeeded-vm"}},
-			DisksCopied: true,
-		}
-		succeededVM.SetCondition(libcnd.Condition{
-			Type:   api.ConditionSucceeded,
-			Status: True,
-		})
-		failedVM := &apisplan.VMStatus{
-			VM:          apisplan.VM{Ref: ref.Ref{Name: "failed-vm"}},
-			DisksCopied: true,
-		}
-		failedVM.SetCondition(libcnd.Condition{
-			Type:   api.ConditionFailed,
-			Status: True,
-		})
-		p.Status.Migration.VMs = []*apisplan.VMStatus{succeededVM, failedVM}
-
-		reconciler.checkConversionResumable(p)
-		gomega.Expect(p.Status.HasCondition(ConversionResumable)).To(gomega.BeTrue())
-		cnd := p.Status.FindCondition(ConversionResumable)
-		gomega.Expect(cnd.Message).To(gomega.ContainSubstring("failed-vm"))
-		gomega.Expect(cnd.Message).NotTo(gomega.ContainSubstring("succeeded-vm"))
 	})
 })

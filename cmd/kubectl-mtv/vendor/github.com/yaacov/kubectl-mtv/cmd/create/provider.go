@@ -40,7 +40,6 @@ func NewProviderCmd(kubeConfigFlags *genericclioptions.ConfigFlags) *cobra.Comma
 
 	// HyperV specific flags
 	var smbUrl, smbUser, smbPassword string
-	var hypervMgmtType string
 
 	// Azure specific flags
 	var azureTenantID, azureSubscriptionID, azureClientID, azureClientSecret string
@@ -181,7 +180,6 @@ Credentials can be provided directly via flags or through an existing Kubernetes
 				SMBUrl:                     smbUrl,
 				SMBUser:                    smbUser,
 				SMBPassword:                smbPassword,
-				HyperVMgmtType:             hypervMgmtType,
 				AzureTenantID:              azureTenantID,
 				AzureSubscriptionID:        azureSubscriptionID,
 				AzureClientID:              azureClientID,
@@ -238,7 +236,6 @@ Credentials can be provided directly via flags or through an existing Kubernetes
 	cmd.Flags().StringVar(&smbUrl, "smb-url", "", "SMB share URL for HyperV (e.g., //server/share)")
 	cmd.Flags().StringVar(&smbUser, "smb-user", "", "SMB username (defaults to HyperV username)")
 	cmd.Flags().StringVar(&smbPassword, "smb-password", "", "SMB password (defaults to HyperV password)")
-	cmd.Flags().StringVar(&hypervMgmtType, "hyperv-management-type", "", "HyperV management type (e.g., cluster)")
 
 	// Azure specific flags
 	cmd.Flags().StringVar(&azureTenantID, "azure-tenant-id", "", "Azure AD tenant ID")

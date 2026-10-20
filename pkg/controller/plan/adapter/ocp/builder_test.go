@@ -1,12 +1,23 @@
 package ocp
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
+	"math/big"
+	"net"
+	"net/http"
 	"testing"
+	"time"
 
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	planapi "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
-	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
 	"github.com/kubev2v/forklift/pkg/settings"
@@ -16,96 +27,141 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
-	export "kubevirt.io/api/export/v1alpha1"
+	export "kubevirt.io/api/export/v1beta1"
 	cdi "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func TestGetPVCNameTemplate_UniversalDefault(t *testing.T) {
-	plan := &api.Plan{}
-
-	template := planbase.GetPVCNameTemplate(plan, "vm1-id")
-	expected := planbase.DefaultPVCNameTemplate
-	if template != expected {
-		t.Errorf("expected universal default template %q, got %q", expected, template)
+func newBuilder(plan *api.Plan) *Builder {
+	return &Builder{
+		Context: &plancontext.Context{
+			Plan: plan,
+		},
 	}
 }
 
-func TestGetPVCNameTemplate_OCPDefault(t *testing.T) {
-	ocpType := api.OpenShift
-	plan := &api.Plan{}
-	plan.Provider.Source = &api.Provider{
-		Spec: api.ProviderSpec{Type: &ocpType},
-	}
-	template := planbase.GetPVCNameTemplate(plan, "vm1-id")
-	if template != planbase.DefaultOCPPVCNameTemplate {
-		t.Errorf("expected OCP default template %q, got %q", planbase.DefaultOCPPVCNameTemplate, template)
+func TestHasCustomPVCNameTemplate_NoTemplateSet(t *testing.T) {
+	b := newBuilder(&api.Plan{})
+	vmRef := ref.Ref{Name: "vm1", Namespace: "ns1"}
+
+	if b.hasCustomPVCNameTemplate(vmRef) {
+		t.Error("expected false when no template is set")
 	}
 }
 
-func TestGetPVCNameTemplate_PlanLevelTemplate(t *testing.T) {
+func TestHasCustomPVCNameTemplate_PlanLevelTemplate(t *testing.T) {
+	plan := &api.Plan{
+		Spec: api.PlanSpec{
+			PVCNameTemplate: "{{.TargetVmName}}-disk-{{.DiskIndex}}",
+		},
+	}
+	b := newBuilder(plan)
+	vmRef := ref.Ref{Name: "vm1", Namespace: "ns1"}
+
+	if !b.hasCustomPVCNameTemplate(vmRef) {
+		t.Error("expected true when plan-level template is set")
+	}
+}
+
+func TestHasCustomPVCNameTemplate_VMLevelTemplate(t *testing.T) {
+	plan := &api.Plan{
+		Spec: api.PlanSpec{
+			VMs: []planapi.VM{
+				{
+					Ref:             ref.Ref{Name: "vm1"},
+					PVCNameTemplate: "{{.SourcePVCName}}-migrated",
+				},
+			},
+		},
+	}
+	b := newBuilder(plan)
+	vmRef := ref.Ref{Name: "vm1"}
+
+	if !b.hasCustomPVCNameTemplate(vmRef) {
+		t.Error("expected true when VM-level template is set")
+	}
+}
+
+func TestHasCustomPVCNameTemplate_VMLevelOverrideOnly(t *testing.T) {
+	plan := &api.Plan{
+		Spec: api.PlanSpec{
+			VMs: []planapi.VM{
+				{
+					Ref:             ref.Ref{Name: "vm1"},
+					PVCNameTemplate: "custom-{{.DiskIndex}}",
+				},
+				{
+					Ref: ref.Ref{Name: "vm2"},
+				},
+			},
+		},
+	}
+	b := newBuilder(plan)
+
+	if !b.hasCustomPVCNameTemplate(ref.Ref{Name: "vm1"}) {
+		t.Error("expected true for vm1 with custom template")
+	}
+	if b.hasCustomPVCNameTemplate(ref.Ref{Name: "vm2"}) {
+		t.Error("expected false for vm2 without custom template")
+	}
+}
+
+func TestSetPVCNameFromTemplate_DefaultTemplate(t *testing.T) {
+	plan := &api.Plan{}
+	b := newBuilder(plan)
+
+	vmRef := ref.Ref{Name: "vm1", Namespace: "ns1"}
+
+	template := b.getPVCNameTemplate(vmRef)
+	if template != "{{.SourcePVCName}}" {
+		t.Errorf("expected default template '{{.SourcePVCName}}', got %q", template)
+	}
+}
+
+func TestSetPVCNameFromTemplate_CustomPlanTemplate(t *testing.T) {
 	plan := &api.Plan{
 		Spec: api.PlanSpec{
 			PVCNameTemplate: "migrated-{{.DiskIndex}}",
 		},
 	}
+	b := newBuilder(plan)
 
-	template := planbase.GetPVCNameTemplate(plan, "vm1-id")
+	vmRef := ref.Ref{Name: "vm1", Namespace: "ns1"}
+
+	template := b.getPVCNameTemplate(vmRef)
 	if template != "migrated-{{.DiskIndex}}" {
 		t.Errorf("expected plan-level template, got %q", template)
 	}
 }
 
-func TestGetPVCNameTemplate_VMLevelOverridesPlan(t *testing.T) {
+func TestSetPVCNameFromTemplate_VMLevelOverridesPlan(t *testing.T) {
 	plan := &api.Plan{
 		Spec: api.PlanSpec{
 			PVCNameTemplate: "plan-level-{{.DiskIndex}}",
 			VMs: []planapi.VM{
 				{
-					Ref:             ref.Ref{ID: "vm1-id", Name: "vm1"},
+					Ref:             ref.Ref{Name: "vm1"},
 					PVCNameTemplate: "vm-level-{{.DiskIndex}}",
 				},
 			},
 		},
 	}
+	b := newBuilder(plan)
 
-	template := planbase.GetPVCNameTemplate(plan, "vm1-id")
+	template := b.getPVCNameTemplate(ref.Ref{Name: "vm1"})
 	if template != "vm-level-{{.DiskIndex}}" {
 		t.Errorf("expected VM-level template to override plan-level, got %q", template)
 	}
 }
 
-func TestGetPVCNameTemplate_VMLevelOnlyForMatchingVM(t *testing.T) {
-	plan := &api.Plan{
-		Spec: api.PlanSpec{
-			PVCNameTemplate: "plan-{{.DiskIndex}}",
-			VMs: []planapi.VM{
-				{
-					Ref:             ref.Ref{ID: "vm1-id", Name: "vm1"},
-					PVCNameTemplate: "custom-{{.DiskIndex}}",
-				},
-				{
-					Ref: ref.Ref{ID: "vm2-id", Name: "vm2"},
-				},
-			},
-		},
-	}
-
-	if tmpl := planbase.GetPVCNameTemplate(plan, "vm1-id"); tmpl != "custom-{{.DiskIndex}}" {
-		t.Errorf("expected VM-level template for vm1, got %q", tmpl)
-	}
-	if tmpl := planbase.GetPVCNameTemplate(plan, "vm2-id"); tmpl != "plan-{{.DiskIndex}}" {
-		t.Errorf("expected plan-level template for vm2, got %q", tmpl)
-	}
-}
-
 func TestExecuteTemplate_OCPTemplateData(t *testing.T) {
-	data := &api.PVCNameTemplateData{
+	b := newBuilder(&api.Plan{})
+
+	data := &api.OCPPVCNameTemplateData{
 		VmName:             "source-vm",
 		TargetVmName:       "target-vm",
 		PlanName:           "my-plan",
 		DiskIndex:          0,
-		VmId:               "vm-12345",
 		SourcePVCName:      "my-pvc",
 		SourcePVCNamespace: "src-ns",
 	}
@@ -116,7 +172,7 @@ func TestExecuteTemplate_OCPTemplateData(t *testing.T) {
 		expected string
 	}{
 		{
-			name:     "source pvc name template",
+			name:     "default template",
 			template: "{{.SourcePVCName}}",
 			expected: "my-pvc",
 		},
@@ -130,21 +186,11 @@ func TestExecuteTemplate_OCPTemplateData(t *testing.T) {
 			template: "{{.PlanName}}-{{.SourcePVCName}}",
 			expected: "my-plan-my-pvc",
 		},
-		{
-			name:     "VmId variable",
-			template: "{{.PlanName}}-{{.VmId}}",
-			expected: "my-plan-vm-12345",
-		},
-		{
-			name:     "universal default template",
-			template: "{{trunc 15 .PlanName}}-{{trunc 15 .TargetVmName}}-disk-{{.DiskIndex}}",
-			expected: "my-plan-target-vm-disk-0",
-		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := templateutil.ExecuteTemplate(tc.template, data)
+			result, err := b.executeTemplate(tc.template, data)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -222,7 +268,7 @@ func TestDataVolumes_PVCNameTemplate(t *testing.T) {
 			Status: &export.VirtualMachineExportStatus{
 				Links: &export.VirtualMachineExportLinks{
 					External: &export.VirtualMachineExportLink{
-						Cert: "cert",
+						Cert: "",
 						Volumes: []export.VirtualMachineExportVolume{{
 							Name: volumeName,
 							Formats: []export.VirtualMachineExportVolumeFormat{
@@ -324,4 +370,133 @@ func TestDataVolumes_PVCNameTemplate(t *testing.T) {
 			t.Errorf("expected Name %q, got Name=%q GenerateName=%q", "ocpglob-0", dvs[0].Name, dvs[0].GenerateName)
 		}
 	})
+}
+
+func TestTlsCertForExport(t *testing.T) {
+	caPEM, serverCert, _ := newTestTLSCredentials(t)
+	listener := startTestTLSServer(t, serverCert)
+	exportURL := "https://" + listener.Addr().String()
+
+	t.Run("empty cert", func(t *testing.T) {
+		got, err := tlsCertForExport(exportURL, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "" {
+			t.Fatalf("expected empty cert, got %q", got)
+		}
+	})
+
+	t.Run("matching CA", func(t *testing.T) {
+		got, err := tlsCertForExport(exportURL, string(caPEM))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != string(caPEM) {
+			t.Fatalf("expected provided CA, got %q", got)
+		}
+	})
+
+	t.Run("missing export URL", func(t *testing.T) {
+		_, err := tlsCertForExport("", string(caPEM))
+		if err == nil {
+			t.Fatal("expected error for missing export URL")
+		}
+	})
+
+	t.Run("wrong CA when system also untrusted", func(t *testing.T) {
+		wrongCAPEM, _, _ := newTestTLSCredentials(t)
+		_, err := tlsCertForExport(exportURL, string(wrongCAPEM))
+		if err == nil {
+			t.Fatal("expected error when neither VMExport cert nor system CA verifies")
+		}
+	})
+}
+
+func TestCreateDataVolumeSpec_OmitsCertConfigMap(t *testing.T) {
+	spec := createDataVolumeSpec(resource.MustParse("1Gi"), "sc", "https://example/disk", "", "secret")
+	if spec.Source.HTTP.CertConfigMap != "" {
+		t.Fatalf("expected empty CertConfigMap, got %q", spec.Source.HTTP.CertConfigMap)
+	}
+
+	spec = createDataVolumeSpec(resource.MustParse("1Gi"), "sc", "https://example/disk", "ca-cm", "secret")
+	if spec.Source.HTTP.CertConfigMap != "ca-cm" {
+		t.Fatalf("expected CertConfigMap ca-cm, got %q", spec.Source.HTTP.CertConfigMap)
+	}
+}
+
+func newTestTLSCredentials(t *testing.T) (caPEM []byte, serverCert tls.Certificate, serverKey *ecdsa.PrivateKey) {
+	t.Helper()
+
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate CA key: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create CA cert: %v", err)
+	}
+	caPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+
+	serverKey, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate server key: %v", err)
+	}
+	serverTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	serverDER, err := x509.CreateCertificate(rand.Reader, serverTemplate, caTemplate, &serverKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create server cert: %v", err)
+	}
+	serverCert = tls.Certificate{
+		Certificate: [][]byte{serverDER, caDER},
+		PrivateKey:  serverKey,
+	}
+	return caPEM, serverCert, serverKey
+}
+
+func startTestTLSServer(t *testing.T, serverCert tls.Certificate) net.Listener {
+	t.Helper()
+
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+	})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			t.Errorf("listener.Close: %v", closeErr)
+		}
+	})
+
+	go func() {
+		serveErr := http.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		if serveErr == nil || errors.Is(serveErr, http.ErrServerClosed) {
+			return
+		}
+		var opErr *net.OpError
+		if errors.As(serveErr, &opErr) && errors.Is(opErr.Err, net.ErrClosed) {
+			return
+		}
+		t.Errorf("http.Serve: %v", serveErr)
+	}()
+	return listener
 }

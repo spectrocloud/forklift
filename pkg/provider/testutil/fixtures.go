@@ -7,7 +7,6 @@ import (
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
 )
 
 // PlanBuilder provides a fluent interface for building test Plan objects.
@@ -26,7 +25,7 @@ func NewPlanBuilder() *PlanBuilder {
 			},
 			Spec: api.PlanSpec{
 				TargetNamespace:                "test",
-				PVCNameTemplateUseGenerateName: ptr.To(true),
+				PVCNameTemplateUseGenerateName: true,
 			},
 		},
 	}
@@ -306,15 +305,6 @@ func (b *MigrationBuilder) WithCancel(vms ...ref.Ref) *MigrationBuilder {
 // WithCutover sets the cutover time for warm migrations.
 func (b *MigrationBuilder) WithCutover(cutover meta.Time) *MigrationBuilder {
 	b.migration.Spec.Cutover = &cutover
-	return b
-}
-
-// WithVMCutover adds a per-VM cutover time.
-func (b *MigrationBuilder) WithVMCutover(vmID string, cutover meta.Time) *MigrationBuilder {
-	b.migration.Spec.VMCutover = append(b.migration.Spec.VMCutover, api.VMCutover{
-		ID:      vmID,
-		Cutover: cutover,
-	})
 	return b
 }
 

@@ -234,26 +234,24 @@ func (h *HostHandler) buildAdapters(host *Host) (err error) {
 // REST Resource.
 type Host struct {
 	Resource
-	Cluster                 string               `json:"cluster"`
-	Status                  string               `json:"status"`
-	InMaintenanceMode       bool                 `json:"inMaintenance"`
-	ManagementServerIp      string               `json:"managementServerIp"`
-	Thumbprint              string               `json:"thumbprint"`
-	Timezone                string               `json:"timezone"`
-	CpuSockets              int16                `json:"cpuSockets"`
-	CpuCores                int16                `json:"cpuCores"`
-	MemoryBytes             int64                `json:"memoryBytes"`
-	ProductName             string               `json:"productName"`
-	ProductVersion          string               `json:"productVersion"`
-	Network                 model.HostNetwork    `json:"networking"`
-	Networks                []model.Ref          `json:"networks"`
-	Datastores              []model.Ref          `json:"datastores"`
-	VMs                     []model.Ref          `json:"vms"`
-	NetworkAdapters         []NetworkAdapter     `json:"networkAdapters"`
-	HostScsiDisks           []model.HostScsiDisk `json:"hostScsiDisks"`
-	AdvancedOptions         []AdvancedOptions    `json:"advancedOptions"`
-	VMotionSupported        bool                 `json:"vmotionSupported"`
-	StorageVMotionSupported bool                 `json:"storageVmotionSupported"`
+	Cluster            string               `json:"cluster"`
+	Status             string               `json:"status"`
+	InMaintenanceMode  bool                 `json:"inMaintenance"`
+	ManagementServerIp string               `json:"managementServerIp"`
+	Thumbprint         string               `json:"thumbprint"`
+	Timezone           string               `json:"timezone"`
+	CpuSockets         int16                `json:"cpuSockets"`
+	CpuCores           int16                `json:"cpuCores"`
+	MemoryBytes        int64                `json:"memoryBytes"`
+	ProductName        string               `json:"productName"`
+	ProductVersion     string               `json:"productVersion"`
+	Network            model.HostNetwork    `json:"networking"`
+	Networks           []model.Ref          `json:"networks"`
+	Datastores         []model.Ref          `json:"datastores"`
+	VMs                []model.Ref          `json:"vms"`
+	NetworkAdapters    []NetworkAdapter     `json:"networkAdapters"`
+	HostScsiDisks      []model.HostScsiDisk `json:"hostScsiDisks"`
+	AdvancedOptions    []AdvancedOptions    `json:"advancedOptions"`
 }
 
 type AdvancedOptions struct {
@@ -280,8 +278,6 @@ func (r *Host) With(m *model.Host) {
 	r.Datastores = m.Datastores
 	r.NetworkAdapters = []NetworkAdapter{}
 	r.HostScsiDisks = append(r.HostScsiDisks, m.HostScsiDisks...)
-	r.VMotionSupported = m.VMotionSupported
-	r.StorageVMotionSupported = m.StorageVMotionSupported
 }
 
 // Build self link (URI).

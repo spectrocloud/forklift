@@ -166,7 +166,6 @@ func (r *Collector) Collect() error {
 		{"volumes", r.collectVolumes},
 		{"networks", r.collectNetworks},
 		{"storageTypes", r.collectStorageTypes},
-		{"snapshots", r.collectSnapshots},
 	}
 
 	// Execute all collection tasks

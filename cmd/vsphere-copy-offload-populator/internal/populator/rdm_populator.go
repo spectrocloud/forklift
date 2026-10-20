@@ -29,7 +29,7 @@ func NewRDMPopulator(storageApi RDMCapable, vmwareClient vmware.Client, copyCtx 
 }
 
 // Populate performs the RDM copy operation
-func (p *RDMPopulator) Populate(ctx context.Context, vmId string, migrationHostId, sourceVMDKFile string, pv PersistentVolume, hostLocker Hostlocker, progress chan<- uint64, xcopyUsed chan<- int, quit chan error) (errFinal error) {
+func (p *RDMPopulator) Populate(ctx context.Context, vmId string, sourceVMDKFile string, pv PersistentVolume, hostLocker Hostlocker, progress chan<- uint64, xcopyUsed chan<- int, quit chan error) (errFinal error) {
 	log := klog.Background().WithName("copy-offload").WithName("rdm")
 	defer func() {
 		r := recover()

@@ -60,9 +60,9 @@ func Describe(configFlags *genericclioptions.ConfigFlags, name, namespace string
 	buildMappingsSection(b, networkMapping, storageMapping, migrationType)
 
 	// Running / Latest migration
-	buildMigrationSection(b, "RUNNING MIGRATION", planDetails.RunningMigration, planDetails, useUTC)
+	buildMigrationSection(b, "RUNNING MIGRATION", planDetails.RunningMigration, planDetails)
 	if planDetails.RunningMigration == nil {
-		buildMigrationSection(b, "LATEST MIGRATION", planDetails.LatestMigration, planDetails, useUTC)
+		buildMigrationSection(b, "LATEST MIGRATION", planDetails.LatestMigration, planDetails)
 	}
 
 	// Mapping details
@@ -168,16 +168,13 @@ func buildMappingsSection(b *describe.Builder, networkMapping, storageMapping, m
 	}
 }
 
-func buildMigrationSection(b *describe.Builder, title string, migration *unstructured.Unstructured, details status.PlanDetails, useUTC bool) {
+func buildMigrationSection(b *describe.Builder, title string, migration *unstructured.Unstructured, details status.PlanDetails) {
 	if migration == nil {
 		return
 	}
 
 	b.Section(title)
 	b.Field("Name", migration.GetName())
-	if cutover, found, _ := unstructured.NestedString(migration.Object, "spec", "cutover"); found && cutover != "" {
-		b.FieldC("Cutover", planutil.FormatTime(cutover, useUTC), output.Yellow)
-	}
 	b.Field("Total VMs", fmt.Sprintf("%d", details.VMStats.Total))
 	b.Field("Completed", fmt.Sprintf("%d", details.VMStats.Completed))
 	b.FieldC("Succeeded", fmt.Sprintf("%d", details.VMStats.Succeeded), output.Green)
@@ -280,8 +277,6 @@ func buildVMsSection(b *describe.Builder, plan *unstructured.Unstructured, migra
 
 	// Build a vmID -> status map from the migration's status.vms
 	vmStatusMap := buildVMStatusMap(migration)
-	// Build a vmID -> cutover map from the migration's spec.vmCutover
-	vmCutoverMap := buildVMCutoverMap(migration)
 
 	b.Section("VIRTUAL MACHINES")
 	b.Field("VM Count", fmt.Sprintf("%d", len(specVMs)))
@@ -311,9 +306,6 @@ func buildVMsSection(b *describe.Builder, plan *unstructured.Unstructured, migra
 		b.FieldC("ID", stringOrDefault(vmID, "-"), output.Cyan)
 		if targetName != "" {
 			b.FieldC("Target Name", targetName, output.Green)
-		}
-		if vmCutover, ok := vmCutoverMap[vmID]; ok {
-			b.FieldC("Cutover", planutil.FormatTime(vmCutover, useUTC), output.Yellow)
 		}
 
 		// Migration status for this VM
@@ -398,33 +390,6 @@ func buildVMStatusMap(migration *unstructured.Unstructured) map[string]map[strin
 		id, _, _ := unstructured.NestedString(vm, "id")
 		if id != "" {
 			result[id] = vm
-		}
-	}
-	return result
-}
-
-// buildVMCutoverMap extracts the per-VM cutover entries from a migration's
-// spec.vmCutover and returns them as a map keyed by VM ID for quick lookup.
-func buildVMCutoverMap(migration *unstructured.Unstructured) map[string]string {
-	result := make(map[string]string)
-	if migration == nil {
-		return result
-	}
-
-	entries, exists, _ := unstructured.NestedSlice(migration.Object, "spec", "vmCutover")
-	if !exists {
-		return result
-	}
-
-	for _, e := range entries {
-		entry, ok := e.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		id, _, _ := unstructured.NestedString(entry, "id")
-		cutover, _, _ := unstructured.NestedString(entry, "cutover")
-		if id != "" && cutover != "" {
-			result[id] = cutover
 		}
 	}
 	return result

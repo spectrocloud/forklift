@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Tue, 8 Sep 2026 16:53:42 -0700
+Subject: [PATCH 09/10] spectro: update guard test for v2.12.7
+ ShouldUseV2vForTransfer signature
+
+Upstream dropped the destinationClient parameter; the NetApp-shift check
+moved into Plan.HasNetAppShiftDestination(). The guard test caught it.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit e37ce2d36a7e09afb6b883f0f12e74c666c2d4c6)
+---
+ pkg/apis/forklift/v1beta1/spectro_fork_test.go | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/pkg/apis/forklift/v1beta1/spectro_fork_test.go b/pkg/apis/forklift/v1beta1/spectro_fork_test.go
+index 35fd27927..7493d9d2e 100644
+--- a/pkg/apis/forklift/v1beta1/spectro_fork_test.go
++++ b/pkg/apis/forklift/v1beta1/spectro_fork_test.go
+@@ -49,7 +49,7 @@ func TestSpectroShouldUseV2vForTransfer(t *testing.T) {
+ 	}
+ 
+ 	t.Run("vsphere never uses virt-v2v for transfer", func(t *testing.T) {
+-		got, err := newPlan(VSphere).ShouldUseV2vForTransfer(ref.Ref{}, nil)
++		got, err := newPlan(VSphere).ShouldUseV2vForTransfer(ref.Ref{})
+ 		if err != nil {
+ 			t.Fatalf("unexpected error: %v", err)
+ 		}
+@@ -59,7 +59,7 @@ func TestSpectroShouldUseV2vForTransfer(t *testing.T) {
+ 	})
+ 
+ 	t.Run("ova keeps upstream behaviour", func(t *testing.T) {
+-		got, err := newPlan(Ova).ShouldUseV2vForTransfer(ref.Ref{}, nil)
++		got, err := newPlan(Ova).ShouldUseV2vForTransfer(ref.Ref{})
+ 		if err != nil {
+ 			t.Fatalf("unexpected error: %v", err)
+ 		}

@@ -24,10 +24,9 @@ type ProviderOptions struct {
 	ProjectName string
 	RegionName  string
 	// HyperV specific options
-	SMBUrl         string
-	SMBUser        string
-	SMBPassword    string
-	HyperVMgmtType string
+	SMBUrl      string
+	SMBUser     string
+	SMBPassword string
 	// EC2 specific options
 	EC2Region             string
 	EC2TargetRegion       string

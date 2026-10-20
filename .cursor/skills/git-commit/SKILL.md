@@ -16,7 +16,7 @@ Run `git branch --show-current`. If on `main`, **warn the user** and ask if they
 ## Step 2: Gather Info
 
 Use AskQuestion to ask:
-1. **Jira issue ID** (e.g. `MTV-1234`) — if "None", ask for **commit type**: `chore` or `fix`, then ask for **scope** (deps, docs, ci, test, refactor, lint, build, validation, deployment, etc.)
+1. **Jira issue ID** (e.g. `MTV-1234`) — if "None", ask for **chore type** (deps, docs, ci, test, refactor, lint, build)
 2. **Add AI co-author line?** (Yes / No)
 
 ## Step 3: Analyze Changes
@@ -25,21 +25,8 @@ Run `git diff HEAD` and `git status` to see all changes since the last commit (s
 
 ## Step 4: Generate Commit Message
 
-### Title Format (PR title validation enforced by CI)
+Format:
 
-The title (~72 chars max, imperative mood) must match one of these patterns:
-
-- **With Jira:** `MTV-XXXX | description`
-- **Without Jira (chore):** `chore(scope): description`
-- **Without Jira (fix):** `fix(scope): description`
-
-> **Important:** The `chore` and `fix` formats **require parentheses with a scope**.
-> `fix: description` is **invalid** — use `fix(scope): description` instead.
-> The scope should be a short word describing the area (e.g., deps, docs, ci, deployment, validation).
-
-### Full Message Format
-
-**With Jira:**
 ```
 MTV-XXXX | <imperative description, ~72 chars total>
 
@@ -49,42 +36,17 @@ Ref: https://redhat.atlassian.net/browse/MTV-XXXX
 Resolves: MTV-XXXX
 ```
 
-**Without Jira (fix or chore):**
-```
-fix(scope): <imperative description, ~72 chars total>
+Title (~72 chars max, imperative mood):
+- **With Jira:** `MTV-XXXX | description`
+- **Without Jira:** `chore(type): description` (skips CI — no `Ref:`/`Resolves:` needed)
 
-<body: what changed and why, lines wrapped at 72 chars>
-
-Resolves: none
-```
-
-### Trailers
-
-- **With Jira:** `Ref: https://redhat.atlassian.net/browse/MTV-XXXX` and `Resolves: MTV-XXXX`
-- **Without Jira:** `Resolves: none` (required by CI for non-chore commits)
-- **Chore commits:** No `Resolves:` line needed (CI skips validation for chore commits)
+Trailers (with Jira only):
+- `Ref: https://redhat.atlassian.net/browse/MTV-XXXX`
+- `Resolves: MTV-XXXX` (required by CI)
 
 If co-author requested, append: `Co-authored-by: AI Assistant <noreply@cursor.com>`
 
-## Step 5: Branch Naming Convention
-
-If the user requests a new branch name, follow this convention:
-
-- **With Jira:** `mtv-XXXX-short-description` (lowercase ticket, kebab-case summary)
-- **Without Jira:** `fix-short-description` or `chore-short-description`
-
-Rules:
-- All lowercase
-- Use hyphens to separate words (kebab-case)
-- Keep it short (3–5 words max after the prefix)
-- Use the lowercase Jira ticket as prefix when available
-
-Examples:
-- `mtv-6189-fix-warm-cutover-naming`
-- `fix-protect-system-namespaces`
-- `chore-update-dependencies`
-
-## Step 6: Present Message and Command
+## Step 5: Present Message and Command
 
 Present the full commit message in a code block, followed by a ready-to-run `git` command the user can copy-paste:
 

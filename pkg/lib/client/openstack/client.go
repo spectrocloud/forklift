@@ -206,9 +206,6 @@ func (c *Client) getTLSConfig() (tlsConfig *tls.Config, err error) {
 
 // Connect
 func (c *Client) Connect() (err error) {
-	if c.Log == nil {
-		c.Log = logging.WithName("openstack")
-	}
 	err = c.Authenticate()
 	if err != nil {
 		return

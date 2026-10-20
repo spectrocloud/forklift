@@ -1,9 +1,5 @@
 package parser
 
-import "sync"
-
-var parseMutex sync.Mutex
-
 // tslLexer adapts our Lexer to the goyacc interface
 type tslLexer struct {
 	lexer *Lexer
@@ -14,8 +10,6 @@ type tslLexer struct {
 func (l *tslLexer) Lex(lval *yySymType) int {
 	token := l.lexer.NextToken()
 	l.pos = token.Position
-
-	lval.pos = token.Position
 
 	// Set the semantic value for string tokens
 	switch token.Type {
@@ -36,12 +30,8 @@ func (l *tslLexer) Error(s string) {
 	}
 }
 
-// Parse parses a TSL expression and returns the AST.
-// It is safe for concurrent use.
+// Parse parses a TSL expression and returns the AST
 func Parse(input string) (*Node, error) {
-	parseMutex.Lock()
-	defer parseMutex.Unlock()
-
 	// Reset global state
 	parseResult = nil
 	parseError = nil

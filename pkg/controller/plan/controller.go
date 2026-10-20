@@ -488,7 +488,6 @@ func (r *Reconciler) execute(plan *api.Plan) (reQ time.Duration, err error) {
 	if migration == nil {
 		r.Log.Info("No pending migrations found.")
 		plan.Status.DeleteCondition(Executing)
-		r.checkConversionResumable(plan)
 		return
 	}
 
@@ -518,10 +517,6 @@ func (r *Reconciler) execute(plan *api.Plan) (reQ time.Duration, err error) {
 				t)
 		}
 	}
-
-	// Check if the failed plan is resumable
-	r.checkConversionResumable(plan)
-
 	if len(pending) > 1 && reQ == 0 {
 		r.Log.V(1).Info(
 			"Found pending migrations.",

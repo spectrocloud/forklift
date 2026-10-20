@@ -73,6 +73,7 @@ const (
 	DuplicateVM                     = "DuplicateVM"
 	SharedDisks                     = "SharedDisks"
 	SharedWarnDisks                 = "SharedWarnDisks"
+	ExcludeWarnDisks                = "ExcludeWarnDisks"
 	NameNotValid                    = "TargetNameNotValid"
 	HookNotValid                    = "HookNotValid"
 	HookNotReady                    = "HookNotReady"
@@ -109,6 +110,7 @@ const (
 	VMCriticalConcerns              = "VMCriticalConcerns"
 	RDMDiskWarning                  = "RDMDiskWarning"
 	IndependentDiskWarning          = "IndependentDiskWarning"
+	ExcludeDisks                    = "ExcludeDisks"
 	// NetAppShift (Advisory) reports whether the plan's storage map uses a NetApp Shift/Trident class.
 	NetAppShift = "NetAppShift"
 	// NetAppShiftWarmNotSupported (Critical) blocks warm migration when the storage map uses NetApp Shift.
@@ -116,7 +118,6 @@ const (
 	// NetAppShiftDatastoreNASMissing (Critical) blocks when a disk maps to NetApp Shift but the source
 	// datastore lacks NAS export details in inventory (required for MTV annotations).
 	NetAppShiftDatastoreNASMissing = "NetAppShiftDatastoreNASMissing"
-	ConversionResumable            = "ConversionResumable"
 )
 
 // Categories
@@ -593,7 +594,7 @@ func (r *Reconciler) validateNetworkMap(plan *api.Plan) (err error) {
 	}
 	// Check if we are preserving static IPs and give warning if we are mapping to Pod Network.
 	// The Pod network has different subnet than the source provider so the VMs might not be accessible.
-	if plan.Provider.Source != nil && plan.Provider.Source.SupportsPreserveStaticIps() && plan.Spec.PreserveStaticIPs {
+	if plan.Referenced.Provider.Source.SupportsPreserveStaticIps() && plan.Spec.PreserveStaticIPs {
 		var hasMappingToPodNetwork bool
 		for _, networkMap := range mp.Spec.Map {
 			if networkMap.Destination.Type == Pod {
@@ -989,6 +990,7 @@ func (r *Reconciler) validateVM(plan *api.Plan, ctx *plancontext.Context) error 
 		Items:    []string{},
 	}
 	var sharedDisksConditions []libcnd.Condition
+	var excludeDisksConditions []libcnd.Condition
 	setOf := map[string]bool{}
 	setOfTargetName := map[string]bool{}
 
@@ -1267,6 +1269,30 @@ func (r *Reconciler) validateVM(plan *api.Plan, ctx *plancontext.Context) error 
 			sharedDisks.Type = fmt.Sprintf("%s-%s", sharedDisks.Type, ref.ID)
 			sharedDisksConditions = append(sharedDisksConditions, sharedDisks)
 		}
+
+		exOk, exMsg, exCategory, exErr := validator.ExcludedDisks(*ref)
+		if exErr != nil {
+			return exErr
+		}
+		if !exOk {
+			excludeDisks := libcnd.Condition{
+				Type:     ExcludeDisks,
+				Status:   True,
+				Category: exCategory,
+				Message:  "VM excludeDisks configuration is invalid.",
+				Items:    []string{ref.String()},
+			}
+			if exMsg != "" {
+				excludeDisks.Message = exMsg
+			}
+			if exCategory == validation.Warn {
+				excludeDisks.Type = ExcludeWarnDisks
+			} else {
+				excludeDisks.Type = ExcludeDisks
+			}
+			excludeDisks.Type = fmt.Sprintf("%s-%s", excludeDisks.Type, ref.ID)
+			excludeDisksConditions = append(excludeDisksConditions, excludeDisks)
+		}
 		if settings.Settings.StaticUdnIpAddresses && plan.Spec.PreserveStaticIPs && plan.DestinationHasUdnNetwork(r.Client) {
 			ok, err = validator.UdnStaticIPs(*ref, ctx.Destination.Client)
 			if err != nil {
@@ -1338,9 +1364,15 @@ func (r *Reconciler) validateVM(plan *api.Plan, ctx *plancontext.Context) error 
 				consolidationNeeded.Items = append(consolidationNeeded.Items, ref.String())
 			}
 		}
-		// validate pvc name template (VM → Plan → controller global → hardcoded)
-		pvcNameTemplate := planbase.GetPVCNameTemplate(plan, vm.ID)
-		if pvcNameTemplate != "" {
+		// is valid vm pvc name template
+		if plan.Spec.PVCNameTemplate != "" || vm.PVCNameTemplate != "" {
+			// if vm level pvc name template is set, use it, otherwise use plan level pvc name template
+			pvcNameTemplate := plan.Spec.PVCNameTemplate
+			if vm.PVCNameTemplate != "" {
+				pvcNameTemplate = vm.PVCNameTemplate
+			}
+
+			// validate pvc name template for the vm
 			if _, err := validator.PVCNameTemplate(vm.Ref, pvcNameTemplate); err != nil {
 				r.Log.Info("PVC name template is invalid", "error", err.Error(), "template", pvcNameTemplate, "plan", plan.Name, "namespace", plan.Namespace)
 
@@ -1348,13 +1380,13 @@ func (r *Reconciler) validateVM(plan *api.Plan, ctx *plancontext.Context) error 
 				pvcNameInvalid.Items = append(pvcNameInvalid.Items, conditionItem)
 			}
 		}
-		// validate volume name template
+		// is valid vm pvc name template
 		if vm.VolumeNameTemplate != "" {
 			if err := r.IsValidVolumeNameTemplate(vm.VolumeNameTemplate); err != nil {
 				volumeNameInvalid.Items = append(volumeNameInvalid.Items, ref.String())
 			}
 		}
-		// validate network name template
+		// is valid vm pvc name template
 		if vm.NetworkNameTemplate != "" {
 			if err := r.IsValidNetworkNameTemplate(vm.NetworkNameTemplate); err != nil {
 				networkNameInvalid.Items = append(networkNameInvalid.Items, ref.String())
@@ -1396,6 +1428,9 @@ func (r *Reconciler) validateVM(plan *api.Plan, ctx *plancontext.Context) error 
 	}
 	if len(sharedDisksConditions) > 0 {
 		plan.Status.SetCondition(sharedDisksConditions...)
+	}
+	if len(excludeDisksConditions) > 0 {
+		plan.Status.SetCondition(excludeDisksConditions...)
 	}
 	if len(missingCbtForWarm.Items) > 0 {
 		plan.Status.SetCondition(missingCbtForWarm)
@@ -1821,7 +1856,7 @@ func (r *Reconciler) validateVddkImage(plan *api.Plan) (err error) {
 			Status:   True,
 			Reason:   NotSet,
 			Category: api.CategoryCritical,
-			Message:  "VDDK image is required for warm migration. Set it on the source provider or configure a global VDDK image.",
+			Message:  "VDDK image not set on the provider, this is required for the warm migration",
 		})
 	}
 	if plan.Spec.SkipGuestConversion && vddkImage == "" && !plan.IsUsingOffloadPlugin() {
@@ -1830,7 +1865,7 @@ func (r *Reconciler) validateVddkImage(plan *api.Plan) (err error) {
 			Status:   True,
 			Reason:   NotSet,
 			Category: api.CategoryCritical,
-			Message:  "VDDK image is required for raw copy mode migration. Set it on the source provider or configure a global VDDK image.",
+			Message:  "VDDK image not set on the provider, this is required for the raw copy mode migration",
 		})
 	}
 
@@ -2145,7 +2180,10 @@ func createVddkCheckJob(plan *api.Plan) *batchv1.Job {
 								},
 							},
 							VolumeMounts: []core.VolumeMount{mount},
-							Command:      []string{"file", "-E", "/opt/vmware-vix-disklib-distrib/lib64/libvixDiskLib.so"},
+							Command: []string{"/bin/sh", "-c",
+								"file -E /opt/vmware-vix-disklib-distrib/lib64/libvixDiskLib.so" +
+									" || file -E /opt/nbdkit-nfc-plugin.so" +
+									" || file -E /usr/lib64/nbdkit/plugins/nbdkit-nfc-plugin.so"},
 						},
 					},
 					Volumes: volumes,
@@ -2520,41 +2558,4 @@ func (r *Reconciler) vmUsesVddk(storageMap *api.StorageMap, vsphereVM *vsphere.V
 	}
 
 	return false, nil
-}
-
-// checkConversionResumable sets the ConversionResumable condition on plans
-// whose migration failed after disk copy completed (DisksCopied=true).
-// Works for any provider where copy and conversion are separate phases.
-func (r *Reconciler) checkConversionResumable(plan *api.Plan) {
-	plan.Status.DeleteCondition(ConversionResumable)
-
-	if !plan.Status.HasCondition(Failed) {
-		return
-	}
-
-	resumableVMs := []string{}
-	for _, vm := range plan.Status.Migration.VMs {
-		if !vm.DisksCopied {
-			continue
-		}
-		if !vm.HasCondition(api.ConditionFailed) {
-			continue
-		}
-		resumableVMs = append(resumableVMs, vm.Name)
-	}
-
-	if len(resumableVMs) == 0 {
-		return
-	}
-
-	plan.Status.SetCondition(libcnd.Condition{
-		Type:     ConversionResumable,
-		Status:   True,
-		Durable:  true,
-		Category: api.CategoryAdvisory,
-		Message: fmt.Sprintf(
-			"%d VM(s) have migrated disks available for conversion resume: %s",
-			len(resumableVMs),
-			strings.Join(resumableVMs, ", ")),
-	})
 }

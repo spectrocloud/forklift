@@ -17,6 +17,9 @@ import (
 const (
 	qemuUser  = int64(107)
 	qemuGroup = int64(107)
+
+	nbdkitNfcPluginSubPath   = "nbdkit-nfc-plugin.so"
+	nbdkitNfcPluginMountPath = "/usr/lib64/nbdkit/plugins/nbdkit-nfc-plugin.so"
 )
 
 // Builder constructs virt-v2v pod specs from a fully-resolved PodConfig.
@@ -131,6 +134,13 @@ func (b *Builder) GetVirtV2vPodSpec(vm *plan.VMStatus, volumes []core.Volume, vo
 				Capabilities:             &core.Capabilities{Drop: []core.Capability{"ALL"}},
 			},
 		})
+		// Sidecar images such as go-nfc copy /opt/nbdkit-nfc-plugin.so; overlay that file
+		// on the nbdkit plugin path without replacing the image's built-in plugin directory.
+		volumeMounts = append(volumeMounts, core.VolumeMount{
+			Name:      convctx.VddkVolumeName,
+			MountPath: nbdkitNfcPluginMountPath,
+			SubPath:   nbdkitNfcPluginSubPath,
+		})
 	}
 
 	annotations := map[string]string{}
@@ -230,7 +240,68 @@ func (b *Builder) BuildVirtV2vConversionPod(pod *core.Pod, environment []core.En
 	pod.Labels[convctx.LabelApp] = "virt-v2v"
 	pod.Spec.Containers[0].Name = "virt-v2v"
 	pod.Spec.Containers[0].Env = environment
+	applySpectroConversionPodRelaxations(pod)
 	return nil
+}
+
+// applySpectroConversionPodRelaxations loosens the conversion pod's confinement
+// so libguestfs can run outside OpenShift, where there is no SCC granting the
+// equivalent access. On OpenShift the upstream settings are left untouched.
+//
+// libguestfs needs to create user namespaces and remount the guest root; with
+// RuntimeDefault seccomp and an AppArmor profile applied it fails to start the
+// appliance. LIBGUESTFS_BACKEND=direct avoids libvirt, but some operations
+// still require CAP_SYS_ADMIN. Since libguestfs 1.52 the appliance's network is
+// provided by passt, which must also build a user+network namespace sandbox and
+// then drop to an unprivileged user, so the container has to be root with
+// CAP_SETUID/CAP_SETGID as well.
+func applySpectroConversionPodRelaxations(pod *core.Pod) {
+	container := &pod.Spec.Containers[0]
+
+	container.Env = append(container.Env, core.EnvVar{
+		Name:  "LIBGUESTFS_BACKEND",
+		Value: "direct",
+	})
+
+	if settings.Settings.OpenShift {
+		return
+	}
+
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations["container.apparmor.security.beta.kubernetes.io/"+container.Name] = "unconfined"
+
+	if pod.Spec.SecurityContext != nil {
+		pod.Spec.SecurityContext.SeccompProfile = &core.SeccompProfile{
+			Type: core.SeccompProfileTypeUnconfined,
+		}
+	}
+
+	if container.SecurityContext == nil {
+		container.SecurityContext = &core.SecurityContext{}
+	}
+	if container.SecurityContext.Capabilities == nil {
+		container.SecurityContext.Capabilities = &core.Capabilities{}
+	}
+	container.SecurityContext.Capabilities.Add = append(
+		container.SecurityContext.Capabilities.Add,
+		core.Capability("SYS_ADMIN"),
+		core.Capability("SETUID"),
+		core.Capability("SETGID"))
+
+	// A non-root container receives capabilities.add in its bounding set only:
+	// CapEff stays empty and every addition is a no-op, so passt's sandbox setup
+	// fails with EPERM. Run the container as root, where the requested
+	// capabilities become effective and passt can create its namespaces and drop
+	// to nobody. RunAsNonRoot must be cleared together with RunAsUser, or the
+	// kubelet rejects the pod.
+	if pod.Spec.SecurityContext != nil {
+		zero := int64(0)
+		runAsNonRoot := false
+		pod.Spec.SecurityContext.RunAsUser = &zero
+		pod.Spec.SecurityContext.RunAsNonRoot = &runAsNonRoot
+	}
 }
 
 // BuildVirtV2vInspectionPod applies inspection-specific settings to a pod.
