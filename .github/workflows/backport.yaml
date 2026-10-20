@@ -1,0 +1,81 @@
+name: Backport
+
+on:
+  # zizmor: ignore[dangerous-triggers]
+  # pull_request_target is required, not incidental: the backport must push
+  # branches and open PRs on the base repo, which a `pull_request` run from a
+  # fork cannot do. The reason the trigger is dangerous - running untrusted PR
+  # code with base-repo secrets - does not apply here, because this workflow
+  # never checks the PR out. It has no actions/checkout step at all; it only
+  # hands the PR number to a SHA-pinned action. Permissions are pinned to the
+  # minimum that cherry-picking needs, below.
+  pull_request_target:
+    types: ["labeled", "closed"]
+
+permissions:
+  contents: read
+
+
+# Serialize per-PR so rapid-fire label additions (e.g. backport-to-rc-4.9 +
+# backport-to-rc-4.7 within seconds) don't spawn parallel runs that each scan
+# every backport-to-* label and open duplicate PRs against the same target.
+# cancel-in-progress=false because we want every triggering event to fully
+# process, not get killed mid-cherry-pick by the next label add.
+concurrency:
+  group: backport-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  backport:
+    name: Backport PR
+    runs-on: ubuntu-latest
+    # contents: write to push the cherry-pick branches, pull-requests: write to
+    # open the backport PRs and copy reviewers across, workflows: write because
+    # a backported PR may itself modify .github/workflows files — GITHUB_TOKEN
+    # never gets the workflows scope implicitly, and without it the push is
+    # rejected ("refusing to allow a GitHub App to create or update workflow").
+    permissions:
+      contents: write
+      pull-requests: write
+    if: |
+      github.event.pull_request.merged == true
+      && contains(github.event.pull_request.labels.*.name, 'auto-backport')
+      && (
+        (github.event.action == 'labeled' && github.event.label.name == 'auto-backport')
+        || (github.event.action == 'closed')
+      )
+    steps:
+      # The workflow fires within seconds of merge, but GitHub's API can lag in
+      # associating the merge commit with its PR and labels. When that lookup
+      # races the merge, the backport resolves zero target branches. A brief
+      # settle wait lets the index catch up so target branches resolve on the
+      # first run instead of needing a manual re-run.
+      - name: Wait for merge metadata to settle
+        run: sleep 8
+
+      - name: Backport Action
+        # Pinned to the v12.0.0 commit SHA per GitHub Actions hardening guidance —
+        # tags are mutable, SHAs are not. Bump in lockstep with the comment when
+        # upgrading. See https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-third-party-actions
+        uses: sorenlouv/backport-github-action@85813678d776774a19ec5af56bd3a04305946f8a # v12.0.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          auto_backport_label_prefix: backport-to-
+          copy_source_pr_reviewers: 'true'
+          # This job only runs on PRs already labelled `auto-backport` (see the
+          # job `if:`), so a labelled PR resolving to zero target branches is not
+          # the benign "nothing to backport" case — it's the post-merge API race
+          # the settle wait above guards against. Drop no-branches-exception from
+          # the ignore list so that race fails the job loudly (and re-runnably)
+          # rather than passing green while creating nothing. Merge conflicts
+          # stay ignored: they surface as a conflict PR + status comment, which
+          # is the intended outcome, not a CI failure.
+          ignore_error_codes: merge-conflict-exception
+
+      - name: Info log
+        if: ${{ success() }}
+        run: cat ~/.backport/backport.info.log
+
+      - name: Debug log
+        if: ${{ failure() }}
+        run: cat ~/.backport/backport.debug.log
