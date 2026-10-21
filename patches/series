@@ -14,3 +14,4 @@
 0010-spectro-adapt-v2.12.9-ShouldUseV2vForTransfer-exclud.patch
 0011-spectro-keep-passt-as-root-in-the-virt-v2v-images.patch
 0012-spectro-fix-deep-inspection-image-targets-and-bundle.patch
+0013-spectro-build-with-Go-1.26.10.patch
