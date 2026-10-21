@@ -1,0 +1,390 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <sharada.phadnis@spectrocloud.com>
+Date: Wed, 21 Oct 2026 10:54:07 -0700
+Subject: [PATCH] spectro: build with Go 1.26.10
+
+Pin every ubi9/ubi10 go-toolset builder to 1.26.10 (ubi9
+1.26.10-1792592174, ubi10 1.26.10-1792583413). The CentOS Stream 9
+virt-v2v builders keep their stage, since cgo needs libvirt-devel, but copy
+in the same pinned Red Hat toolchain because CentOS's golang trails RHEL's
+(1.26.7 at the time). ovirt-populator stays on ubi8 go-toolset 1.25.9:
+there is no ubi8 1.26.10 build.
+---
+ build/deep-inspection-rhel9/Containerfile                   | 2 +-
+ build/deep-inspection-rhel9/Containerfile-downstream        | 2 +-
+ build/deep-inspection/Containerfile                         | 2 +-
+ build/deep-inspection/Containerfile-downstream              | 2 +-
+ build/forklift-api/Containerfile                            | 2 +-
+ build/forklift-api/Containerfile-downstream                 | 2 +-
+ build/forklift-cli-download/Containerfile                   | 2 +-
+ build/forklift-cli-download/Containerfile-downstream        | 2 +-
+ build/forklift-controller/Containerfile                     | 2 +-
+ build/forklift-controller/Containerfile-downstream          | 2 +-
+ build/hyperv-provider-server/Containerfile                  | 2 +-
+ build/hyperv-provider-server/Containerfile-downstream       | 2 +-
+ build/openstack-populator/Containerfile                     | 2 +-
+ build/openstack-populator/Containerfile-downstream          | 2 +-
+ build/ova-provider-server/Containerfile                     | 2 +-
+ build/ova-provider-server/Containerfile-downstream          | 2 +-
+ build/ova-proxy/Containerfile                               | 2 +-
+ build/ova-proxy/Containerfile-downstream                    | 2 +-
+ build/populator-controller/Containerfile                    | 2 +-
+ build/populator-controller/Containerfile-downstream         | 2 +-
+ build/validation/Containerfile-downstream                   | 2 +-
+ build/virt-v2v-rhel9/Containerfile                          | 2 +-
+ build/virt-v2v-rhel9/Containerfile-downstream               | 2 +-
+ build/virt-v2v/Containerfile                                | 2 +-
+ build/virt-v2v/Containerfile-downstream                     | 2 +-
+ build/virt-v2v/Containerfile-downstream-fssupport           | 2 +-
+ build/virt-v2v/Containerfile-upstream                       | 6 +++++-
+ build/virt-v2v/Containerfile-upstream-fedora                | 6 +++++-
+ build/virt-v2v/Containerfile-upstream-xfs                   | 6 +++++-
+ build/vsphere-copy-offload-populator/Containerfile          | 2 +-
+ .../vsphere-copy-offload-populator/Containerfile-downstream | 2 +-
+ 31 files changed, 43 insertions(+), 31 deletions(-)
+
+diff --git a/build/deep-inspection-rhel9/Containerfile b/build/deep-inspection-rhel9/Containerfile
+index b00af423b..cec21caf3 100644
+--- a/build/deep-inspection-rhel9/Containerfile
++++ b/build/deep-inspection-rhel9/Containerfile
+@@ -1,4 +1,4 @@
+-FROM registry.access.redhat.com/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/deep-inspection-rhel9/Containerfile-downstream b/build/deep-inspection-rhel9/Containerfile-downstream
+index 9c672ebc7..b3c860f1e 100644
+--- a/build/deep-inspection-rhel9/Containerfile-downstream
++++ b/build/deep-inspection-rhel9/Containerfile-downstream
+@@ -1,4 +1,4 @@
+-FROM registry.redhat.io/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.redhat.io/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/deep-inspection/Containerfile b/build/deep-inspection/Containerfile
+index c8e41462c..f381be7cd 100644
+--- a/build/deep-inspection/Containerfile
++++ b/build/deep-inspection/Containerfile
+@@ -1,4 +1,4 @@
+-FROM registry.access.redhat.com/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/deep-inspection/Containerfile-downstream b/build/deep-inspection/Containerfile-downstream
+index 887035047..18495152a 100644
+--- a/build/deep-inspection/Containerfile-downstream
++++ b/build/deep-inspection/Containerfile-downstream
+@@ -1,4 +1,4 @@
+-FROM registry.redhat.io/ubi10/go-toolset:1.25.9-1778589469 AS builder
++FROM registry.redhat.io/ubi10/go-toolset:1.26.10-1792583413 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/forklift-api/Containerfile b/build/forklift-api/Containerfile
+index d7d6f9067..79e5db0a5 100644
+--- a/build/forklift-api/Containerfile
++++ b/build/forklift-api/Containerfile
+@@ -1,4 +1,4 @@
+-FROM registry.access.redhat.com/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/forklift-api/Containerfile-downstream b/build/forklift-api/Containerfile-downstream
+index 3672c6672..cf43bd07d 100644
+--- a/build/forklift-api/Containerfile-downstream
++++ b/build/forklift-api/Containerfile-downstream
+@@ -1,4 +1,4 @@
+-FROM registry.redhat.io/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.redhat.io/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/forklift-cli-download/Containerfile b/build/forklift-cli-download/Containerfile
+index ad44c644d..fbc9ab294 100644
+--- a/build/forklift-cli-download/Containerfile
++++ b/build/forklift-cli-download/Containerfile
+@@ -1,5 +1,5 @@
+ # Build stage
+-FROM registry.access.redhat.com/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ 
+ USER 0
+ WORKDIR /app
+diff --git a/build/forklift-cli-download/Containerfile-downstream b/build/forklift-cli-download/Containerfile-downstream
+index b9ac596a7..ee853e61c 100644
+--- a/build/forklift-cli-download/Containerfile-downstream
++++ b/build/forklift-cli-download/Containerfile-downstream
+@@ -1,5 +1,5 @@
+ # Build stage
+-FROM registry.redhat.io/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.redhat.io/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ 
+ USER 0
+ WORKDIR /app
+diff --git a/build/forklift-controller/Containerfile b/build/forklift-controller/Containerfile
+index d6f93b324..32fd8564c 100644
+--- a/build/forklift-controller/Containerfile
++++ b/build/forklift-controller/Containerfile
+@@ -1,4 +1,4 @@
+-FROM registry.access.redhat.com/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/forklift-controller/Containerfile-downstream b/build/forklift-controller/Containerfile-downstream
+index 367e7fa45..cc55a64b3 100644
+--- a/build/forklift-controller/Containerfile-downstream
++++ b/build/forklift-controller/Containerfile-downstream
+@@ -1,4 +1,4 @@
+-FROM registry.redhat.io/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.redhat.io/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ 
+ USER 0
+ WORKDIR /app
+diff --git a/build/hyperv-provider-server/Containerfile b/build/hyperv-provider-server/Containerfile
+index d20c3d8c1..4d107a83c 100644
+--- a/build/hyperv-provider-server/Containerfile
++++ b/build/hyperv-provider-server/Containerfile
+@@ -1,4 +1,4 @@
+-FROM registry.access.redhat.com/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/hyperv-provider-server/Containerfile-downstream b/build/hyperv-provider-server/Containerfile-downstream
+index d00dd2e37..9a1c65a26 100644
+--- a/build/hyperv-provider-server/Containerfile-downstream
++++ b/build/hyperv-provider-server/Containerfile-downstream
+@@ -1,4 +1,4 @@
+-FROM registry.redhat.io/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.redhat.io/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/openstack-populator/Containerfile b/build/openstack-populator/Containerfile
+index 846fb5a3e..ebc0f5eef 100644
+--- a/build/openstack-populator/Containerfile
++++ b/build/openstack-populator/Containerfile
+@@ -1,4 +1,4 @@
+-FROM registry.access.redhat.com/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/openstack-populator/Containerfile-downstream b/build/openstack-populator/Containerfile-downstream
+index 6026b84b1..977f51137 100644
+--- a/build/openstack-populator/Containerfile-downstream
++++ b/build/openstack-populator/Containerfile-downstream
+@@ -1,4 +1,4 @@
+-FROM registry.redhat.io/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.redhat.io/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/ova-provider-server/Containerfile b/build/ova-provider-server/Containerfile
+index 10bde7e6a..d093a5a3c 100644
+--- a/build/ova-provider-server/Containerfile
++++ b/build/ova-provider-server/Containerfile
+@@ -1,4 +1,4 @@
+-FROM registry.access.redhat.com/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/ova-provider-server/Containerfile-downstream b/build/ova-provider-server/Containerfile-downstream
+index e55f6b6c8..c1d1f76cd 100644
+--- a/build/ova-provider-server/Containerfile-downstream
++++ b/build/ova-provider-server/Containerfile-downstream
+@@ -1,4 +1,4 @@
+-FROM registry.redhat.io/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.redhat.io/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/ova-proxy/Containerfile b/build/ova-proxy/Containerfile
+index d465de80f..cbf237892 100644
+--- a/build/ova-proxy/Containerfile
++++ b/build/ova-proxy/Containerfile
+@@ -1,4 +1,4 @@
+-FROM registry.access.redhat.com/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/ova-proxy/Containerfile-downstream b/build/ova-proxy/Containerfile-downstream
+index e58183179..04d581c96 100644
+--- a/build/ova-proxy/Containerfile-downstream
++++ b/build/ova-proxy/Containerfile-downstream
+@@ -1,4 +1,4 @@
+-FROM registry.redhat.io/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.redhat.io/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/populator-controller/Containerfile b/build/populator-controller/Containerfile
+index 57956c3b5..8e0f58b28 100644
+--- a/build/populator-controller/Containerfile
++++ b/build/populator-controller/Containerfile
+@@ -1,4 +1,4 @@
+-FROM registry.access.redhat.com/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/populator-controller/Containerfile-downstream b/build/populator-controller/Containerfile-downstream
+index e3e8a5b50..88fa70050 100644
+--- a/build/populator-controller/Containerfile-downstream
++++ b/build/populator-controller/Containerfile-downstream
+@@ -1,4 +1,4 @@
+-FROM registry.redhat.io/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.redhat.io/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/validation/Containerfile-downstream b/build/validation/Containerfile-downstream
+index 9facc5b61..cf4778e8b 100644
+--- a/build/validation/Containerfile-downstream
++++ b/build/validation/Containerfile-downstream
+@@ -1,4 +1,4 @@
+-FROM registry.redhat.io/ubi9/go-toolset:1.25.9-1778604137 AS mtv-opa
++FROM registry.redhat.io/ubi9/go-toolset:1.26.10-1792592174 AS mtv-opa
+ USER 0
+ WORKDIR /app/opa
+ ENV GOFLAGS="-tags=strictfipsruntime"
+diff --git a/build/virt-v2v-rhel9/Containerfile b/build/virt-v2v-rhel9/Containerfile
+index e244fbc87..7a130bb70 100644
+--- a/build/virt-v2v-rhel9/Containerfile
++++ b/build/virt-v2v-rhel9/Containerfile
+@@ -18,7 +18,7 @@ RUN mkdir -p /usr/local/lib/guestfs/appliance && \
+     qemu-img convert -c -O qcow2 root root.qcow2 && \
+     mv -vf root.qcow2 root
+ 
+-FROM registry.access.redhat.com/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/virt-v2v-rhel9/Containerfile-downstream b/build/virt-v2v-rhel9/Containerfile-downstream
+index 3fbb83081..637228bc3 100644
+--- a/build/virt-v2v-rhel9/Containerfile-downstream
++++ b/build/virt-v2v-rhel9/Containerfile-downstream
+@@ -23,7 +23,7 @@ RUN mkdir -p /usr/local/lib/guestfs/appliance && \
+     qemu-img convert -c -O qcow2 root root.qcow2 && \
+     mv -vf root.qcow2 root
+ 
+-FROM registry.redhat.io/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.redhat.io/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ RUN dnf install -y libvirt-devel
+ WORKDIR /app
+diff --git a/build/virt-v2v/Containerfile b/build/virt-v2v/Containerfile
+index be75de666..409609004 100644
+--- a/build/virt-v2v/Containerfile
++++ b/build/virt-v2v/Containerfile
+@@ -18,7 +18,7 @@ RUN mkdir -p /usr/local/lib/guestfs/appliance && \
+     qemu-img convert -c -O qcow2 root root.qcow2 && \
+     mv -vf root.qcow2 root
+ 
+-FROM registry.access.redhat.com/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER 0
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/virt-v2v/Containerfile-downstream b/build/virt-v2v/Containerfile-downstream
+index f1a1cc5fe..797956e2f 100644
+--- a/build/virt-v2v/Containerfile-downstream
++++ b/build/virt-v2v/Containerfile-downstream
+@@ -23,7 +23,7 @@ RUN mkdir -p /usr/local/lib/guestfs/appliance && \
+     qemu-img convert -c -O qcow2 root root.qcow2 && \
+     mv -vf root.qcow2 root
+ 
+-FROM registry.redhat.io/ubi10/go-toolset:1.25.9-1778589469 AS builder
++FROM registry.redhat.io/ubi10/go-toolset:1.26.10-1792583413 AS builder
+ USER 0
+ RUN dnf install -y libvirt-devel
+ WORKDIR /app
+diff --git a/build/virt-v2v/Containerfile-downstream-fssupport b/build/virt-v2v/Containerfile-downstream-fssupport
+index 795048d64..8f9a604d2 100644
+--- a/build/virt-v2v/Containerfile-downstream-fssupport
++++ b/build/virt-v2v/Containerfile-downstream-fssupport
+@@ -1,4 +1,4 @@
+-FROM registry.redhat.io/ubi10/go-toolset:1.25.9-1778589469 AS builder
++FROM registry.redhat.io/ubi10/go-toolset:1.26.10-1792583413 AS builder
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+ ENV GOFLAGS="-mod=vendor -tags=strictfipsruntime"
+diff --git a/build/virt-v2v/Containerfile-upstream b/build/virt-v2v/Containerfile-upstream
+index 3c9d5a135..b18bde5ee 100644
+--- a/build/virt-v2v/Containerfile-upstream
++++ b/build/virt-v2v/Containerfile-upstream
+@@ -1,7 +1,11 @@
+ # Build virt-v2v binary
+ FROM quay.io/centos/centos:stream9 AS builder
+ USER 0
+-RUN --mount=type=cache,target=/var/cache/dnf dnf -y install --enablerepo=crb libvirt-devel golang
++RUN --mount=type=cache,target=/var/cache/dnf dnf -y install --enablerepo=crb libvirt-devel gcc pkgconf-pkg-config
++# CentOS Stream 9's golang trails RHEL's, so take the pinned Red Hat toolchain
++# (cgo against libvirt-devel above still needs this CentOS stage).
++COPY --from=registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 /usr/lib/golang /usr/lib/golang
++RUN ln -s /usr/lib/golang/bin/go /usr/bin/go && ln -s /usr/lib/golang/bin/gofmt /usr/bin/gofmt
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+ ENV GOFLAGS="-mod=vendor -tags=strictfipsruntime"
+diff --git a/build/virt-v2v/Containerfile-upstream-fedora b/build/virt-v2v/Containerfile-upstream-fedora
+index 39b12df75..bdeadda62 100644
+--- a/build/virt-v2v/Containerfile-upstream-fedora
++++ b/build/virt-v2v/Containerfile-upstream-fedora
+@@ -1,7 +1,11 @@
+ # Build virt-v2v binary
+ FROM quay.io/centos/centos:stream9 AS builder
+ USER 0
+-RUN --mount=type=cache,target=/var/cache/dnf dnf -y install --enablerepo=crb libvirt-devel golang
++RUN --mount=type=cache,target=/var/cache/dnf dnf -y install --enablerepo=crb libvirt-devel gcc pkgconf-pkg-config
++# CentOS Stream 9's golang trails RHEL's, so take the pinned Red Hat toolchain
++# (cgo against libvirt-devel above still needs this CentOS stage).
++COPY --from=registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 /usr/lib/golang /usr/lib/golang
++RUN ln -s /usr/lib/golang/bin/go /usr/bin/go && ln -s /usr/lib/golang/bin/gofmt /usr/bin/gofmt
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+ ENV GOFLAGS="-mod=vendor -tags=strictfipsruntime"
+diff --git a/build/virt-v2v/Containerfile-upstream-xfs b/build/virt-v2v/Containerfile-upstream-xfs
+index 35b48b146..9694fd222 100644
+--- a/build/virt-v2v/Containerfile-upstream-xfs
++++ b/build/virt-v2v/Containerfile-upstream-xfs
+@@ -1,7 +1,11 @@
+ # Build virt-v2v binary
+ FROM quay.io/centos/centos:stream9 AS builder
+ USER 0
+-RUN --mount=type=cache,target=/var/cache/dnf dnf -y install --enablerepo=crb libvirt-devel golang
++RUN --mount=type=cache,target=/var/cache/dnf dnf -y install --enablerepo=crb libvirt-devel gcc pkgconf-pkg-config
++# CentOS Stream 9's golang trails RHEL's, so take the pinned Red Hat toolchain
++# (cgo against libvirt-devel above still needs this CentOS stage).
++COPY --from=registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 /usr/lib/golang /usr/lib/golang
++RUN ln -s /usr/lib/golang/bin/go /usr/bin/go && ln -s /usr/lib/golang/bin/gofmt /usr/bin/gofmt
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+ ENV GOFLAGS="-mod=vendor -tags=strictfipsruntime"
+diff --git a/build/vsphere-copy-offload-populator/Containerfile b/build/vsphere-copy-offload-populator/Containerfile
+index 27e1a71c5..b5108b259 100644
+--- a/build/vsphere-copy-offload-populator/Containerfile
++++ b/build/vsphere-copy-offload-populator/Containerfile
+@@ -1,4 +1,4 @@
+-FROM registry.access.redhat.com/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ USER root
+ WORKDIR /usr/src/app
+ 
+diff --git a/build/vsphere-copy-offload-populator/Containerfile-downstream b/build/vsphere-copy-offload-populator/Containerfile-downstream
+index 67718600f..f61cd6e79 100644
+--- a/build/vsphere-copy-offload-populator/Containerfile-downstream
++++ b/build/vsphere-copy-offload-populator/Containerfile-downstream
+@@ -1,4 +1,4 @@
+-FROM registry.redhat.io/ubi9/go-toolset:1.25.9-1778604137 AS builder
++FROM registry.redhat.io/ubi9/go-toolset:1.26.10-1792592174 AS builder
+ COPY --chown=1001:0 . /src
+ WORKDIR /src/cmd/vsphere-copy-offload-populator
+ 
