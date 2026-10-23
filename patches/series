@@ -15,3 +15,4 @@
 0011-spectro-keep-passt-as-root-in-the-virt-v2v-images.patch
 0012-spectro-fix-deep-inspection-image-targets-and-bundle.patch
 0013-spectro-build-with-Go-1.26.10.patch
+0014-spectro-build-ovirt-populator-with-Go-1.26.10.patch
