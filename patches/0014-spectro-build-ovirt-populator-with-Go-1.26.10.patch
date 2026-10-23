@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 13:52:00 -0700
+Subject: [PATCH] spectro: build ovirt-populator with Go 1.26.10
+
+Red Hat now publishes ubi8 go-toolset 1.26.10 (1.26.10-1792672852,
+amd64/arm64/ppc64le/s390x), so ovirt-populator no longer has to stay on
+1.25.9 and builds with the same Go as every other forklift image. It keeps
+the ubi8 builder: the base image is unchanged, only the toolchain moves.
+---
+ build/ovirt-populator/Containerfile            | 2 +-
+ build/ovirt-populator/Containerfile-downstream | 2 +-
+ build/ovirt-populator/Containerfile-upstream   | 2 +-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/build/ovirt-populator/Containerfile b/build/ovirt-populator/Containerfile
+index 78ef9173e..5c86d0714 100644
+--- a/build/ovirt-populator/Containerfile
++++ b/build/ovirt-populator/Containerfile
+@@ -1,4 +1,4 @@
+-FROM registry.access.redhat.com/ubi8/go-toolset:1.25.9-1778589418 AS builder
++FROM registry.access.redhat.com/ubi8/go-toolset:1.26.10-1792672852 AS builder
+ ENV GOPATH=$APP_ROOT
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
+diff --git a/build/ovirt-populator/Containerfile-downstream b/build/ovirt-populator/Containerfile-downstream
+index acb7848e0..5f46469dd 100644
+--- a/build/ovirt-populator/Containerfile-downstream
++++ b/build/ovirt-populator/Containerfile-downstream
+@@ -1,4 +1,4 @@
+-FROM registry.redhat.io/ubi8/go-toolset:1.25.9-1778589418 AS builder
++FROM registry.redhat.io/ubi8/go-toolset:1.26.10-1792672852 AS builder
+ USER 0
+ ENV GOPATH=$APP_ROOT
+ WORKDIR /app
+diff --git a/build/ovirt-populator/Containerfile-upstream b/build/ovirt-populator/Containerfile-upstream
+index 17ec48efa..f758e3294 100644
+--- a/build/ovirt-populator/Containerfile-upstream
++++ b/build/ovirt-populator/Containerfile-upstream
+@@ -1,4 +1,4 @@
+-FROM registry.access.redhat.com/ubi8/go-toolset:1.25.9-1778589418 AS builder
++FROM registry.access.redhat.com/ubi8/go-toolset:1.26.10-1792672852 AS builder
+ ENV GOPATH=$APP_ROOT
+ WORKDIR /app
+ COPY --chown=1001:0 ./ ./
