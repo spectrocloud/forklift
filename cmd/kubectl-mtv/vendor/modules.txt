@@ -119,8 +119,12 @@ github.com/kballard/go-shellquote
 ## explicit; go 1.25.0
 =======
 # github.com/kubev2v/forklift v0.0.0-20260630205043-0e6f6933ffde => ../../
+<<<<<<< HEAD
 ## explicit; go 1.26.0
 >>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
+=======
+## explicit; go 1.26.10
+>>>>>>> cf3390df0 (spectro: pin the go directive to 1.26.10 for PVM-1439)
 github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1
 github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan
 github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/provider
