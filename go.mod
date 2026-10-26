@@ -1,9 +1,11 @@
 module github.com/kubev2v/forklift
 
-go 1.26.0
+go 1.26.10
 
 // Spectro (PVM-1439): golang.org/x/net >= v0.59.0 and x/crypto >= v0.56.0
-// carry the CVE fixes but require go 1.26. Keep Go 1.25 runtime defaults so
+// carry the CVE fixes but require go 1.26. The directive names the patch
+// release the images build with (go-toolset 1.26.10), so govulncheck scans
+// the fixed stdlib rather than go1.26.0. Keep Go 1.25 runtime defaults so
 // the directive bump changes no GODEBUG behaviour.
 godebug default=go1.25
 
