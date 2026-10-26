@@ -486,7 +486,10 @@ const (
 	TIOCSERGWILD                                 = 0x5454
 	TIOCSERSETMULTI                              = 0x545b
 	TIOCSERSWILD                                 = 0x5455
+<<<<<<< HEAD
 	TIOCSER_TEMT                                 = 0x1
+=======
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	TIOCSETD                                     = 0x5423
 	TIOCSIG                                      = 0x40045436
 	TIOCSISO7816                                 = 0xc0285443
