@@ -1,6 +1,11 @@
 module github.com/kubev2v/forklift/cmd/kubectl-mtv
 
-go 1.25.0
+go 1.26.0
+
+// Spectro (PVM-1439): golang.org/x/net >= v0.59.0 and x/crypto >= v0.56.0
+// carry the CVE fixes but require go 1.26. Keep Go 1.25 runtime defaults so
+// the directive bump changes no GODEBUG behaviour.
+godebug default=go1.25
 
 require github.com/yaacov/kubectl-mtv v0.3.22
 
@@ -70,12 +75,12 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/net v0.53.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
-	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.43.0 // indirect
-	golang.org/x/term v0.42.0 // indirect
-	golang.org/x/text v0.36.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/term v0.46.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
