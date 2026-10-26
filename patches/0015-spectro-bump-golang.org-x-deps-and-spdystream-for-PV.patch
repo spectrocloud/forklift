@@ -18,7 +18,7 @@ Root module and the two nested modules that ship in images
 plus the x/sys, x/term, x/sync, x/mod, x/tools versions those require.
 
 x/net >= v0.59.0 and x/crypto >= v0.56.0 declare go 1.26, so the go
-directive moves 1.25.0 -> 1.26.0. godebug default=go1.25 keeps the Go
+directive moves 1.25.0 -> 1.26.10. godebug default=go1.25 keeps the Go
 1.25 runtime defaults: without it urlstrictcolons=1 and friends switch
 on, which broke the Vantara client tests. Images already build with Go
 1.26.10, so the stdlib advisories in the ticket are closed by the
@@ -30,32 +30,34 @@ API changes into kubectl-mtv and the copy-offload populator.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- cmd/kubectl-mtv/go.mod                    | 17 +++++++----
- cmd/kubectl-mtv/go.sum                    | 28 +++++++++---------
- cmd/vsphere-copy-offload-populator/go.mod | 23 +++++++++------
- cmd/vsphere-copy-offload-populator/go.sum | 32 ++++++++++----------
- go.mod                                    | 25 +++++++++-------
- go.sum                                    | 36 +++++++++++------------
- 6 files changed, 88 insertions(+), 73 deletions(-)
+ cmd/kubectl-mtv/go.mod                    | 19 ++++++++++------
+ cmd/kubectl-mtv/go.sum                    | 28 ++++++++++++------------
+ cmd/vsphere-copy-offload-populator/go.mod | 25 +++++++++++++--------
+ cmd/vsphere-copy-offload-populator/go.sum | 32 +++++++++++++--------------
+ go.mod                                    | 27 ++++++++++++++---------
+ go.sum                                    | 36 +++++++++++++++----------------
+ 6 files changed, 94 insertions(+), 73 deletions(-)
 
 diff --git a/cmd/kubectl-mtv/go.mod b/cmd/kubectl-mtv/go.mod
-index e4e354da9..5fe5cfa4a 100644
+index e4e354da9a260b55d8042efaeb3fad4d6a07ee45..46818ed94ec4b650f94dcfe32072889b9dcea881 100644
 --- a/cmd/kubectl-mtv/go.mod
 +++ b/cmd/kubectl-mtv/go.mod
-@@ -1,6 +1,11 @@
+@@ -1,6 +1,13 @@
  module github.com/kubev2v/forklift/cmd/kubectl-mtv
  
 -go 1.25.0
-+go 1.26.0
++go 1.26.10
 +
 +// Spectro (PVM-1439): golang.org/x/net >= v0.59.0 and x/crypto >= v0.56.0
-+// carry the CVE fixes but require go 1.26. Keep Go 1.25 runtime defaults so
++// carry the CVE fixes but require go 1.26. The directive names the patch
++// release the images build with (go-toolset 1.26.10), so govulncheck scans
++// the fixed stdlib rather than go1.26.0. Keep Go 1.25 runtime defaults so
 +// the directive bump changes no GODEBUG behaviour.
 +godebug default=go1.25
  
  require github.com/yaacov/kubectl-mtv v0.3.22
  
-@@ -70,12 +75,12 @@ require (
+@@ -70,12 +77,12 @@ require (
  	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
  	go.yaml.in/yaml/v2 v2.4.3 // indirect
  	go.yaml.in/yaml/v3 v3.0.4 // indirect
@@ -74,7 +76,7 @@ index e4e354da9..5fe5cfa4a 100644
  	google.golang.org/protobuf v1.36.11 // indirect
  	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 diff --git a/cmd/kubectl-mtv/go.sum b/cmd/kubectl-mtv/go.sum
-index 382d04ce9..45c75731f 100644
+index 382d04ce934f045a588c65fe56ae02d82b2d9bd3..45c75731f30871c5c23afbf5293bd583c6040c35 100644
 --- a/cmd/kubectl-mtv/go.sum
 +++ b/cmd/kubectl-mtv/go.sum
 @@ -323,8 +323,8 @@ golang.org/x/mod v0.2.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
@@ -149,23 +151,25 @@ index 382d04ce9..45c75731f 100644
  golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
  golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
 diff --git a/cmd/vsphere-copy-offload-populator/go.mod b/cmd/vsphere-copy-offload-populator/go.mod
-index fcaa2aaa1..44fde30b7 100644
+index fcaa2aaa1edfee5fbaf6b7d845090242db577874..5a8519ecac232330f844feab843ebef9b34d556f 100644
 --- a/cmd/vsphere-copy-offload-populator/go.mod
 +++ b/cmd/vsphere-copy-offload-populator/go.mod
-@@ -1,6 +1,11 @@
+@@ -1,6 +1,13 @@
  module github.com/kubev2v/forklift/cmd/vsphere-copy-offload-populator
  
 -go 1.25.0
-+go 1.26.0
++go 1.26.10
 +
 +// Spectro (PVM-1439): golang.org/x/net >= v0.59.0 and x/crypto >= v0.56.0
-+// carry the CVE fixes but require go 1.26. Keep Go 1.25 runtime defaults so
++// carry the CVE fixes but require go 1.26. The directive names the patch
++// release the images build with (go-toolset 1.26.10), so govulncheck scans
++// the fixed stdlib rather than go1.26.0. Keep Go 1.25 runtime defaults so
 +// the directive bump changes no GODEBUG behaviour.
 +godebug default=go1.25
  
  require (
  	github.com/dell/gopowermax/v2 v2.9.0
-@@ -15,7 +20,7 @@ require (
+@@ -15,7 +22,7 @@ require (
  	github.com/stretchr/testify v1.10.0
  	github.com/vmware/govmomi v0.50.0
  	go.uber.org/mock v0.5.2
@@ -174,7 +178,7 @@ index fcaa2aaa1..44fde30b7 100644
  	k8s.io/api v0.32.8
  	k8s.io/apimachinery v0.32.8
  	k8s.io/client-go v0.32.8
-@@ -65,7 +70,7 @@ require (
+@@ -65,7 +72,7 @@ require (
  	go.uber.org/zap v1.27.0 // indirect
  	go.yaml.in/yaml/v3 v3.0.4 // indirect
  	golang.org/x/arch v0.15.0 // indirect
@@ -183,7 +187,7 @@ index fcaa2aaa1..44fde30b7 100644
  	golang.org/x/oauth2 v0.29.0 // indirect
  	golang.org/x/time v0.11.0 // indirect
  	google.golang.org/genproto/googleapis/rpc v0.0.0-20250115164207-1a7da9e5054f // indirect
-@@ -133,12 +138,12 @@ require (
+@@ -133,12 +140,12 @@ require (
  	go.opentelemetry.io/otel/metric v1.34.0 // indirect
  	go.opentelemetry.io/otel/trace v1.34.0 // indirect
  	go.uber.org/multierr v1.11.0 // indirect
@@ -203,7 +207,7 @@ index fcaa2aaa1..44fde30b7 100644
  	howett.net/plist v0.0.0-20181124034731-591f970eefbb // indirect
  	k8s.io/mount-utils v0.32.8 // indirect
 diff --git a/cmd/vsphere-copy-offload-populator/go.sum b/cmd/vsphere-copy-offload-populator/go.sum
-index f9aefe225..d5cd5d389 100644
+index f9aefe225b45aff7cc8bc9722b75f30e37807968..d5cd5d389272b405ae0841ca868792cc546d9ab1 100644
 --- a/cmd/vsphere-copy-offload-populator/go.sum
 +++ b/cmd/vsphere-copy-offload-populator/go.sum
 @@ -436,8 +436,8 @@ golang.org/x/arch v0.15.0/go.mod h1:JmwW7aLIoRUKgaTzhkiEFxvcEiQGyOg9BMonBJUS7EE=
@@ -289,23 +293,25 @@ index f9aefe225..d5cd5d389 100644
  golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
  golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
 diff --git a/go.mod b/go.mod
-index 8004c6281..ac2599d51 100644
+index 8004c6281691744668a9af910002c0e85dd23617..60811687b08a6b1c8cc57b63f7183905d097d736 100644
 --- a/go.mod
 +++ b/go.mod
-@@ -1,6 +1,11 @@
+@@ -1,6 +1,13 @@
  module github.com/kubev2v/forklift
  
 -go 1.25.0
-+go 1.26.0
++go 1.26.10
 +
 +// Spectro (PVM-1439): golang.org/x/net >= v0.59.0 and x/crypto >= v0.56.0
-+// carry the CVE fixes but require go 1.26. Keep Go 1.25 runtime defaults so
++// carry the CVE fixes but require go 1.26. The directive names the patch
++// release the images build with (go-toolset 1.26.10), so govulncheck scans
++// the fixed stdlib rather than go1.26.0. Keep Go 1.25 runtime defaults so
 +// the directive bump changes no GODEBUG behaviour.
 +godebug default=go1.25
  
  require (
  	github.com/Masterminds/sprig/v3 v3.3.0
-@@ -39,7 +44,7 @@ require (
+@@ -39,7 +46,7 @@ require (
  	github.com/vmware/govmomi v0.50.0
  	go.uber.org/mock v0.4.0
  	go.uber.org/zap v1.27.0
@@ -314,7 +320,7 @@ index 8004c6281..ac2599d51 100644
  	gopkg.in/yaml.v2 v2.4.0
  	k8s.io/api v0.32.5
  	k8s.io/apiextensions-apiserver v0.32.5
-@@ -127,7 +132,7 @@ require (
+@@ -127,7 +134,7 @@ require (
  	github.com/mitchellh/copystructure v1.2.0 // indirect
  	github.com/mitchellh/go-homedir v1.1.0 // indirect
  	github.com/mitchellh/reflectwalk v1.0.2 // indirect
@@ -323,7 +329,7 @@ index 8004c6281..ac2599d51 100644
  	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
  	github.com/modern-go/reflect2 v1.0.2 // indirect
  	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-@@ -151,15 +156,15 @@ require (
+@@ -151,15 +158,15 @@ require (
  	go.yaml.in/yaml/v3 v3.0.4 // indirect
  	golang.org/x/arch v0.15.0 // indirect
  	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
@@ -347,7 +353,7 @@ index 8004c6281..ac2599d51 100644
  	google.golang.org/protobuf v1.36.7 // indirect
  	gopkg.in/evanphx/json-patch.v4 v4.12.0 // indirect
 diff --git a/go.sum b/go.sum
-index 95926717e..714b0cd5f 100644
+index 95926717e2ec67f9e9948317a9570876eb1e6ca4..714b0cd5fe978019cfd6a13dd497cf21961eb3b8 100644
 --- a/go.sum
 +++ b/go.sum
 @@ -448,8 +448,8 @@ github.com/mitchellh/mapstructure v1.1.2/go.mod h1:FVVH3fgwuzCH5S8UJGiWEs2h04kUh
@@ -445,3 +451,4 @@ index 95926717e..714b0cd5f 100644
  golang.org/x/xerrors v0.0.0-20190717185122-a985d3407aa7/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
  golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
  golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+-- 
