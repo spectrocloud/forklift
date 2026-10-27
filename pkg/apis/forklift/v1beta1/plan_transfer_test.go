@@ -8,6 +8,9 @@ import (
 )
 
 func TestShouldUseV2vForTransfer_ExcludeDisks(t *testing.T) {
+	// Spectro: upstream's rules only apply when no VDDK image is configured;
+	// the provider below sets none, so clear the global fallback too.
+	t.Setenv("VDDK_IMAGE", "")
 	vsphere, openshift := VSphere, OpenShift
 	newPlan := func(exclude []string) *Plan {
 		return &Plan{
@@ -29,11 +32,6 @@ func TestShouldUseV2vForTransfer_ExcludeDisks(t *testing.T) {
 		}
 	}
 
-	// Spectro: the vSphere case always returns false, so both of upstream's
-	// assertions collapse to the CDI path. Upstream expects virt-v2v (true) in
-	// the second case; that premise is exactly what this fork inverts, so both
-	// cases are asserted as false here. See spectro_fork_test.go for the
-	// canonical guard on the inversion itself.
 	ok, err := newPlan([]string{"scsi0:1"}).ShouldUseV2vForTransfer(ref.Ref{ID: "vm-1"})
 	if err != nil {
 		t.Fatal(err)
@@ -46,7 +44,7 @@ func TestShouldUseV2vForTransfer_ExcludeDisks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok {
-		t.Fatal("expected CDI path when excludeDisks is empty (Spectro inverts upstream)")
+	if !ok {
+		t.Fatal("expected virt-v2v when excludeDisks is empty")
 	}
 }

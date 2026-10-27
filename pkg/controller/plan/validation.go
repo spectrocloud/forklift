@@ -1868,6 +1868,18 @@ func (r *Reconciler) validateVddkImage(plan *api.Plan) (err error) {
 			Message:  "VDDK image not set on the provider, this is required for the raw copy mode migration",
 		})
 	}
+	// Spectro: without VDDK, virt-v2v copies the disks as part of conversion,
+	// and conversion is opt-in on this fork. Without convertDisk the copy
+	// phase is skipped and the VM would get empty disks.
+	if !source.RequiresConversion() && vddkImage == "" && !plan.IsUsingOffloadPlugin() {
+		plan.Status.SetCondition(libcnd.Condition{
+			Type:     VDDKInitImageUnavailable,
+			Status:   True,
+			Reason:   NotSet,
+			Category: api.CategoryCritical,
+			Message:  "VDDK image not set on the provider; without VDDK, virt-v2v copies and converts the disks, which requires convertDisk: true on the provider",
+		})
+	}
 
 	return
 }
