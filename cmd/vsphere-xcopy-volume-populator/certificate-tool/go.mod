@@ -1,6 +1,6 @@
 module certificate-tool
 
-go 1.25.7
+go 1.26.10
 
 require (
 	github.com/spf13/cobra v1.9.1
