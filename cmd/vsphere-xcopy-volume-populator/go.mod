@@ -1,8 +1,6 @@
 module github.com/kubev2v/forklift/cmd/vsphere-xcopy-volume-populator
 
-go 1.25.7
-
-toolchain go1.23.10
+go 1.26.10
 
 require (
 	github.com/dell/goscaleio v1.19.1
