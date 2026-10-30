@@ -1,6 +1,13 @@
 module github.com/kubev2v/forklift/cmd/vsphere-copy-offload-populator
 
-go 1.25.0
+go 1.26.10
+
+// Spectro (PVM-1439): golang.org/x/net >= v0.59.0 and x/crypto >= v0.56.0
+// carry the CVE fixes but require go 1.26. The directive names the patch
+// release the images build with (go-toolset 1.26.10), so govulncheck scans
+// the fixed stdlib rather than go1.26.0. Keep Go 1.25 runtime defaults so
+// the directive bump changes no GODEBUG behaviour.
+godebug default=go1.25
 
 require (
 	github.com/dell/gopowermax/v2 v2.9.0
@@ -15,7 +22,7 @@ require (
 	github.com/stretchr/testify v1.10.0
 	github.com/vmware/govmomi v0.50.0
 	go.uber.org/mock v0.5.2
-	golang.org/x/crypto v0.50.0
+	golang.org/x/crypto v0.57.0
 	k8s.io/api v0.32.8
 	k8s.io/apimachinery v0.32.8
 	k8s.io/client-go v0.32.8
@@ -65,7 +72,7 @@ require (
 	go.uber.org/zap v1.27.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/arch v0.15.0 // indirect
-	golang.org/x/mod v0.35.0 // indirect
+	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/oauth2 v0.29.0 // indirect
 	golang.org/x/time v0.11.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250115164207-1a7da9e5054f // indirect
@@ -133,12 +140,12 @@ require (
 	go.opentelemetry.io/otel/metric v1.34.0 // indirect
 	go.opentelemetry.io/otel/trace v1.34.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/net v0.53.0 // indirect
-	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.43.0 // indirect
-	golang.org/x/term v0.42.0 // indirect
-	golang.org/x/text v0.36.0 // indirect
-	golang.org/x/tools v0.44.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/term v0.46.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/tools v0.49.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	howett.net/plist v0.0.0-20181124034731-591f970eefbb // indirect
 	k8s.io/mount-utils v0.32.8 // indirect
