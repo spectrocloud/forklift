@@ -400,7 +400,15 @@ func (p *Profile) process(s string, toASCII bool) (string, error) {
 				// Spec says keep the old label.
 				continue
 			}
+<<<<<<< HEAD
 			if unicode16 && err == nil && len(u) > 0 && isASCII(u) {
+=======
+			if err == nil && len(u) > 0 && isASCII(u) {
+				// UTS 43 pre-revision 33 doesn't classify a xn-- label
+				// which contains only ASCII characters as an error,
+				// but that's a specification bug and a security issue.
+				// Always return an error in this case.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 				err = punyError(enc)
 			}
 			isBidi = isBidi || bidirule.DirectionString(u) != bidi.LeftToRight

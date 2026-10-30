@@ -24,6 +24,10 @@
 //	client := &http.Client{Transport: tr}
 //
 // Deprecated: This package is deprecated.
+<<<<<<< HEAD
+=======
+// It is not maintained and should not be used.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 package h2c
 
 import (
@@ -84,6 +88,13 @@ type h2cHandler struct {
 
 // NewHandler is deprecated.
 //
+<<<<<<< HEAD
+=======
+// The Handler returned by NewHandler will read the first request on a connection entirely
+// into memory. To limit the memory consumed by this request, wrap the result of NewHandler
+// in an http.MaxBytesHandler.
+//
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 // Deprecated: Set the [http.Server] Protocols field to use unencrypted HTTP/2 instead.
 func NewHandler(h http.Handler, s *http2.Server) http.Handler {
 	return &h2cHandler{

@@ -25,6 +25,11 @@ import (
 //
 //	https://golang.org/pkg/net/http/#ResponseWriter
 //	https://golang.org/pkg/net/http/#example_ResponseWriter_trailers
+<<<<<<< HEAD
+=======
+//
+// Deprecated: Use [http.TrailerPrefix] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 const TrailerPrefix = "Trailer:"
 
 // Push errors.
@@ -38,16 +43,31 @@ var (
 // The configuration conf may be nil.
 //
 // ConfigureServer must be called before s begins serving.
+<<<<<<< HEAD
+=======
+//
+// Deprecated: Set [http.Server.Protocols] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 func ConfigureServer(s *http.Server, conf *Server) error {
 	return configureServer(s, conf)
 }
 
 // Server is an HTTP/2 server.
+<<<<<<< HEAD
+=======
+//
+// Deprecated: Use [http.Server] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 type Server struct {
 	// MaxHandlers limits the number of http.Handler ServeHTTP goroutines
 	// which may run at a time over all connections.
 	// Negative or zero no limit.
 	// TODO: implement
+<<<<<<< HEAD
+=======
+	//
+	// Deprecated: This field has never had any effect.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	MaxHandlers int
 
 	// MaxConcurrentStreams optionally specifies the number of
@@ -56,6 +76,12 @@ type Server struct {
 	// which may be active globally, which is MaxHandlers.
 	// If zero, MaxConcurrentStreams defaults to at least 100, per
 	// the HTTP/2 spec's recommendations.
+<<<<<<< HEAD
+=======
+	//
+	// Deprecated: Use [http.Server.HTTP2] and
+	// [http.HTTP2Config.MaxConcurrentStreams] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	MaxConcurrentStreams uint32
 
 	// MaxDecoderHeaderTableSize optionally specifies the http2
@@ -63,44 +89,91 @@ type Server struct {
 	// informs the remote endpoint of the maximum size of the header compression
 	// table used to decode header blocks, in octets. If zero, the default value
 	// of 4096 is used.
+<<<<<<< HEAD
+=======
+	//
+	// Deprecated: Use [http.Server.HTTP2] and
+	// [http.HTTP2Config.MaxDecoderHeaderTableSize] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	MaxDecoderHeaderTableSize uint32
 
 	// MaxEncoderHeaderTableSize optionally specifies an upper limit for the
 	// header compression table used for encoding request headers. Received
 	// SETTINGS_HEADER_TABLE_SIZE settings are capped at this limit. If zero,
 	// the default value of 4096 is used.
+<<<<<<< HEAD
+=======
+	//
+	// Deprecated: Use [http.Server.HTTP2] and
+	// [http.HTTP2Config.MaxEncoderHeaderTableSize] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	MaxEncoderHeaderTableSize uint32
 
 	// MaxReadFrameSize optionally specifies the largest frame
 	// this server is willing to read. A valid value is between
 	// 16k and 16M, inclusive. If zero or otherwise invalid, a
 	// default value is used.
+<<<<<<< HEAD
+=======
+	//
+	// Deprecated: Use [http.Server.HTTP2] and
+	// [http.HTTP2Config.MaxReadFrameSize] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	MaxReadFrameSize uint32
 
 	// PermitProhibitedCipherSuites, if true, permits the use of
 	// cipher suites prohibited by the HTTP/2 spec.
+<<<<<<< HEAD
+=======
+	//
+	// Deprecated: Use [http.Server.HTTP2] and
+	// [http.HTTP2Config.PermitProhibitedCipherSuites] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	PermitProhibitedCipherSuites bool
 
 	// IdleTimeout specifies how long until idle clients should be
 	// closed with a GOAWAY frame. PING frames are not considered
 	// activity for the purposes of IdleTimeout.
 	// If zero or negative, there is no timeout.
+<<<<<<< HEAD
+=======
+	//
+	// Deprecated: Use [http.Server.IdleTimeout] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	IdleTimeout time.Duration
 
 	// ReadIdleTimeout is the timeout after which a health check using a ping
 	// frame will be carried out if no frame is received on the connection.
 	// If zero, no health check is performed.
+<<<<<<< HEAD
+=======
+	//
+	// Deprecated: Use [http.Server.HTTP2] and
+	// [http.HTTP2Config.SendPingTimeout] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	ReadIdleTimeout time.Duration
 
 	// PingTimeout is the timeout after which the connection will be closed
 	// if a response to a ping is not received.
 	// If zero, a default of 15 seconds is used.
+<<<<<<< HEAD
+=======
+	//
+	// Deprecated: Use [http.Server.HTTP2] and
+	// [http.HTTP2Config.PingTimeout] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	PingTimeout time.Duration
 
 	// WriteByteTimeout is the timeout after which a connection will be
 	// closed if no data can be written to it. The timeout begins when data is
 	// available to write, and is extended whenever any bytes are written.
 	// If zero or negative, there is no timeout.
+<<<<<<< HEAD
+=======
+	//
+	// Deprecated: Use [http.Server.HTTP2] and
+	// [http.HTTP2Config.WriteByteTimeout] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	WriteByteTimeout time.Duration
 
 	// MaxUploadBufferPerConnection is the size of the initial flow
@@ -108,12 +181,24 @@ type Server struct {
 	// allow this to be smaller than 65535 or larger than 2^32-1.
 	// If the value is outside this range, a default value will be
 	// used instead.
+<<<<<<< HEAD
+=======
+	//
+	// Deprecated: Use [http.Server.HTTP2] and
+	// [http.HTTP2Config.MaxReceiveBufferPerConnection] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	MaxUploadBufferPerConnection int32
 
 	// MaxUploadBufferPerStream is the size of the initial flow control
 	// window for each stream. The HTTP/2 spec does not allow this to
 	// be larger than 2^32-1. If the value is zero or larger than the
 	// maximum, a default value will be used instead.
+<<<<<<< HEAD
+=======
+	//
+	// Deprecated: Use [http.Server.HTTP2] and
+	// [http.HTTP2Config.MaxReceiveBufferPerStream] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	MaxUploadBufferPerStream int32
 
 	// NewWriteScheduler constructs a write scheduler for a connection.
@@ -126,6 +211,12 @@ type Server struct {
 	// It's intended to increment a metric for monitoring, such
 	// as an expvar or Prometheus metric.
 	// The errType consists of only ASCII word characters.
+<<<<<<< HEAD
+=======
+	//
+	// Deprecated: Use [http.Server.HTTP2] and
+	// [http.HTTP2Config.CountError] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 	CountError func(errType string)
 
 	// Internal state. This is a pointer (rather than embedded directly)
@@ -135,6 +226,11 @@ type Server struct {
 }
 
 // ServeConnOpts are options for the Server.ServeConn method.
+<<<<<<< HEAD
+=======
+//
+// Deprecated: ServeConnOpts is deprecated.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 type ServeConnOpts struct {
 	// Context is the base context to use.
 	// If nil, context.Background is used.
@@ -178,6 +274,11 @@ type ServeConnOpts struct {
 // implemented in terms of providing a suitably-behaving net.Conn.
 //
 // The opts parameter is optional. If nil, default values are used.
+<<<<<<< HEAD
+=======
+//
+// Deprecated: Use [http.Server.Serve] or [http.Server.ServeTLS] instead.
+>>>>>>> f5d297778 (spectro: bump golang.org/x deps and spdystream for PVM-1439 CVEs)
 func (s *Server) ServeConn(c net.Conn, opts *ServeConnOpts) {
 	if opts == nil {
 		opts = &ServeConnOpts{}
