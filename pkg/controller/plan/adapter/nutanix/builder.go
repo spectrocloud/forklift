@@ -1046,17 +1046,15 @@ func (r *Builder) PodEnvironment(vmRef ref.Ref, _ *core.Secret) (env []core.EnvV
 }
 
 // nicPreservesStaticIP returns true when the NIC's static IP should be passed
-// to virt-v2v. The NetworkMap pair's networkIPMode overrides the plan-level
-// preserveStaticIPs flag; when no matching pair exists, the flag wins.
+// to virt-v2v: never for a NIC on an ignored network, otherwise per the
+// plan-level preserveStaticIPs flag. (Spectro: we do not carry upstream's
+// per-pair networkIPMode override.)
 func nicPreservesStaticIP(nic model.NIC, ctx *plancontext.Context) bool {
 	if ctx.Map.Network != nil {
 		for _, pair := range ctx.Map.Network.Spec.Map {
 			if pair.Source.ID == nic.SubnetUUID {
 				if pair.Destination.Type == planbase.Ignored {
 					return false
-				}
-				if pair.NetworkIPMode != "" {
-					return pair.NetworkIPMode == api.NetworkIPModePreserve
 				}
 				break
 			}
