@@ -1,0 +1,365 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 14:09:50 -0700
+Subject: [PATCH] spectro: let virt-v2v copy vSphere disks when no VDDK image
+ is set
+
+Patch 0002 made CDI+VDDK the only transfer path for vSphere, so a provider
+without a VDDK image could not migrate at all. Restore upstream's virt-v2v
+transfer for that case, keeping CDI+VDDK whenever an image is configured:
+
+- ShouldUseV2vForTransfer returns false for vSphere only when a VDDK image
+  is set (provider vddkInitImage, else the controller's VDDK_IMAGE). Without
+  one, upstream's rules apply: a cold migration to the host cluster has
+  virt-v2v copy and convert the disks (nbdkit over HTTPS through vCenter);
+  warm, remote-destination, shared-disk, excludeDisks, NetApp shift and
+  offload plans keep the CDI path.
+- vSphere DataVolumes() gets upstream's Blank source back for that path.
+- Conversion is opt-in on this fork and the virt-v2v copy runs as part of
+  conversion, so plan validation now rejects a vSphere plan with no VDDK
+  image unless the provider sets convertDisk: true. Without that the copy
+  phase is skipped and the VM would get empty disks.
+
+plan_transfer_test.go goes back to upstream's assertions (with VDDK_IMAGE
+cleared) and the guard test now pins both sides of the VDDK switch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/apis/forklift/v1beta1/plan.go             | 50 ++++++++++++++----
+ .../forklift/v1beta1/plan_transfer_test.go    | 12 ++---
+ .../forklift/v1beta1/spectro_fork_test.go     | 42 ++++++++++++---
+ .../plan/adapter/vsphere/builder.go           | 51 ++++++++++++-------
+ pkg/controller/plan/validation.go             | 12 +++++
+ .../plan/validation_spectro_test.go           | 46 +++++++++++++++++
+ 6 files changed, 170 insertions(+), 43 deletions(-)
+ create mode 100644 pkg/controller/plan/validation_spectro_test.go
+
+diff --git a/pkg/apis/forklift/v1beta1/plan.go b/pkg/apis/forklift/v1beta1/plan.go
+index 8cad6cedf..e5ae4ef51 100644
+--- a/pkg/apis/forklift/v1beta1/plan.go
++++ b/pkg/apis/forklift/v1beta1/plan.go
+@@ -18,6 +18,7 @@ package v1beta1
+ 
+ import (
+ 	"context"
++	"os"
+ 
+ 	k8snet "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
+ 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
+@@ -475,22 +476,44 @@ func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref) (bool, error) {
+ 
+ 	switch source.Type() {
+ 	case VSphere:
+-		// Spectro: the virt-v2v transfer path is removed for vSphere. CDI+VDDK
+-		// always copies the disks and virt-v2v only converts in place, so this
+-		// always reports false. Upstream instead weighs warm/host/shared-disk/
+-		// NetApp-shift/offload conditions here to decide between the two paths.
+-		//
+-		// Returning false here is what drives, via BasePredicate.Evaluate:
++		// Spectro: when a VDDK image is configured, CDI+VDDK always copies the
++		// disks and virt-v2v only converts in place, so this reports false.
++		// Returning false is what drives, via BasePredicate.Evaluate:
+ 		//   CDIDiskCopy      -> true  (PhaseCopyDisks runs)
+ 		//   VirtV2vDiskCopy  -> false (PhaseAllocateDisks + PhaseCopyDisksVirtV2V skipped)
+ 		// and, via KubeVirt.ResolveConversionType, api.InPlace (V2V_inPlace=1).
+ 		//
+-		// Upstream v2.12.9 added an ExcludeDisks check to this branch; it is
+-		// unreachable here because Spectro always returns false, so the disk
+-		// exclusion is handled by the CDI path instead.
++		// Without a VDDK image, upstream's rules below apply: virt-v2v copies
++		// and converts the disks itself, reading them over HTTPS through
++		// vCenter. That needs Provider.Spec.ConvertDisk=true, which plan
++		// validation enforces.
+ 		//
+ 		// OVA/HyperV deliberately keep upstream behaviour below.
+-		return false, nil
++		if vddkImageConfigured(source) {
++			return false, nil
++		}
++		// The virt-v2v transfers all disks attached to the VM. If we want to skip the shared disks so we don't transfer
++		// them multiple times we need to manage the transfer using KubeVirt CDI DataVolumes and v2v-in-place.
++		migrateSharedDisks := p.Spec.MigrateSharedDisks
++		planVM, found := p.Spec.FindVM(vmRef)
++		if found && planVM.MigrateSharedDisks != nil {
++			migrateSharedDisks = *planVM.MigrateSharedDisks
++		}
++		if p.IsWarm() || !destination.IsHost() || !migrateSharedDisks ||
++			p.Spec.SkipGuestConversion || p.Spec.Type == MigrationOnlyConversion {
++			return false, nil
++		}
++		if found && len(planVM.ExcludeDisks) > 0 {
++			// virt-v2v copies every attached disk; skip excluded disks via CDI instead.
++			return false, nil
++		}
++		if p.HasNetAppShiftDestination() {
++			return false, nil
++		}
++		if p.IsUsingOffloadPlugin() {
++			return false, nil
++		}
++		return true, nil
+ 	case Ova, HyperV:
+ 		return true, nil
+ 	default:
+@@ -498,6 +521,13 @@ func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref) (bool, error) {
+ 	}
+ }
+ 
++// Spectro: whether a VDDK image is configured for the source provider. Mirrors
++// settings.GetVDDKImage (provider setting, then the controller's VDDK_IMAGE),
++// which this package cannot import because pkg/settings imports it.
++func vddkImageConfigured(source *Provider) bool {
++	return source.Spec.Settings[VDDK] != "" || os.Getenv("VDDK_IMAGE") != ""
++}
++
+ func (p *Plan) HasNetAppShiftDestination() bool {
+ 	return p.Status.NetAppShiftDestination
+ }
+diff --git a/pkg/apis/forklift/v1beta1/plan_transfer_test.go b/pkg/apis/forklift/v1beta1/plan_transfer_test.go
+index 5b1bc892c..8bbbce6ad 100644
+--- a/pkg/apis/forklift/v1beta1/plan_transfer_test.go
++++ b/pkg/apis/forklift/v1beta1/plan_transfer_test.go
+@@ -8,6 +8,9 @@ import (
+ )
+ 
+ func TestShouldUseV2vForTransfer_ExcludeDisks(t *testing.T) {
++	// Spectro: upstream's rules only apply when no VDDK image is configured;
++	// the provider below sets none, so clear the global fallback too.
++	t.Setenv("VDDK_IMAGE", "")
+ 	vsphere, openshift := VSphere, OpenShift
+ 	newPlan := func(exclude []string) *Plan {
+ 		return &Plan{
+@@ -29,11 +32,6 @@ func TestShouldUseV2vForTransfer_ExcludeDisks(t *testing.T) {
+ 		}
+ 	}
+ 
+-	// Spectro: the vSphere case always returns false, so both of upstream's
+-	// assertions collapse to the CDI path. Upstream expects virt-v2v (true) in
+-	// the second case; that premise is exactly what this fork inverts, so both
+-	// cases are asserted as false here. See spectro_fork_test.go for the
+-	// canonical guard on the inversion itself.
+ 	ok, err := newPlan([]string{"scsi0:1"}).ShouldUseV2vForTransfer(ref.Ref{ID: "vm-1"})
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -46,7 +44,7 @@ func TestShouldUseV2vForTransfer_ExcludeDisks(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if ok {
+-		t.Fatal("expected CDI path when excludeDisks is empty (Spectro inverts upstream)")
++	if !ok {
++		t.Fatal("expected virt-v2v when excludeDisks is empty")
+ 	}
+ }
+diff --git a/pkg/apis/forklift/v1beta1/spectro_fork_test.go b/pkg/apis/forklift/v1beta1/spectro_fork_test.go
+index 7493d9d2e..ef3527731 100644
+--- a/pkg/apis/forklift/v1beta1/spectro_fork_test.go
++++ b/pkg/apis/forklift/v1beta1/spectro_fork_test.go
+@@ -37,29 +37,55 @@ func TestSpectroRequiresConversionIsOptIn(t *testing.T) {
+ 
+ // Upstream: ShouldUseV2vForTransfer() can return true for vSphere, letting
+ // virt-v2v copy the disks.
+-// Spectro:  always false for vSphere - CDI+VDDK copies, virt-v2v only converts
+-// in place. OVA keeps upstream behaviour.
++// Spectro:  false for vSphere whenever a VDDK image is configured - CDI+VDDK
++// copies, virt-v2v only converts in place. Without a VDDK image upstream's
++// rules apply. OVA keeps upstream behaviour.
+ func TestSpectroShouldUseV2vForTransfer(t *testing.T) {
+-	newPlan := func(sourceType ProviderType) *Plan {
++	t.Setenv("VDDK_IMAGE", "")
++	newPlan := func(sourceType ProviderType, settings map[string]string) *Plan {
+ 		src, dst := sourceType, OpenShift
+ 		p := &Plan{}
+-		p.Referenced.Provider.Source = &Provider{Spec: ProviderSpec{Type: &src}}
++		// Shared disks are migrated, so upstream's rules pick virt-v2v for a
++		// cold migration to the host cluster.
++		p.Spec.MigrateSharedDisks = true
++		p.Referenced.Provider.Source = &Provider{Spec: ProviderSpec{Type: &src, Settings: settings}}
+ 		p.Referenced.Provider.Destination = &Provider{Spec: ProviderSpec{Type: &dst}}
+ 		return p
+ 	}
+ 
+-	t.Run("vsphere never uses virt-v2v for transfer", func(t *testing.T) {
+-		got, err := newPlan(VSphere).ShouldUseV2vForTransfer(ref.Ref{})
++	t.Run("vsphere with a provider VDDK image uses CDI", func(t *testing.T) {
++		got, err := newPlan(VSphere, map[string]string{VDDK: "vddk:latest"}).ShouldUseV2vForTransfer(ref.Ref{})
+ 		if err != nil {
+ 			t.Fatalf("unexpected error: %v", err)
+ 		}
+ 		if got {
+-			t.Fatal("ShouldUseV2vForTransfer() = true for vSphere, want false")
++			t.Fatal("ShouldUseV2vForTransfer() = true for vSphere with VDDK, want false")
++		}
++	})
++
++	t.Run("vsphere with a global VDDK image uses CDI", func(t *testing.T) {
++		t.Setenv("VDDK_IMAGE", "vddk:latest")
++		got, err := newPlan(VSphere, nil).ShouldUseV2vForTransfer(ref.Ref{})
++		if err != nil {
++			t.Fatalf("unexpected error: %v", err)
++		}
++		if got {
++			t.Fatal("ShouldUseV2vForTransfer() = true for vSphere with VDDK_IMAGE, want false")
++		}
++	})
++
++	t.Run("vsphere without VDDK uses virt-v2v for transfer", func(t *testing.T) {
++		got, err := newPlan(VSphere, nil).ShouldUseV2vForTransfer(ref.Ref{})
++		if err != nil {
++			t.Fatalf("unexpected error: %v", err)
++		}
++		if !got {
++			t.Fatal("ShouldUseV2vForTransfer() = false for vSphere without VDDK, want true")
+ 		}
+ 	})
+ 
+ 	t.Run("ova keeps upstream behaviour", func(t *testing.T) {
+-		got, err := newPlan(Ova).ShouldUseV2vForTransfer(ref.Ref{})
++		got, err := newPlan(Ova, nil).ShouldUseV2vForTransfer(ref.Ref{})
+ 		if err != nil {
+ 			t.Fatalf("unexpected error: %v", err)
+ 		}
+diff --git a/pkg/controller/plan/adapter/vsphere/builder.go b/pkg/controller/plan/adapter/vsphere/builder.go
+index 3ec3aa317..5994482bc 100644
+--- a/pkg/controller/plan/adapter/vsphere/builder.go
++++ b/pkg/controller/plan/adapter/vsphere/builder.go
+@@ -686,23 +686,38 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
+ 		}
+ 
+ 		storageClass := mapped.Destination.StorageClass
+-		// Spectro: the virt-v2v transfer path is removed. CDI+VDDK always copies
+-		// the disks and virt-v2v is reduced to in-place conversion, so VDDK is a
+-		// hard requirement for vSphere migrations.
+-		vddkImage := settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
+-		uuid := vm.UUID
+-		if canUseInstanceUUID && vm.InstanceUUID != "" {
+-			uuid = vm.InstanceUUID
+-		}
+-		dvSource := cdi.DataVolumeSource{
+-			VDDK: &cdi.DataVolumeSourceVDDK{
+-				BackingFile:  baseVolume(disk.File, r.Plan.IsWarm()),
+-				UUID:         uuid,
+-				URL:          url,
+-				SecretRef:    secret.Name,
+-				Thumbprint:   thumbprint,
+-				InitImageURL: vddkImage,
+-			},
++		// Spectro: with a VDDK image configured, ShouldUseV2vForTransfer is
++		// false and CDI+VDDK copies the disks. Without one it follows upstream,
++		// and virt-v2v copies into blank volumes.
++		var dvSource cdi.DataVolumeSource
++		useV2vForTransfer, vErr := r.Plan.ShouldUseV2vForTransfer(vmRef)
++		if vErr != nil {
++			err = vErr
++			return
++		}
++		if useV2vForTransfer {
++			// Let virt-v2v do the copying
++			dvSource = cdi.DataVolumeSource{
++				Blank: &cdi.DataVolumeBlankImage{},
++			}
++		} else {
++			vddkImage := settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
++			uuid := vm.UUID
++			if canUseInstanceUUID && vm.InstanceUUID != "" {
++				uuid = vm.InstanceUUID
++			}
++
++			// Let CDI do the copying
++			dvSource = cdi.DataVolumeSource{
++				VDDK: &cdi.DataVolumeSourceVDDK{
++					BackingFile:  baseVolume(disk.File, r.Plan.IsWarm()),
++					UUID:         uuid,
++					URL:          url,
++					SecretRef:    secret.Name,
++					Thumbprint:   thumbprint,
++					InitImageURL: vddkImage,
++				},
++			}
+ 		}
+ 		alignedCapacity := utils.RoundUp(disk.Capacity, utils.DefaultAlignBlockSize)
+ 		dvSpec := cdi.DataVolumeSpec{
+@@ -753,7 +768,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
+ 			}
+ 		}
+ 
+-		if vddkConfigMap != nil {
++		if !useV2vForTransfer && vddkConfigMap != nil {
+ 			dv.ObjectMeta.Annotations[planbase.AnnVddkExtraArgs] = vddkConfigMap.Name
+ 		}
+ 		dvs = append(dvs, *dv)
+diff --git a/pkg/controller/plan/validation.go b/pkg/controller/plan/validation.go
+index 960d4f0d1..c2e1c845c 100644
+--- a/pkg/controller/plan/validation.go
++++ b/pkg/controller/plan/validation.go
+@@ -1868,6 +1868,18 @@ func (r *Reconciler) validateVddkImage(plan *api.Plan) (err error) {
+ 			Message:  "VDDK image not set on the provider, this is required for the raw copy mode migration",
+ 		})
+ 	}
++	// Spectro: without VDDK, virt-v2v copies the disks as part of conversion,
++	// and conversion is opt-in on this fork. Without convertDisk the copy
++	// phase is skipped and the VM would get empty disks.
++	if !source.RequiresConversion() && vddkImage == "" && !plan.IsUsingOffloadPlugin() {
++		plan.Status.SetCondition(libcnd.Condition{
++			Type:     VDDKInitImageUnavailable,
++			Status:   True,
++			Reason:   NotSet,
++			Category: api.CategoryCritical,
++			Message:  "VDDK image not set on the provider; without VDDK, virt-v2v copies and converts the disks, which requires convertDisk: true on the provider",
++		})
++	}
+ 
+ 	return
+ }
+diff --git a/pkg/controller/plan/validation_spectro_test.go b/pkg/controller/plan/validation_spectro_test.go
+new file mode 100644
+index 000000000..ea589e4ae
+--- /dev/null
++++ b/pkg/controller/plan/validation_spectro_test.go
+@@ -0,0 +1,46 @@
++package plan
++
++import (
++	"testing"
++
++	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
++	"github.com/kubev2v/forklift/pkg/settings"
++	"k8s.io/utils/ptr"
++)
++
++// Spectro: without a VDDK image virt-v2v copies the disks as part of
++// conversion, and conversion is opt-in via Provider.Spec.ConvertDisk, so a
++// vSphere plan without VDDK must require convertDisk.
++func TestSpectroValidateVddkImageWithoutVddkRequiresConvertDisk(t *testing.T) {
++	saved := settings.Settings.Migration.VddkImage
++	settings.Settings.Migration.VddkImage = ""
++	t.Cleanup(func() { settings.Settings.Migration.VddkImage = saved })
++
++	newPlan := func(convertDisk *bool) *api.Plan {
++		src, dst := api.VSphere, api.OpenShift
++		p := &api.Plan{}
++		p.Referenced.Provider.Source = &api.Provider{Spec: api.ProviderSpec{Type: &src, ConvertDisk: convertDisk}}
++		p.Referenced.Provider.Destination = &api.Provider{Spec: api.ProviderSpec{Type: &dst}}
++		return p
++	}
++
++	for _, tc := range []struct {
++		name        string
++		convertDisk *bool
++		wantBlocked bool
++	}{
++		{"convertDisk unset", nil, true},
++		{"convertDisk false", ptr.To(false), true},
++		{"convertDisk true", ptr.To(true), false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			p := newPlan(tc.convertDisk)
++			if err := (&Reconciler{}).validateVddkImage(p); err != nil {
++				t.Fatalf("unexpected error: %v", err)
++			}
++			if got := p.Status.HasCondition(VDDKInitImageUnavailable); got != tc.wantBlocked {
++				t.Fatalf("%s condition = %v, want %v", VDDKInitImageUnavailable, got, tc.wantBlocked)
++			}
++		})
++	}
++}
