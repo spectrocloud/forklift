@@ -98,11 +98,7 @@ func main() {
 				return nil
 			}(); err == nil || !errors.Is(err, os.ErrNotExist) {
 				if err == nil {
-					if convert.OverlayEnabled {
-						err = convert.RunInPlaceWithOverlay(convert.RunVirtV2vInPlace)
-					} else {
-						err = convert.RunVirtV2vInPlace()
-					}
+					err = convert.RunVirtV2vInPlace()
 				}
 			} else {
 				// No libvirt URL - use disk mode directly on mounted disks
