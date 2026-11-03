@@ -16,4 +16,5 @@
 0012-spectro-fix-deep-inspection-image-targets-and-bundle.patch
 0013-spectro-build-with-Go-1.26.10.patch
 0014-spectro-build-ovirt-populator-with-Go-1.26.10.patch
+0016-spectro-let-virt-v2v-copy-vSphere-disks-when-no-VDDK.patch
 0015-spectro-bump-golang.org-x-deps-and-spdystream-for-PV.patch
