@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 14:31:36 -0700
+Subject: [PATCH] spectro: adapt the Nutanix backport to APIs our fork lacks
+
+- cmd/virt-v2v/entrypoint.go: #8428 runs the mounted domain XML through
+  RunInPlaceWithOverlay when OverlayEnabled is set. We do not carry the
+  upstream overlay feature, so call RunVirtV2vInPlace directly, the same
+  as the libvirt URL branch above it.
+- nutanix/builder.go: #8939 honours a per-network-pair networkIPMode
+  (from upstream MTV-5674, #6916), which we do not carry. Use the
+  plan-level preserveStaticIPs flag, still skipping NICs on ignored
+  networks, the same as vSphere in our fork.
+
+Resolves: None
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmd/virt-v2v/entrypoint.go                     | 6 +-----
+ pkg/controller/plan/adapter/nutanix/builder.go | 8 +++-----
+ 2 files changed, 4 insertions(+), 10 deletions(-)
+
+diff --git a/cmd/virt-v2v/entrypoint.go b/cmd/virt-v2v/entrypoint.go
+index dbb5502f6..0a4b4812d 100644
+--- a/cmd/virt-v2v/entrypoint.go
++++ b/cmd/virt-v2v/entrypoint.go
+@@ -98,11 +98,7 @@ func main() {
+ 				return nil
+ 			}(); err == nil || !errors.Is(err, os.ErrNotExist) {
+ 				if err == nil {
+-					if convert.OverlayEnabled {
+-						err = convert.RunInPlaceWithOverlay(convert.RunVirtV2vInPlace)
+-					} else {
+-						err = convert.RunVirtV2vInPlace()
+-					}
++					err = convert.RunVirtV2vInPlace()
+ 				}
+ 			} else {
+ 				// No libvirt URL - use disk mode directly on mounted disks
+diff --git a/pkg/controller/plan/adapter/nutanix/builder.go b/pkg/controller/plan/adapter/nutanix/builder.go
+index 91cff4ac8..82bda0fd7 100644
+--- a/pkg/controller/plan/adapter/nutanix/builder.go
++++ b/pkg/controller/plan/adapter/nutanix/builder.go
+@@ -1046,8 +1046,9 @@ func (r *Builder) PodEnvironment(vmRef ref.Ref, _ *core.Secret) (env []core.EnvV
+ }
+ 
+ // nicPreservesStaticIP returns true when the NIC's static IP should be passed
+-// to virt-v2v. The NetworkMap pair's networkIPMode overrides the plan-level
+-// preserveStaticIPs flag; when no matching pair exists, the flag wins.
++// to virt-v2v: never for a NIC on an ignored network, otherwise per the
++// plan-level preserveStaticIPs flag. (Spectro: we do not carry upstream's
++// per-pair networkIPMode override.)
+ func nicPreservesStaticIP(nic model.NIC, ctx *plancontext.Context) bool {
+ 	if ctx.Map.Network != nil {
+ 		for _, pair := range ctx.Map.Network.Spec.Map {
+@@ -1055,9 +1056,6 @@ func nicPreservesStaticIP(nic model.NIC, ctx *plancontext.Context) bool {
+ 				if pair.Destination.Type == planbase.Ignored {
+ 					return false
+ 				}
+-				if pair.NetworkIPMode != "" {
+-					return pair.NetworkIPMode == api.NetworkIPModePreserve
+-				}
+ 				break
+ 			}
+ 		}
