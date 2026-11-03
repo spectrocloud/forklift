@@ -22,6 +22,7 @@ const (
 	MainContainer      = "main"
 	NFSVolumeMountName = "nfs"
 	NFSVolumeMountPath = "/ova"
+	QEMUUser           = 107
 	QEMUGroup          = 107
 	PVSize             = "1Gi"
 )
@@ -277,6 +278,9 @@ func (r *Builder) securityContext() (sc *core.SecurityContext) {
 		Capabilities: &core.Capabilities{
 			Drop: []core.Capability{"ALL"},
 		},
+		// Spectro: nothing assigns a UID outside OpenShift (no SCC), and the
+		// image runs as root, so runAsNonRoot alone fails CreateContainerConfig.
+		RunAsUser:    ptr.To(int64(QEMUUser)),
 		RunAsGroup:   ptr.To(int64(QEMUGroup)),
 		RunAsNonRoot: ptr.To(true),
 		SeccompProfile: &core.SeccompProfile{
