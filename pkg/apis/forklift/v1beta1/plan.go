@@ -18,6 +18,7 @@ package v1beta1
 
 import (
 	"context"
+	"os"
 
 	k8snet "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
@@ -475,27 +476,56 @@ func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref) (bool, error) {
 
 	switch source.Type() {
 	case VSphere:
-		// Spectro: the virt-v2v transfer path is removed for vSphere. CDI+VDDK
-		// always copies the disks and virt-v2v only converts in place, so this
-		// always reports false. Upstream instead weighs warm/host/shared-disk/
-		// NetApp-shift/offload conditions here to decide between the two paths.
-		//
-		// Returning false here is what drives, via BasePredicate.Evaluate:
+		// Spectro: when a VDDK image is configured, CDI+VDDK always copies the
+		// disks and virt-v2v only converts in place, so this reports false.
+		// Returning false is what drives, via BasePredicate.Evaluate:
 		//   CDIDiskCopy      -> true  (PhaseCopyDisks runs)
 		//   VirtV2vDiskCopy  -> false (PhaseAllocateDisks + PhaseCopyDisksVirtV2V skipped)
 		// and, via KubeVirt.ResolveConversionType, api.InPlace (V2V_inPlace=1).
 		//
-		// Upstream v2.12.9 added an ExcludeDisks check to this branch; it is
-		// unreachable here because Spectro always returns false, so the disk
-		// exclusion is handled by the CDI path instead.
+		// Without a VDDK image, upstream's rules below apply: virt-v2v copies
+		// and converts the disks itself, reading them over HTTPS through
+		// vCenter. That needs Provider.Spec.ConvertDisk=true, which plan
+		// validation enforces.
 		//
 		// OVA/HyperV deliberately keep upstream behaviour below.
-		return false, nil
+		if vddkImageConfigured(source) {
+			return false, nil
+		}
+		// The virt-v2v transfers all disks attached to the VM. If we want to skip the shared disks so we don't transfer
+		// them multiple times we need to manage the transfer using KubeVirt CDI DataVolumes and v2v-in-place.
+		migrateSharedDisks := p.Spec.MigrateSharedDisks
+		planVM, found := p.Spec.FindVM(vmRef)
+		if found && planVM.MigrateSharedDisks != nil {
+			migrateSharedDisks = *planVM.MigrateSharedDisks
+		}
+		if p.IsWarm() || !destination.IsHost() || !migrateSharedDisks ||
+			p.Spec.SkipGuestConversion || p.Spec.Type == MigrationOnlyConversion {
+			return false, nil
+		}
+		if found && len(planVM.ExcludeDisks) > 0 {
+			// virt-v2v copies every attached disk; skip excluded disks via CDI instead.
+			return false, nil
+		}
+		if p.HasNetAppShiftDestination() {
+			return false, nil
+		}
+		if p.IsUsingOffloadPlugin() {
+			return false, nil
+		}
+		return true, nil
 	case Ova, HyperV:
 		return true, nil
 	default:
 		return false, nil
 	}
+}
+
+// Spectro: whether a VDDK image is configured for the source provider. Mirrors
+// settings.GetVDDKImage (provider setting, then the controller's VDDK_IMAGE),
+// which this package cannot import because pkg/settings imports it.
+func vddkImageConfigured(source *Provider) bool {
+	return source.Spec.Settings[VDDK] != "" || os.Getenv("VDDK_IMAGE") != ""
 }
 
 func (p *Plan) HasNetAppShiftDestination() bool {
