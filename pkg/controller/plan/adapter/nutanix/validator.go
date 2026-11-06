@@ -27,18 +27,57 @@ func (r *Validator) MigrationType() bool {
 	}
 }
 
-func (r *Validator) StorageMapped(_ ref.Ref) (bool, error) {
-	// TODO: validate storage container mappings against VM disks
-	return true, nil
+func (r *Validator) StorageMapped(vmRef ref.Ref) (bool, error) {
+	if r.Plan.Referenced.Map.Storage == nil {
+		return false, nil
+	}
+	vm := &model.VM{}
+	if err := r.Source.Inventory.Find(vm, vmRef); err != nil {
+		return false, liberr.Wrap(err, "vm", vmRef.String())
+	}
+	return disksMapped(vm, r.Plan.Referenced.Map.Storage), nil
+}
+
+// disksMapped reports whether every data disk's storage container has a
+// storage map entry. It matches on the map's spec, as DataVolumes does.
+func disksMapped(vm *model.VM, storageMap *api.StorageMap) bool {
+	mapped := map[string]bool{}
+	for _, pair := range storageMap.Spec.Map {
+		mapped[pair.Source.ID] = true
+	}
+	for _, disk := range dataDisks(vm) {
+		if !mapped[disk.StorageContainerUUID] {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Validator) DirectStorage(_ ref.Ref) (bool, error) {
 	return true, nil
 }
 
-func (r *Validator) NetworksMapped(_ ref.Ref) (bool, error) {
-	// TODO: validate subnet mappings against VM NICs
-	return true, nil
+func (r *Validator) NetworksMapped(vmRef ref.Ref) (bool, error) {
+	if r.Plan.Referenced.Map.Network == nil {
+		return false, nil
+	}
+	vm := &model.VM{}
+	if err := r.Source.Inventory.Find(vm, vmRef); err != nil {
+		return false, liberr.Wrap(err, "vm", vmRef.String())
+	}
+	return nicsMapped(vm, r.Plan.Referenced.Map.Network), nil
+}
+
+// nicsMapped reports whether every NIC's subnet has a network map entry,
+// including entries that map it to "ignored". mapNetworks skips NICs
+// without one, so an unmapped NIC would otherwise be dropped silently.
+func nicsMapped(vm *model.VM, networkMap *api.NetworkMap) bool {
+	for _, nic := range vm.NICs {
+		if len(planbase.FindAllMappingsForNICRef(ref.Ref{ID: nic.SubnetUUID}, networkMap)) == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Validator) MaintenanceMode(_ ref.Ref) (bool, error) {
