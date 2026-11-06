@@ -1954,7 +1954,11 @@ func (r *Migration) updateCopyProgress(vm *plan.VMStatus, step *plan.Step) (err 
 				if r.Plan.IsWarm() && len(importer.Status.ContainerStatuses) > 0 {
 					vm.Warm.Failures = int(importer.Status.ContainerStatuses[0].RestartCount)
 				}
-				r.maybeRefreshImportCredentials(vm, dv.DataVolume, importer)
+				// A restarted importer starts with a fresh restart count; checking
+				// the deleted pod's count would fail the VM just as it recovers.
+				if r.maybeRefreshImportCredentials(vm, dv.DataVolume, importer) {
+					continue
+				}
 				if restartLimitExceeded(importer) {
 					task.MarkedCompleted()
 					msg, _ := terminationMessage(importer)
@@ -2287,7 +2291,8 @@ func terminationMessage(pod *core.Pod) (msg string, ok bool) {
 // (e.g. Nutanix Prism Central cookies) when the CDI importer fails with an
 // auth error, then deletes the importer pod so CDI recreates it with the
 // updated SecretExtraHeaders Secret mounted — without recreating the DV.
-func (r *Migration) maybeRefreshImportCredentials(vm *plan.VMStatus, dv *cdi.DataVolume, importer *core.Pod) {
+// It reports whether the importer pod was restarted.
+func (r *Migration) maybeRefreshImportCredentials(vm *plan.VMStatus, dv *cdi.DataVolume, importer *core.Pod) (restarted bool) {
 	if !isImportAuthFailure(importer) {
 		return
 	}
@@ -2348,6 +2353,7 @@ func (r *Migration) maybeRefreshImportCredentials(vm *plan.VMStatus, dv *cdi.Dat
 		"dv.name", dv.Name,
 		"dv.namespace", dv.Namespace,
 		"vm", vm.String())
+	return true
 }
 
 func isImportAuthFailure(pod *core.Pod) bool {

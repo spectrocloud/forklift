@@ -361,7 +361,7 @@ func TestMaybeRefreshImportCredentials(t *testing.T) {
 		VM: plan.VM{Ref: ref.Ref{ID: "vm-1", Name: "test-vm"}},
 	}
 
-	m.maybeRefreshImportCredentials(vm, dv, importer)
+	g.Expect(m.maybeRefreshImportCredentials(vm, dv, importer)).To(gomega.BeTrue())
 
 	g.Expect(refresher.calls).To(gomega.Equal(1))
 	updated := &cdi.DataVolume{}
@@ -375,7 +375,7 @@ func TestMaybeRefreshImportCredentials(t *testing.T) {
 	importer2 := importer.DeepCopy()
 	importer2.ResourceVersion = ""
 	g.Expect(client.Create(context.TODO(), importer2)).To(gomega.Succeed())
-	m.maybeRefreshImportCredentials(vm, updated, importer2)
+	g.Expect(m.maybeRefreshImportCredentials(vm, updated, importer2)).To(gomega.BeFalse())
 	g.Expect(refresher.calls).To(gomega.Equal(0))
 }
 
@@ -407,7 +407,7 @@ func TestMaybeRefreshImportCredentials_NotRefreshed(t *testing.T) {
 		VM: plan.VM{Ref: ref.Ref{ID: "vm-1", Name: "test-vm"}},
 	}
 
-	m.maybeRefreshImportCredentials(vm, dv, importer)
+	g.Expect(m.maybeRefreshImportCredentials(vm, dv, importer)).To(gomega.BeFalse())
 
 	g.Expect(refresher.calls).To(gomega.Equal(1))
 	updated := &cdi.DataVolume{}
@@ -460,7 +460,7 @@ func TestMaybeRefreshImportCredentials_NonAuthFailure(t *testing.T) {
 		VM: plan.VM{Ref: ref.Ref{ID: "vm-1", Name: "test-vm"}},
 	}
 
-	m.maybeRefreshImportCredentials(vm, dv, importer)
+	g.Expect(m.maybeRefreshImportCredentials(vm, dv, importer)).To(gomega.BeFalse())
 
 	g.Expect(refresher.calls).To(gomega.Equal(0))
 	err := client.Get(context.TODO(), types.NamespacedName{Namespace: importer.Namespace, Name: importer.Name}, &core.Pod{})
