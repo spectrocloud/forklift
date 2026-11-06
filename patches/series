@@ -24,3 +24,4 @@
 0020-spectro-skip-TLS-verification-on-Nutanix-CDI-imports.patch
 0021-spectro-fix-Nutanix-review-findings-in-the-conversio.patch
 0022-spectro-validate-Nutanix-storage-and-network-mapping.patch
+0023-spectro-skip-the-importer-restart-limit-after-a-cred.patch
