@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 12:26:33 -0800
+Subject: [PATCH] spectro: fix Nutanix review findings in the conversion path
+
+- virt-v2v: order mounted disks by index before matching them to the
+  domain XML. filepath.Glob sorts lexically (disk10 before disk2) and
+  file and block disks were globbed separately, so with 11+ disks, or a
+  mix of filesystem and block PVCs, UpdateDiskPaths pointed XML disks at
+  the wrong volumes.
+- Nutanix domain XML: give IDE disks an hd* target. libvirt rejects sd*
+  names on the ide bus.
+- Nutanix static IPs: set V2V_multipleIPsPerNic when a preserved NIC has
+  more than one static IP, as the vSphere and Hyper-V builders do, so the
+  extra addresses are restored on Windows guests.
+- Docs: insecureSkipVerify now also skips verification for disk
+  transfers (spec.source.http.insecureSkipVerify, CDI >= v1.66).
+
+Resolves: None
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/compatibility/provider-secrets.md        |  2 +-
+ .../plan/adapter/nutanix/builder.go           | 17 ++++++++-
+ .../plan/adapter/nutanix/builder_test.go      | 35 +++++++++++++++++++
+ pkg/virt-v2v/conversion/conversion.go         | 26 +++++++++++++-
+ pkg/virt-v2v/conversion/disk_order_test.go    | 28 +++++++++++++++
+ 5 files changed, 105 insertions(+), 3 deletions(-)
+ create mode 100644 pkg/virt-v2v/conversion/disk_order_test.go
+
+diff --git a/docs/compatibility/provider-secrets.md b/docs/compatibility/provider-secrets.md
+index b471883f9..1ad8a0207 100644
+--- a/docs/compatibility/provider-secrets.md
++++ b/docs/compatibility/provider-secrets.md
+@@ -340,7 +340,7 @@ stringData:
+ 
+ Authentication to Nutanix HTTP API. Standard user/password fields plus CA certificate field. Note that Prism Central providers will redirect to Prism Element nodes for disk transfers; therefore, it is necessary to bundle the CA certificate from Prism Central together with the certificates from all Prism Element nodes that might be used for transfer. Concatenate all certificates in PEM format as below.
+ 
+-Also, it is important that these certificates present an IP subjectAltName, as the redirect may not use domain names. The insecureSkipVerify flag only skips validation for inventory collection - for disk transfers, it causes forklift to automatically fetch the certificate from the redirected endpoint and instruct the importer pod to trust it.
++Also, it is important that these certificates present an IP subjectAltName, as the redirect may not use domain names. The insecureSkipVerify flag skips certificate validation for inventory collection and for disk transfers. For disk transfers, forklift sets `insecureSkipVerify` on each DataVolume's HTTP source, so CDI's importer does not verify the Prism certificate at all; this needs CDI v1.66 or later. It also still fetches the certificate from the redirected endpoint and pins it for the importer, which is what older CDI versions fall back to. Prism's factory certificate (`CN=*.nutanix.local`, no subjectAltName) cannot pass host name verification, so with that certificate only `insecureSkipVerify` works. When it is set, the `cacert` field does not protect disk transfers.
+ 
+ ### Example
+ 
+diff --git a/pkg/controller/plan/adapter/nutanix/builder.go b/pkg/controller/plan/adapter/nutanix/builder.go
+index c6347d4c8..816bbdce0 100644
+--- a/pkg/controller/plan/adapter/nutanix/builder.go
++++ b/pkg/controller/plan/adapter/nutanix/builder.go
+@@ -1053,6 +1053,18 @@ func (r *Builder) PodEnvironment(vmRef ref.Ref, _ *core.Secret) (env []core.EnvV
+ 	}
+ 	if staticIPs != "" {
+ 		env = append(env, core.EnvVar{Name: "V2V_staticIPs", Value: staticIPs})
++		var staticMACs []string
++		for _, nic := range vm.NICs {
++			if !nicPreservesStaticIP(nic, r.Context) {
++				continue
++			}
++			for range nic.StaticIPConfigs {
++				staticMACs = append(staticMACs, nic.MACAddress)
++			}
++		}
++		if planbase.HasMultipleIPsPerMAC(staticMACs) {
++			env = append(env, core.EnvVar{Name: v2vconfig.EnvMultipleIpsPerNicName, Value: "true"})
++		}
+ 	}
+ 
+ 	return
+@@ -1167,8 +1179,11 @@ func buildDomainXML(vm *model.VM, pvcs []*core.PersistentVolumeClaim) (string, e
+ 		}
+ 
+ 		devPrefix := "sd"
+-		if bus == "virtio" {
++		switch bus {
++		case "virtio":
+ 			devPrefix = "vd"
++		case "ide":
++			devPrefix = "hd"
+ 		}
+ 		devName := devPrefix + diskIndexLetter(i)
+ 
+diff --git a/pkg/controller/plan/adapter/nutanix/builder_test.go b/pkg/controller/plan/adapter/nutanix/builder_test.go
+index 9a971ecdf..c9cf85e7b 100644
+--- a/pkg/controller/plan/adapter/nutanix/builder_test.go
++++ b/pkg/controller/plan/adapter/nutanix/builder_test.go
+@@ -155,6 +155,41 @@ func TestBuildDomainXMLMatchesMapDisksOrder(t *testing.T) {
+ 	}
+ }
+ 
++// TestBuildDomainXMLDevicePrefixMatchesBus verifies that IDE disks get an hd*
++// target, which libvirt requires for the ide bus, and SCSI/SATA disks sd*.
++func TestBuildDomainXMLDevicePrefixMatchesBus(t *testing.T) {
++	vm := newOrderingTestVM()
++	pvcs := []*core.PersistentVolumeClaim{
++		pvcFor("pvc-sata", "disk-sata", false),
++		pvcFor("pvc-scsi-0", "disk-scsi-0", false),
++		pvcFor("pvc-ide", "disk-ide", false),
++		pvcFor("pvc-scsi-1", "disk-scsi-1", false),
++	}
++
++	xmlStr, err := buildDomainXML(vm, pvcs)
++	if err != nil {
++		t.Fatalf("buildDomainXML: %v", err)
++	}
++	domain := &libvirtxml.Domain{}
++	if err := xml.Unmarshal([]byte(xmlStr), domain); err != nil {
++		t.Fatalf("failed to parse generated domain XML: %v", err)
++	}
++
++	wantPrefix := map[string]string{"scsi": "sd", "sata": "sd", "ide": "hd"}
++	for i, d := range domain.Devices.Disks {
++		if d.Target == nil {
++			t.Fatalf("disk[%d]: missing target", i)
++		}
++		prefix, ok := wantPrefix[d.Target.Bus]
++		if !ok {
++			t.Fatalf("disk[%d]: unexpected bus %q", i, d.Target.Bus)
++		}
++		if d.Target.Dev[:2] != prefix {
++			t.Errorf("disk[%d]: bus %s has target %q, want prefix %q", i, d.Target.Bus, d.Target.Dev, prefix)
++		}
++	}
++}
++
+ // TestBuildDomainXMLOmitsDisksWithoutPVC verifies that a disk with no
+ // matching PVC (e.g. unmapped storage) is dropped entirely rather than
+ // merely defaulting its volume mode -- otherwise every disk index after it
+diff --git a/pkg/virt-v2v/conversion/conversion.go b/pkg/virt-v2v/conversion/conversion.go
+index 3905fb5b9..752590928 100644
+--- a/pkg/virt-v2v/conversion/conversion.go
++++ b/pkg/virt-v2v/conversion/conversion.go
+@@ -7,7 +7,10 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"path/filepath"
++	"sort"
++	"strconv"
+ 	"strings"
++	"unicode"
+ 
+ 	"github.com/kubev2v/forklift/pkg/virt-v2v/config"
+ 	"github.com/kubev2v/forklift/pkg/virt-v2v/customize"
+@@ -52,7 +55,7 @@ func (c *Conversion) getDisk() ([]*Disk, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	diskPaths = append(diskPaths, disksBlock...)
++	diskPaths = sortDiskPaths(append(diskPaths, disksBlock...))
+ 	for _, path := range diskPaths {
+ 		disk, err := NewDisk(c.AppConfig, path)
+ 		if err != nil {
+@@ -63,6 +66,27 @@ func (c *Conversion) getDisk() ([]*Disk, error) {
+ 	return disks, nil
+ }
+ 
++// sortDiskPaths orders disk paths by their index, so /mnt/disks/disk2 comes
++// before /mnt/disks/disk10 and /dev/block1 sits between disk0 and disk2.
++// filepath.Glob sorts lexically and file and block disks are globbed
++// separately, but UpdateDiskPaths matches disks to the domain XML by position.
++func sortDiskPaths(paths []string) []string {
++	sort.SliceStable(paths, func(i, j int) bool {
++		return diskIndex(paths[i]) < diskIndex(paths[j])
++	})
++	return paths
++}
++
++// diskIndex returns the number at the end of a disk path such as
++// /mnt/disks/disk10 or /dev/block2, or -1 if it has none.
++func diskIndex(path string) int {
++	n, err := strconv.Atoi(strings.TrimLeftFunc(filepath.Base(path), unicode.IsLetter))
++	if err != nil {
++		return -1
++	}
++	return n
++}
++
+ // addCommonArgs adds v2v arguments which are shared between all virt-v2v commands
+ // (virt-v2v, virt-v2v-in-place, and virt-v2v-inspector)
+ func (c *Conversion) addCommonArgs(cmd utils.CommandBuilder) error {
+diff --git a/pkg/virt-v2v/conversion/disk_order_test.go b/pkg/virt-v2v/conversion/disk_order_test.go
+new file mode 100644
+index 000000000..a0e5da5e6
+--- /dev/null
++++ b/pkg/virt-v2v/conversion/disk_order_test.go
+@@ -0,0 +1,28 @@
++package conversion
++
++import (
++	"reflect"
++	"testing"
++)
++
++func TestSortDiskPaths(t *testing.T) {
++	got := sortDiskPaths([]string{
++		"/mnt/disks/disk0",
++		"/mnt/disks/disk10",
++		"/mnt/disks/disk2",
++		"/mnt/disks/disk3",
++		"/dev/block1",
++		"/dev/block11",
++	})
++	want := []string{
++		"/mnt/disks/disk0",
++		"/dev/block1",
++		"/mnt/disks/disk2",
++		"/mnt/disks/disk3",
++		"/mnt/disks/disk10",
++		"/dev/block11",
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("sortDiskPaths:\n got  %v\n want %v", got, want)
++	}
++}
