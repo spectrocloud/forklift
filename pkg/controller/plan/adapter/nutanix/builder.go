@@ -1053,6 +1053,18 @@ func (r *Builder) PodEnvironment(vmRef ref.Ref, _ *core.Secret) (env []core.EnvV
 	}
 	if staticIPs != "" {
 		env = append(env, core.EnvVar{Name: "V2V_staticIPs", Value: staticIPs})
+		var staticMACs []string
+		for _, nic := range vm.NICs {
+			if !nicPreservesStaticIP(nic, r.Context) {
+				continue
+			}
+			for range nic.StaticIPConfigs {
+				staticMACs = append(staticMACs, nic.MACAddress)
+			}
+		}
+		if planbase.HasMultipleIPsPerMAC(staticMACs) {
+			env = append(env, core.EnvVar{Name: v2vconfig.EnvMultipleIpsPerNicName, Value: "true"})
+		}
 	}
 
 	return
@@ -1167,8 +1179,11 @@ func buildDomainXML(vm *model.VM, pvcs []*core.PersistentVolumeClaim) (string, e
 		}
 
 		devPrefix := "sd"
-		if bus == "virtio" {
+		switch bus {
+		case "virtio":
 			devPrefix = "vd"
+		case "ide":
+			devPrefix = "hd"
 		}
 		devName := devPrefix + diskIndexLetter(i)
 

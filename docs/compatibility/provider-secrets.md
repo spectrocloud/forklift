@@ -340,7 +340,7 @@ stringData:
 
 Authentication to Nutanix HTTP API. Standard user/password fields plus CA certificate field. Note that Prism Central providers will redirect to Prism Element nodes for disk transfers; therefore, it is necessary to bundle the CA certificate from Prism Central together with the certificates from all Prism Element nodes that might be used for transfer. Concatenate all certificates in PEM format as below.
 
-Also, it is important that these certificates present an IP subjectAltName, as the redirect may not use domain names. The insecureSkipVerify flag only skips validation for inventory collection - for disk transfers, it causes forklift to automatically fetch the certificate from the redirected endpoint and instruct the importer pod to trust it.
+Also, it is important that these certificates present an IP subjectAltName, as the redirect may not use domain names. The insecureSkipVerify flag skips certificate validation for inventory collection and for disk transfers. For disk transfers, forklift sets `insecureSkipVerify` on each DataVolume's HTTP source, so CDI's importer does not verify the Prism certificate at all; this needs CDI v1.66 or later. It also still fetches the certificate from the redirected endpoint and pins it for the importer, which is what older CDI versions fall back to. Prism's factory certificate (`CN=*.nutanix.local`, no subjectAltName) cannot pass host name verification, so with that certificate only `insecureSkipVerify` works. When it is set, the `cacert` field does not protect disk transfers.
 
 ### Example
 
