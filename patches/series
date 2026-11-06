@@ -23,3 +23,4 @@
 0019-spectro-bump-containerized-data-importer-api-to-v1.6.patch
 0020-spectro-skip-TLS-verification-on-Nutanix-CDI-imports.patch
 0021-spectro-fix-Nutanix-review-findings-in-the-conversio.patch
+0022-spectro-validate-Nutanix-storage-and-network-mapping.patch
