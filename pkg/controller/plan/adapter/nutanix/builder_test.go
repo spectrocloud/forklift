@@ -155,6 +155,41 @@ func TestBuildDomainXMLMatchesMapDisksOrder(t *testing.T) {
 	}
 }
 
+// TestBuildDomainXMLDevicePrefixMatchesBus verifies that IDE disks get an hd*
+// target, which libvirt requires for the ide bus, and SCSI/SATA disks sd*.
+func TestBuildDomainXMLDevicePrefixMatchesBus(t *testing.T) {
+	vm := newOrderingTestVM()
+	pvcs := []*core.PersistentVolumeClaim{
+		pvcFor("pvc-sata", "disk-sata", false),
+		pvcFor("pvc-scsi-0", "disk-scsi-0", false),
+		pvcFor("pvc-ide", "disk-ide", false),
+		pvcFor("pvc-scsi-1", "disk-scsi-1", false),
+	}
+
+	xmlStr, err := buildDomainXML(vm, pvcs)
+	if err != nil {
+		t.Fatalf("buildDomainXML: %v", err)
+	}
+	domain := &libvirtxml.Domain{}
+	if err := xml.Unmarshal([]byte(xmlStr), domain); err != nil {
+		t.Fatalf("failed to parse generated domain XML: %v", err)
+	}
+
+	wantPrefix := map[string]string{"scsi": "sd", "sata": "sd", "ide": "hd"}
+	for i, d := range domain.Devices.Disks {
+		if d.Target == nil {
+			t.Fatalf("disk[%d]: missing target", i)
+		}
+		prefix, ok := wantPrefix[d.Target.Bus]
+		if !ok {
+			t.Fatalf("disk[%d]: unexpected bus %q", i, d.Target.Bus)
+		}
+		if d.Target.Dev[:2] != prefix {
+			t.Errorf("disk[%d]: bus %s has target %q, want prefix %q", i, d.Target.Bus, d.Target.Dev, prefix)
+		}
+	}
+}
+
 // TestBuildDomainXMLOmitsDisksWithoutPVC verifies that a disk with no
 // matching PVC (e.g. unmapped storage) is dropped entirely rather than
 // merely defaulting its volume mode -- otherwise every disk index after it

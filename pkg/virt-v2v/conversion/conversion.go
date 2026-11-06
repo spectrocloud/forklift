@@ -7,7 +7,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/kubev2v/forklift/pkg/virt-v2v/config"
 	"github.com/kubev2v/forklift/pkg/virt-v2v/customize"
@@ -52,7 +55,7 @@ func (c *Conversion) getDisk() ([]*Disk, error) {
 	if err != nil {
 		return nil, err
 	}
-	diskPaths = append(diskPaths, disksBlock...)
+	diskPaths = sortDiskPaths(append(diskPaths, disksBlock...))
 	for _, path := range diskPaths {
 		disk, err := NewDisk(c.AppConfig, path)
 		if err != nil {
@@ -61,6 +64,27 @@ func (c *Conversion) getDisk() ([]*Disk, error) {
 		disks = append(disks, disk)
 	}
 	return disks, nil
+}
+
+// sortDiskPaths orders disk paths by their index, so /mnt/disks/disk2 comes
+// before /mnt/disks/disk10 and /dev/block1 sits between disk0 and disk2.
+// filepath.Glob sorts lexically and file and block disks are globbed
+// separately, but UpdateDiskPaths matches disks to the domain XML by position.
+func sortDiskPaths(paths []string) []string {
+	sort.SliceStable(paths, func(i, j int) bool {
+		return diskIndex(paths[i]) < diskIndex(paths[j])
+	})
+	return paths
+}
+
+// diskIndex returns the number at the end of a disk path such as
+// /mnt/disks/disk10 or /dev/block2, or -1 if it has none.
+func diskIndex(path string) int {
+	n, err := strconv.Atoi(strings.TrimLeftFunc(filepath.Base(path), unicode.IsLetter))
+	if err != nil {
+		return -1
+	}
+	return n
 }
 
 // addCommonArgs adds v2v arguments which are shared between all virt-v2v commands
