@@ -1,0 +1,1037 @@
+package nutanix
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path"
+	"strings"
+	"testing"
+
+	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
+	planapi "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
+	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
+	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
+	webbase "github.com/kubev2v/forklift/pkg/controller/provider/web/base"
+	model "github.com/kubev2v/forklift/pkg/controller/provider/web/nutanix"
+	libclient "github.com/kubev2v/forklift/pkg/lib/client/nutanix"
+	"github.com/kubev2v/forklift/pkg/lib/logging"
+	core "k8s.io/api/core/v1"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// errNotImplemented is returned by fakeInventory methods that aren't
+// exercised by these tests, so callers get a clear error instead of a
+// silent nil/nil.
+var errNotImplemented = fmt.Errorf("not implemented by fakeInventory")
+
+// fakeInventory is a minimal web.Client stub that only implements Find,
+// returning a fixed VM. The other methods aren't exercised by these tests.
+type fakeInventory struct {
+	vm *model.VM
+}
+
+func (f *fakeInventory) Finder() webbase.Finder { return nil }
+func (f *fakeInventory) Get(_ interface{}, _ string) error {
+	return nil
+}
+func (f *fakeInventory) List(_ interface{}, _ ...webbase.Param) error {
+	return nil
+}
+func (f *fakeInventory) Watch(_ interface{}, _ webbase.EventHandler) (*webbase.Watch, error) {
+	return nil, errNotImplemented
+}
+func (f *fakeInventory) Find(resource interface{}, _ webbase.Ref) error {
+	if vm, ok := resource.(*model.VM); ok {
+		*vm = *f.vm
+	}
+	return nil
+}
+func (f *fakeInventory) VM(_ *webbase.Ref) (interface{}, error) { return f.vm, nil }
+func (f *fakeInventory) Workload(_ *webbase.Ref) (interface{}, error) {
+	return nil, errNotImplemented
+}
+func (f *fakeInventory) Network(_ *webbase.Ref) (interface{}, error) {
+	return nil, errNotImplemented
+}
+func (f *fakeInventory) Storage(_ *webbase.Ref) (interface{}, error) {
+	return nil, errNotImplemented
+}
+func (f *fakeInventory) Host(_ *webbase.Ref) (interface{}, error) {
+	return nil, errNotImplemented
+}
+
+type v3ImageListResponse struct {
+	Entities []libclient.V3Image `json:"entities"`
+	Metadata struct {
+		TotalMatches int `json:"total_matches"`
+	} `json:"metadata"`
+}
+
+type v3ImageCreateRequest struct {
+	Spec struct {
+		Name      string `json:"name"`
+		Resources struct {
+			DataSourceReference struct {
+				Kind string `json:"kind"`
+				UUID string `json:"uuid"`
+			} `json:"data_source_reference"`
+			ImageType string `json:"image_type"`
+		} `json:"resources"`
+	} `json:"spec"`
+}
+
+const testMigrationUID = "7b33cda8-a846-4130-a6ec-f176a511a4e9"
+
+func testMigrationImageName(vmRef ref.Ref, diskUUID string) string {
+	return migrationImageName(testMigrationUID, vmRef, diskUUID)
+}
+
+type v4ImageListResponse struct {
+	Data []libclient.ImageV4 `json:"data"`
+}
+
+type v4ImageCreateRequest struct {
+	Name string `json:"name"`
+}
+
+func newTestClient(url string) *Client {
+	return newTestClientWithInventory(url, nil)
+}
+
+func newTestClientWithInventory(url string, vm *model.VM) *Client {
+	return &Client{
+		Context: &plancontext.Context{
+			Migration: &api.Migration{
+				ObjectMeta: meta.ObjectMeta{
+					UID: testMigrationUID,
+				},
+			},
+			Source: plancontext.Source{
+				Provider: &api.Provider{Spec: api.ProviderSpec{URL: url}},
+				Secret: &core.Secret{
+					Data: map[string][]byte{
+						"user":     []byte("admin"),
+						"password": []byte("password"),
+					},
+				},
+				Inventory: &fakeInventory{vm: vm},
+			},
+			Log: logging.WithName("test"),
+		},
+	}
+}
+
+func testV3Image(uuid, name, state string) libclient.V3Image {
+	image := libclient.V3Image{}
+	image.Metadata.UUID = uuid
+	image.Spec.Name = name
+	image.Status.State = state
+	return image
+}
+
+func testImageV4(extID, name string, sizeBytes int64) libclient.ImageV4 {
+	return libclient.ImageV4{
+		ExtID:     extID,
+		Name:      name,
+		SizeBytes: sizeBytes,
+	}
+}
+
+// TestConnect verifies connect() picks up the provider URL and secret from
+// the plan context and authenticates against the Nutanix API.
+func TestConnect(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Header.Get("Authorization") == "" {
+			t.Error("expected Authorization header")
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"entities":[]}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL)
+
+	if err := client.connect(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if requests == 0 {
+		t.Fatal("expected connect() to issue at least one authenticated request")
+	}
+	if client.URL != server.URL {
+		t.Fatalf("expected client URL to be %s, got %s", server.URL, client.URL)
+	}
+}
+
+// TestConnect_FailsOnUnauthorized verifies connect() surfaces an error when
+// the connectivity probe is rejected.
+func TestConnect_FailsOnUnauthorized(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL)
+
+	if err := client.connect(); err == nil {
+		t.Fatal("expected an error when the connectivity probe returns 401")
+	}
+}
+
+// vmEntity builds a minimal v3 VM entity body with the given power state.
+func vmEntity(uuid, powerState string) libclient.VM {
+	resources := libclient.VMResources{PowerState: powerState}
+	return libclient.VM{
+		APIVersion: "3.1",
+		Metadata:   libclient.Metadata{UUID: uuid},
+		Spec: libclient.VMSpec{
+			Name:      "test-vm",
+			Resources: resources,
+		},
+		Status: libclient.VMStatus{Resources: resources},
+	}
+}
+
+func vmEntityPtr(uuid, powerState string) *libclient.VM {
+	entity := vmEntity(uuid, powerState)
+	return &entity
+}
+
+// newPowerTestServer serves the connectivity probe plus GET/PUT for a
+// single VM entity, tracking PUT bodies and ACPI shutdown requests for
+// assertions. Defaults to Prism Central (200 on prism_central): PowerOff
+// posts .../acpi_shutdown. PUT ON/OFF updates power_state (PowerOn).
+func newPowerTestServer(
+	t *testing.T,
+	entity *libclient.VM,
+) (server *httptest.Server, puts *[]libclient.VMUpdateRequest, acpiShutdowns *int) {
+	t.Helper()
+	var putBodies []libclient.VMUpdateRequest
+	var acpiCount int
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/clusters/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == prismCentralPath:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/acpi_shutdown"):
+			acpiCount++
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"task_uuid":"test-task"}`))
+		case r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(entity)
+		case r.Method == http.MethodPut:
+			var body libclient.VMUpdateRequest
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			putBodies = append(putBodies, body)
+			entity.Spec.Resources.PowerState = body.Spec.Resources.PowerState
+			entity.Status.Resources.PowerState = body.Spec.Resources.PowerState
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	return server, &putBodies, &acpiCount
+}
+
+// newConnectedTestClient builds a plan adapter Client and connects it
+// against the given server, as the Adapter would before issuing requests.
+func newConnectedTestClient(t *testing.T, url string) *Client {
+	t.Helper()
+	client := newTestClient(url)
+	if err := client.connect(); err != nil {
+		t.Fatalf("unexpected error connecting: %v", err)
+	}
+	return client
+}
+
+func powerTestVMID(t *testing.T, name string) string {
+	t.Helper()
+	return "vm-power-" + name
+}
+
+func TestPowerState(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want planapi.VMPowerState
+	}{
+		{"on", powerStateOn, planapi.VMPowerStateOn},
+		{"off", powerStateOff, planapi.VMPowerStateOff},
+		{"unknown", "", planapi.VMPowerStateUnknown},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			vmID := powerTestVMID(t, "state-"+c.name)
+			server, _, _ := newPowerTestServer(t, vmEntityPtr(vmID, c.raw))
+			defer server.Close()
+
+			client := newConnectedTestClient(t, server.URL)
+			state, err := client.PowerState(ref.Ref{ID: vmID})
+			if err != nil {
+				t.Fatalf("unexpected error for raw state %q: %v", c.raw, err)
+			}
+			if state != c.want {
+				t.Fatalf("raw state %q: expected %s, got %s", c.raw, c.want, state)
+			}
+		})
+	}
+}
+
+func TestPoweredOff(t *testing.T) {
+	vmID := powerTestVMID(t, "already-off")
+	server, _, _ := newPowerTestServer(t, vmEntityPtr(vmID, powerStateOff))
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	off, err := client.PoweredOff(ref.Ref{ID: vmID})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !off {
+		t.Fatal("expected PoweredOff to be true when power_state is OFF")
+	}
+}
+
+// TestPowerOff_SkipsAcpiWhenAlreadyOff verifies PowerOff is a no-op when the
+// VM is already off.
+func TestPowerOff_SkipsAcpiWhenAlreadyOff(t *testing.T) {
+	vmID := powerTestVMID(t, "skip-acpi")
+	server, puts, acpi := newPowerTestServer(t, vmEntityPtr(vmID, powerStateOff))
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	if err := client.PowerOff(ref.Ref{ID: vmID}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(*puts) != 0 {
+		t.Fatalf("expected no PUT requests, got %d", len(*puts))
+	}
+	if *acpi != 0 {
+		t.Fatalf("expected no acpi_shutdown requests, got %d", *acpi)
+	}
+}
+
+// TestPowerOff_SubmitsAcpiShutdown verifies PowerOff posts PC v3
+// acpi_shutdown and does not hard-off while the guest is still on.
+func TestPowerOff_SubmitsAcpiShutdown(t *testing.T) {
+	vmID := powerTestVMID(t, "acpi-shutdown")
+	server, puts, acpi := newPowerTestServer(t, vmEntityPtr(vmID, powerStateOn))
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	if err := client.PowerOff(ref.Ref{ID: vmID}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(*puts) != 0 {
+		t.Fatalf("expected no PUT requests, got %d", len(*puts))
+	}
+	if *acpi != 1 {
+		t.Fatalf("expected exactly one acpi_shutdown request, got %d", *acpi)
+	}
+
+	off, err := client.PoweredOff(ref.Ref{ID: vmID})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if off {
+		t.Fatal("expected PoweredOff to be false while ACPI shutdown is pending")
+	}
+}
+
+// TestPowerOff_PrismElementUsesV2SetPowerState verifies PE PowerOff uses
+// REST v2.0 set_power_state with ACPI_SHUTDOWN (PE has no v3 acpi_shutdown).
+func TestPowerOff_PrismElementUsesV2SetPowerState(t *testing.T) {
+	vmID := powerTestVMID(t, "pe-acpi")
+	entity := vmEntityPtr(vmID, powerStateOn)
+	var transitions []string
+	var puts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/clusters/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == prismCentralPath:
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/set_power_state"):
+			var body struct {
+				Transition string `json:"transition"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			transitions = append(transitions, body.Transition)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"task_uuid":"pe-task"}`))
+		case r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(entity)
+		case r.Method == http.MethodPut:
+			puts++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	if err := client.PowerOff(ref.Ref{ID: vmID}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if puts != 0 {
+		t.Fatalf("expected no PUT requests, got %d", puts)
+	}
+	if len(transitions) != 1 || transitions[0] != powerStateTransitionAcpiShutdown {
+		t.Fatalf("expected one ACPI_SHUTDOWN v2 transition, got %v", transitions)
+	}
+}
+
+// TestPowerOff_FailsWhenAcpiUnavailable verifies a failed ACPI POST fails
+// PowerOff with no hard-off PUT (same as vSphere/oVirt: no force power-off).
+func TestPowerOff_FailsWhenAcpiUnavailable(t *testing.T) {
+	vmID := powerTestVMID(t, "acpi-404")
+	entity := vmEntityPtr(vmID, powerStateOn)
+	var puts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/clusters/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == prismCentralPath:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/acpi_shutdown"):
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(entity)
+		case r.Method == http.MethodPut:
+			puts++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	if err := client.PowerOff(ref.Ref{ID: vmID}); err == nil {
+		t.Fatal("expected PowerOff to fail when acpi_shutdown returns 404")
+	}
+	if puts != 0 {
+		t.Fatalf("expected no hard-off PUT, got %d", puts)
+	}
+}
+
+// TestPowerOn_SkipsPutWhenAlreadyOn mirrors TestPowerOff_SkipsPutWhenAlreadyOff.
+func TestPowerOn_SkipsPutWhenAlreadyOn(t *testing.T) {
+	vmID := powerTestVMID(t, "skip-on")
+	server, puts, _ := newPowerTestServer(t, vmEntityPtr(vmID, powerStateOn))
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	if err := client.PowerOn(ref.Ref{ID: vmID}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(*puts) != 0 {
+		t.Fatalf("expected no PUT requests, got %d", len(*puts))
+	}
+}
+
+// TestPowerOn_PrismElementUsesV2SetPowerState verifies PE PowerOn uses
+// REST v2.0 set_power_state with ON (PE rejects v3 VM PUT).
+func TestPowerOn_PrismElementUsesV2SetPowerState(t *testing.T) {
+	vmID := powerTestVMID(t, "pe-on")
+	entity := vmEntityPtr(vmID, powerStateOff)
+	var transitions []string
+	var puts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/clusters/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == prismCentralPath:
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/set_power_state"):
+			var body struct {
+				Transition string `json:"transition"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			transitions = append(transitions, body.Transition)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"task_uuid":"pe-task"}`))
+		case r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(entity)
+		case r.Method == http.MethodPut:
+			puts++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	if err := client.PowerOn(ref.Ref{ID: vmID}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if puts != 0 {
+		t.Fatalf("expected no PUT requests, got %d", puts)
+	}
+	if len(transitions) != 1 || transitions[0] != powerStateOn {
+		t.Fatalf("expected one ON v2 transition, got %v", transitions)
+	}
+}
+
+// newImageTestServer serves the connectivity probe plus a minimal v3 image
+// list/create/delete implementation backed by an in-memory store keyed by
+// UUID, for testing the catalog image lifecycle used by PreTransferActions
+// and Finalize.
+func newImageTestServer(t *testing.T, images map[string]libclient.V3Image) *httptest.Server {
+	t.Helper()
+	nextID := 0
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/clusters/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == prismCentralPath:
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/images/list"):
+			var body struct {
+				Filter string `json:"filter"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			entities := make([]libclient.V3Image, 0, len(images))
+			for _, image := range images {
+				if body.Filter == "" || body.Filter == libclient.V3ImageNameFilter(image.Spec.Name) {
+					entities = append(entities, image)
+				}
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(v3ImageListResponse{
+				Entities: entities,
+				Metadata: struct {
+					TotalMatches int `json:"total_matches"`
+				}{TotalMatches: len(entities)},
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/images"):
+			var body v3ImageCreateRequest
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			nextID++
+			uuid := fmt.Sprintf("image-%d", nextID)
+			images[uuid] = testV3Image(uuid, body.Spec.Name, imageStatePending)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodDelete:
+			delete(images, path.Base(r.URL.Path))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+}
+
+// newPrismCentralTestServer serves the connectivity probe, a 200 OK on
+// Prism Central's self-describing endpoint, and a minimal v4 image
+// list/create/delete implementation backed by an in-memory store keyed
+// by extId, for testing the Prism Central catalog image lifecycle used
+// by PreTransferActions/Finalize. A created image has no sizeBytes until
+// a test explicitly sets one (via the images map), mirroring Prism
+// Central not populating it until the image finishes uploading.
+func newPrismCentralTestServer(t *testing.T, images map[string]libclient.ImageV4) *httptest.Server {
+	t.Helper()
+	nextID := 0
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/clusters/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == prismCentralPath:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodGet && r.URL.Path == imagesV4Path:
+			filter := r.URL.Query().Get("$filter")
+			entities := make([]libclient.ImageV4, 0, len(images))
+			for _, image := range images {
+				if filter == "" || filter == fmt.Sprintf("name eq '%s'", image.Name) {
+					entities = append(entities, image)
+				}
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(v4ImageListResponse{Data: entities})
+		case r.Method == http.MethodPost && r.URL.Path == imagesV4Path:
+			var body v4ImageCreateRequest
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			nextID++
+			extID := fmt.Sprintf("image-%d", nextID)
+			images[extID] = libclient.ImageV4{ExtID: extID, Name: body.Name}
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, imagesV4Path+"/"):
+			delete(images, path.Base(r.URL.Path))
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+}
+
+// TestIsPrismElement_DetectsElementViaProbe verifies isPrismElement
+// treats a 404 from prismCentralPath as Prism Element, with no explicit
+// provider setting.
+func TestIsPrismElement_DetectsElementViaProbe(t *testing.T) {
+	server := newImageTestServer(t, map[string]libclient.V3Image{})
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	element, err := client.isPrismElement()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !element {
+		t.Fatal("expected isPrismElement to be true when the prism_central probe returns 404")
+	}
+}
+
+// TestIsPrismElement_ErrorsOnUnexpectedProbeStatus verifies isPrismElement
+// returns an error for non-404, non-200 probe responses.
+func TestIsPrismElement_ErrorsOnUnexpectedProbeStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/clusters/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == prismCentralPath:
+			w.WriteHeader(http.StatusForbidden)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	_, err := client.isPrismElement()
+	if err == nil {
+		t.Fatal("expected an error when the prism_central probe returns 403")
+	}
+}
+
+// TestSetPowerState_PreservesRawJSON verifies setPowerState round-trips the
+// GET body as JSON, changing only power_state and omitting status, while
+// keeping integer fields exact (UseNumber) and dropping empty host_reference.
+func TestSetPowerState_PreservesRawJSON(t *testing.T) {
+	const getBody = `{
+		"api_version": "3.1",
+		"metadata": {"uuid": "uuid-1", "kind": "vm", "spec_version": 42},
+		"spec": {
+			"name": "test-vm",
+			"cluster_reference": {"kind": "cluster", "uuid": "cluster-1", "name": "Unnamed"},
+			"resources": {
+				"power_state": "ON",
+				"host_reference": {},
+				"vtpm_config": {"enabled": true},
+				"disk_list": [{"disk_size_bytes": 42949672960}],
+				"nic_list": [{"uuid": "nic-1", "subnet_reference": {"kind": "subnet", "uuid": "subnet-1"}}]
+			}
+		},
+		"status": {"resources": {"power_state": "ON"}}
+	}`
+	var putRaw []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/clusters/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+		case r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(getBody))
+		case r.Method == http.MethodPut:
+			putRaw, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	if err := client.setPowerState(ref.Ref{ID: "uuid-1"}, powerStateOff); err != nil {
+		t.Fatalf("setPowerState failed: %v", err)
+	}
+	if len(putRaw) == 0 {
+		t.Fatal("expected a PUT body")
+	}
+	var put map[string]any
+	dec := json.NewDecoder(bytes.NewReader(putRaw))
+	dec.UseNumber()
+	if err := dec.Decode(&put); err != nil {
+		t.Fatalf("unmarshal PUT body: %v", err)
+	}
+	if _, ok := put["status"]; ok {
+		t.Fatalf("expected status to be omitted from PUT body, got %s", putRaw)
+	}
+	spec := put["spec"].(map[string]any)
+	resources := spec["resources"].(map[string]any)
+	if resources["power_state"] != powerStateOff {
+		t.Fatalf("expected power_state %q, got %#v", powerStateOff, resources["power_state"])
+	}
+	if _, ok := resources["host_reference"]; ok {
+		t.Fatalf("expected empty host_reference to be omitted, got %s", putRaw)
+	}
+	if _, ok := resources["vtpm_config"]; !ok {
+		t.Fatalf("expected unknown fields like vtpm_config to be preserved, got %s", putRaw)
+	}
+	disks := resources["disk_list"].([]any)
+	disk0 := disks[0].(map[string]any)
+	if disk0["disk_size_bytes"] != json.Number("42949672960") {
+		t.Fatalf("expected disk_size_bytes to stay an exact integer, got %#v", disk0["disk_size_bytes"])
+	}
+	md := put["metadata"].(map[string]any)
+	if md["kind"] != "vm" || md["spec_version"] != json.Number("42") {
+		t.Fatalf("expected metadata kind/spec_version preserved, got %#v", md)
+	}
+	cluster := spec["cluster_reference"].(map[string]any)
+	if cluster["kind"] != "cluster" {
+		t.Fatalf("expected cluster_reference.kind preserved, got %#v", cluster)
+	}
+}
+
+// TestIsPrismElement_DetectsCentralViaProbe verifies isPrismElement
+// treats a 200 response from prismCentralPath as Prism Central.
+func TestIsPrismElement_DetectsCentralViaProbe(t *testing.T) {
+	server := newPrismCentralTestServer(t, map[string]libclient.ImageV4{})
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	element, err := client.isPrismElement()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if element {
+		t.Fatal("expected isPrismElement to be false when the prism_central probe responds 200")
+	}
+}
+
+// TestIsPrismElement_HonorsExplicitProviderSetting verifies an explicit
+// prismType provider setting is trusted over the live probe.
+func TestIsPrismElement_HonorsExplicitProviderSetting(t *testing.T) {
+	server := newImageTestServer(t, map[string]libclient.V3Image{})
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	client.Context.Source.Provider.Spec.Settings = map[string]string{api.NutanixPrismType: api.NutanixPrismCentral}
+
+	element, err := client.isPrismElement()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if element {
+		t.Fatal("expected the explicit prismType=central setting to override probing")
+	}
+}
+
+// TestPreTransferActions_CreatesV4ImagesForPrismCentral mirrors
+// TestPreTransferActions_CreatesImagesAndWaitsForComplete for Prism
+// Central's v4 Image Service: creates one image per non-CDROM disk,
+// reports not ready while sizeBytes is still unset, and reports ready
+// once it's populated.
+func TestPreTransferActions_CreatesV4ImagesForPrismCentral(t *testing.T) {
+	vm := &model.VM{VM1: model.VM1{
+		Disks: []model.Disk{
+			{UUID: "disk-1", DiskSizeBytes: 1024},
+			{UUID: "cdrom-1", IsCdrom: true},
+		},
+	}}
+	images := map[string]libclient.ImageV4{}
+	server := newPrismCentralTestServer(t, images)
+	defer server.Close()
+
+	client := newTestClientWithInventory(server.URL, vm)
+	if err := client.connect(); err != nil {
+		t.Fatalf("unexpected error connecting: %v", err)
+	}
+
+	vmRef := ref.Ref{ID: "vm-1"}
+	ready, err := client.PreTransferActions(vmRef)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ready {
+		t.Fatal("expected ready=false on first call, before the image exists")
+	}
+	if len(images) != 1 {
+		t.Fatalf("expected exactly one image to be created (CDROM should be skipped), got %d", len(images))
+	}
+
+	ready, err = client.PreTransferActions(vmRef)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ready {
+		t.Fatal("expected ready=false while sizeBytes is still unset")
+	}
+
+	for extID, image := range images {
+		image.SizeBytes = 1024
+		images[extID] = image
+	}
+
+	ready, err = client.PreTransferActions(vmRef)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ready {
+		t.Fatal("expected ready=true once sizeBytes is populated")
+	}
+}
+
+// TestFinalize_DeletesV4ImagesForPrismCentral mirrors
+// TestFinalize_DeletesImages for Prism Central's v4 Image Service.
+func TestFinalize_DeletesV4ImagesForPrismCentral(t *testing.T) {
+	vm := &model.VM{VM1: model.VM1{
+		Disks: []model.Disk{
+			{UUID: "disk-1"},
+			{UUID: "cdrom-1", IsCdrom: true},
+		},
+	}}
+	images := map[string]libclient.ImageV4{
+		"image-1": testImageV4(
+			"image-1",
+			migrationImageName(testMigrationUID, ref.Ref{ID: "vm-1"}, "disk-1"),
+			1024,
+		),
+		"image-unrelated": testImageV4("image-unrelated", "unrelated-image", 1024),
+	}
+	server := newPrismCentralTestServer(t, images)
+	defer server.Close()
+
+	client := newTestClientWithInventory(server.URL, vm)
+	if err := client.connect(); err != nil {
+		t.Fatalf("unexpected error connecting: %v", err)
+	}
+
+	client.Finalize([]*planapi.VMStatus{{VM: planapi.VM{Ref: ref.Ref{ID: "vm-1"}}}}, "test-plan")
+
+	if _, found := images["image-1"]; found {
+		t.Fatal("expected the VM's catalog image to be deleted")
+	}
+	if _, found := images["image-unrelated"]; !found {
+		t.Fatal("expected an unrelated image to be left alone")
+	}
+}
+
+func TestFindImageByName_NotFound(t *testing.T) {
+	server := newImageTestServer(t, map[string]libclient.V3Image{})
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	entity, err := client.findImageByName("missing")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if entity != nil {
+		t.Fatal("expected image not to be found")
+	}
+}
+
+func TestFindImageByName_Found(t *testing.T) {
+	images := map[string]libclient.V3Image{
+		"image-1": testV3Image("image-1", testMigrationImageName(ref.Ref{ID: "vm-1"}, "disk-1"), imageStateComplete),
+	}
+	server := newImageTestServer(t, images)
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	entity, err := client.findImageByName(testMigrationImageName(ref.Ref{ID: "vm-1"}, "disk-1"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if entity == nil {
+		t.Fatal("expected image to be found")
+		return
+	}
+	if entity.Metadata.UUID != "image-1" {
+		t.Fatalf("expected uuid image-1, got %s", entity.Metadata.UUID)
+	}
+	if entity.Status.State != imageStateComplete {
+		t.Fatalf("expected state %s, got %s", imageStateComplete, entity.Status.State)
+	}
+}
+
+func TestCreateImage_PostsExpectedBody(t *testing.T) {
+	images := map[string]libclient.V3Image{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/clusters/list"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/images"):
+			var body v3ImageCreateRequest
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode create body: %v", err)
+			}
+			if body.Spec.Name != "forklift-migration-vm-1-disk-1" {
+				t.Errorf("unexpected image name: %q", body.Spec.Name)
+			}
+			if body.Spec.Resources.ImageType != "DISK_IMAGE" {
+				t.Errorf("expected image_type DISK_IMAGE, got %q", body.Spec.Resources.ImageType)
+			}
+			if body.Spec.Resources.DataSourceReference.Kind != "vm_disk" ||
+				body.Spec.Resources.DataSourceReference.UUID != "disk-uuid-1" {
+				t.Errorf("unexpected data_source_reference: %+v", body.Spec.Resources.DataSourceReference)
+			}
+			images["image-1"] = testV3Image("image-1", body.Spec.Name, imageStatePending)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	client := newConnectedTestClient(t, server.URL)
+	if err := client.createImage("forklift-migration-vm-1-disk-1", "disk-uuid-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(images) != 1 {
+		t.Fatalf("expected exactly one image to be created, got %d", len(images))
+	}
+}
+
+// TestPreTransferActions_CreatesImagesAndWaitsForComplete verifies
+// PreTransferActions creates one image per non-CDROM disk, reports not
+// ready while any image is still pending, and reports ready once every
+// image has transitioned to COMPLETE -- without needing to change the VM
+// disk list between polls (as the migration controller reconciles).
+func TestPreTransferActions_CreatesImagesAndWaitsForComplete(t *testing.T) {
+	vm := &model.VM{VM1: model.VM1{
+		Disks: []model.Disk{
+			{UUID: "disk-1", DiskSizeBytes: 1024},
+			{UUID: "cdrom-1", IsCdrom: true},
+		},
+	}}
+	images := map[string]libclient.V3Image{}
+	server := newImageTestServer(t, images)
+	defer server.Close()
+
+	client := newTestClientWithInventory(server.URL, vm)
+	if err := client.connect(); err != nil {
+		t.Fatalf("unexpected error connecting: %v", err)
+	}
+
+	vmRef := ref.Ref{ID: "vm-1"}
+	ready, err := client.PreTransferActions(vmRef)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ready {
+		t.Fatal("expected ready=false on first call, before the image exists")
+	}
+	if len(images) != 1 {
+		t.Fatalf("expected exactly one image to be created (CDROM should be skipped), got %d", len(images))
+	}
+
+	ready, err = client.PreTransferActions(vmRef)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ready {
+		t.Fatal("expected ready=false while the image is still PENDING")
+	}
+
+	for uuid, image := range images {
+		image.Status.State = imageStateComplete
+		images[uuid] = image
+	}
+
+	ready, err = client.PreTransferActions(vmRef)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ready {
+		t.Fatal("expected ready=true once the image is COMPLETE")
+	}
+}
+
+// TestPreTransferActions_ErrorsOnImageError verifies a failed image
+// creation surfaces as an error rather than looping forever.
+func TestPreTransferActions_ErrorsOnImageError(t *testing.T) {
+	vm := &model.VM{VM1: model.VM1{Disks: []model.Disk{{UUID: "disk-1"}}}}
+	images := map[string]libclient.V3Image{
+		"image-1": testV3Image("image-1", testMigrationImageName(ref.Ref{ID: "vm-1"}, "disk-1"), imageStateError),
+	}
+	server := newImageTestServer(t, images)
+	defer server.Close()
+
+	client := newTestClientWithInventory(server.URL, vm)
+	if err := client.connect(); err != nil {
+		t.Fatalf("unexpected error connecting: %v", err)
+	}
+
+	if _, err := client.PreTransferActions(ref.Ref{ID: "vm-1"}); err == nil {
+		t.Fatal("expected an error when the catalog image failed to create")
+	}
+}
+
+// TestFinalize_DeletesImages verifies Finalize deletes each non-CDROM
+// disk's catalog image and leaves unrelated images untouched.
+func TestFinalize_DeletesImages(t *testing.T) {
+	vm := &model.VM{VM1: model.VM1{
+		Disks: []model.Disk{
+			{UUID: "disk-1"},
+			{UUID: "cdrom-1", IsCdrom: true},
+		},
+	}}
+	images := map[string]libclient.V3Image{
+		"image-1": testV3Image(
+			"image-1",
+			migrationImageName(testMigrationUID, ref.Ref{ID: "vm-1"}, "disk-1"),
+			imageStateComplete,
+		),
+		"image-unrelated": testV3Image("image-unrelated", "unrelated-image", imageStateComplete),
+	}
+	server := newImageTestServer(t, images)
+	defer server.Close()
+
+	client := newTestClientWithInventory(server.URL, vm)
+	if err := client.connect(); err != nil {
+		t.Fatalf("unexpected error connecting: %v", err)
+	}
+
+	client.Finalize([]*planapi.VMStatus{{VM: planapi.VM{Ref: ref.Ref{ID: "vm-1"}}}}, "test-plan")
+
+	if _, found := images["image-1"]; found {
+		t.Fatal("expected the VM's catalog image to be deleted")
+	}
+	if _, found := images["image-unrelated"]; !found {
+		t.Fatal("expected an unrelated image to be left alone")
+	}
+}
+
+func TestMigrationImageNameWithinLimit(t *testing.T) {
+	name := migrationImageName(
+		testMigrationUID,
+		ref.Ref{ID: "52472f87-a3db-4895-5dd8-eef2efa0e157"},
+		"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+	)
+	if len(name) >= migrationImageNameMaxLen {
+		t.Fatalf("expected name length < %d, got %d", migrationImageNameMaxLen, len(name))
+	}
+}

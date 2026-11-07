@@ -18,3 +18,11 @@
 0014-spectro-build-ovirt-populator-with-Go-1.26.10.patch
 0016-spectro-let-virt-v2v-copy-vSphere-disks-when-no-VDDK.patch
 0015-spectro-bump-golang.org-x-deps-and-spdystream-for-PV.patch
+0017-spectro-add-the-Nutanix-AHV-provider-upstream-backpo.patch
+0018-spectro-adapt-the-Nutanix-backport-to-APIs-our-fork-.patch
+0019-spectro-bump-containerized-data-importer-api-to-v1.6.patch
+0020-spectro-skip-TLS-verification-on-Nutanix-CDI-imports.patch
+0021-spectro-fix-Nutanix-review-findings-in-the-conversio.patch
+0022-spectro-validate-Nutanix-storage-and-network-mapping.patch
+0023-spectro-skip-the-importer-restart-limit-after-a-cred.patch
+0024-spectro-stop-flagging-DHCP-only-Nutanix-VMs-for-miss.patch

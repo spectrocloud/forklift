@@ -41,6 +41,7 @@ import (
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	libref "github.com/kubev2v/forklift/pkg/lib/ref"
 	"github.com/kubev2v/forklift/pkg/settings"
+	v2vconfig "github.com/kubev2v/forklift/pkg/virt-v2v/config"
 	template "github.com/openshift/api/template/v1"
 	"github.com/openshift/library-go/pkg/template/generator"
 	"github.com/openshift/library-go/pkg/template/templateprocessing"
@@ -171,6 +172,18 @@ const (
 	VddkAioBufSizeDefault  = "16"
 	VddkAioBufCountDefault = "4"
 )
+
+// in-place conversion constants
+const (
+	// LibvirtDomainXML is the volume/configmap name for the libvirt domain XML.
+	LibvirtDomainXML = "libvirt-domain-xml"
+	// AnnLibvirtDomainXML labels the ConfigMap that carries the libvirt domain XML.
+	AnnLibvirtDomainXML = "forklift.konveyor.io/libvirt-domain-xml"
+)
+
+// V2vInPlaceLibvirtDomain is the path where virt-v2v-in-place expects the domain XML.
+// Shared with the virt-v2v binary via pkg/virt-v2v/config.
+const V2vInPlaceLibvirtDomain = v2vconfig.V2vInPlaceLibvirtDomain
 
 // VirtV2V pod types (aliases for the canonical constants in the conversion/context package).
 const (
@@ -1951,6 +1964,16 @@ func (r *KubeVirt) EnsureDataVolumes(vm *plan.VMStatus, dataVolumes []cdi.DataVo
 				"vm",
 				vm.String())
 		}
+		// Nutanix sets a DataVolume owner reference on Prism Central download-cookie
+		// Secrets so they are GC'd with the DV; other providers no-op.
+		if adoptErr := r.Builder.AdoptDownloadCookieSecretOwner(&dv); adoptErr != nil {
+			r.Log.Error(
+				adoptErr,
+				"Failed to set download cookie secret owner reference.",
+				"dv.name", dv.Name,
+				"dv.namespace", dv.Namespace,
+				"vm", vm.String())
+		}
 	}
 	return
 }
@@ -2041,6 +2064,61 @@ func (r *KubeVirt) ensureVddkConfigMap() (configMap *core.ConfigMap, err error) 
 			),
 		)
 	}
+	return
+}
+
+// ensureDomainXMLConfigMap stores a libvirt domain XML string in a ConfigMap
+// in the target namespace, creating or updating as needed. The ConfigMap is
+// keyed by "input.xml" so it can be mounted directly at V2vInPlaceLibvirtDomain
+// (/tmp/input.xml) inside the conversion pod.
+func (r *KubeVirt) ensureDomainXMLConfigMap(vmRef ref.Ref, domainXML string) (configMap *core.ConfigMap, err error) {
+	labels := r.vmLabels(vmRef)
+	labels[AnnLibvirtDomainXML] = "true"
+
+	list := &core.ConfigMapList{}
+	err = r.Destination.List(
+		context.TODO(),
+		list,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(labels),
+			Namespace:     r.Plan.Spec.TargetNamespace,
+		},
+	)
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+
+	if len(list.Items) > 0 {
+		configMap = &list.Items[0]
+		configMap.Data = map[string]string{"input.xml": domainXML}
+		err = r.Destination.Update(context.TODO(), configMap)
+		if err != nil {
+			err = liberr.Wrap(err)
+		}
+		return
+	}
+
+	configMap = &core.ConfigMap{
+		ObjectMeta: meta.ObjectMeta{
+			Labels:    labels,
+			Namespace: r.Plan.Spec.TargetNamespace,
+			GenerateName: strings.Join([]string{
+				r.Plan.Name,
+				vmRef.ID,
+			}, "-") + "-",
+		},
+		Data: map[string]string{"input.xml": domainXML},
+	}
+	err = r.Destination.Create(context.TODO(), configMap)
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+	r.Log.V(1).Info(
+		"Nutanix domain XML ConfigMap created.",
+		"configMap", path.Join(configMap.Namespace, configMap.Name),
+		"vm", vmRef.String())
 	return
 }
 
@@ -2274,7 +2352,7 @@ func shouldRequestKVM(provider *api.Provider) bool {
 		return false
 	}
 	switch provider.Type() {
-	case api.VSphere, api.Ova, api.HyperV:
+	case api.VSphere, api.Ova, api.HyperV, api.Nutanix:
 		return true
 	default:
 		return false
@@ -3561,6 +3639,42 @@ func (r *KubeVirt) podVolumeMounts(vmVolumes []cnv.Volume, vddkConfigmap *core.C
 					MountPath: fmt.Sprintf("/mnt/%s", VddkConf),
 				},
 			)
+		}
+	}
+
+	// mount libvirt xml definition if supported by source provider
+	if r.Builder != nil {
+		var xmlStr string
+		xmlStr, err = r.Builder.DomainXML(vm.Ref, pvcs)
+		if err != nil {
+			return
+		}
+		if xmlStr != "" {
+			var domainCM *core.ConfigMap
+			domainCM, err = r.ensureDomainXMLConfigMap(vm.Ref, xmlStr)
+			if err != nil {
+				return
+			}
+			domainVol := core.Volume{
+				Name: LibvirtDomainXML,
+				VolumeSource: core.VolumeSource{
+					ConfigMap: &core.ConfigMapVolumeSource{
+						LocalObjectReference: core.LocalObjectReference{
+							Name: domainCM.Name,
+						},
+					},
+				},
+			}
+			domainMount := core.VolumeMount{
+				Name:      LibvirtDomainXML,
+				MountPath: V2vInPlaceLibvirtDomain,
+				SubPath:   "input.xml",
+				ReadOnly:  true,
+			}
+			volumes = append(volumes, domainVol)
+			mounts = append(mounts, domainMount)
+			extraVolumes = append(extraVolumes, domainVol)
+			extraMounts = append(extraMounts, domainMount)
 		}
 	}
 

@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 22:56:16 -0800
+Subject: [PATCH] spectro: bump containerized-data-importer-api to v1.66.1
+
+v1.66.0 adds DataVolumeSourceHTTP.InsecureSkipVerify, which the Nutanix
+importer needs. The module only requires k8s.io/api and apimachinery
+v0.31.5, below ours, so nothing else moves.
+
+Resolves: None
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ go.mod | 2 +-
+ go.sum | 4 ++++
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/go.mod b/go.mod
+index 60811687b..493cd9f34 100644
+--- a/go.mod
++++ b/go.mod
+@@ -58,7 +58,7 @@ require (
+ 	k8s.io/klog/v2 v2.130.1
+ 	k8s.io/utils v0.0.0-20241104100929-3ea5e8cea738
+ 	kubevirt.io/api v1.6.0-beta.0.0.20250702170314-dd941825f5d3
+-	kubevirt.io/containerized-data-importer-api v1.63.1-0.20251115214221-0b4e9b5c9c59
++	kubevirt.io/containerized-data-importer-api v1.66.1
+ 	libvirt.org/go/libvirt v1.10009.1
+ 	libvirt.org/go/libvirtxml v1.11009.0
+ 	modernc.org/sqlite v1.39.1
+diff --git a/go.sum b/go.sum
+index 714b0cd5f..13599d102 100644
+--- a/go.sum
++++ b/go.sum
+@@ -546,6 +546,7 @@ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qq
+ github.com/rogpeppe/fastuuid v0.0.0-20150106093220-6724a57986af/go.mod h1:XWv6SoW27p1b0cqNHllgS5HIMJraePCO15w5zCzIWYg=
+ github.com/rogpeppe/go-internal v1.13.1 h1:KvO1DLK/DRN07sQ1LQKScxyZJuNnedQ5/wKSR38lUII=
+ github.com/rogpeppe/go-internal v1.13.1/go.mod h1:uMEvuHeurkdAXX61udpOXGD/AzZDWNMNyH2VO9fmH0o=
++github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=
+ github.com/russross/blackfriday v1.5.2/go.mod h1:JO/DiYxRf+HjHt06OyowR9PTA263kcR/rfWxYHBV53g=
+ github.com/russross/blackfriday/v2 v2.0.1/go.mod h1:+Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
+ github.com/sergi/go-diff v1.0.0/go.mod h1:0CfEIISq7TuYL3j771MWULgwwjU+GofnZX9QAmXWZgo=
+@@ -593,6 +594,7 @@ github.com/stretchr/testify v1.8.1/go.mod h1:w2LPCIKwWwSfY2zedu0+kehJoqGctiVI29o
+ github.com/stretchr/testify v1.8.4/go.mod h1:sz/lmYIOXD/1dqDmKjjqLyZ2RngseejIcXlSw2iwfAo=
+ github.com/stretchr/testify v1.10.0 h1:Xv5erBjTwe/5IxqUQTdXv5kgmIvbHo3QQyRwhJsOfJA=
+ github.com/stretchr/testify v1.10.0/go.mod h1:r2ic/lqez/lEtzL7wO/rwa5dbSLXVDPFyf8C91i36aY=
++github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
+ github.com/tidwall/gjson v1.18.0 h1:FIDeeyB800efLX89e5a8Y0BNH+LOngJyGrIWxG2FKQY=
+ github.com/tidwall/gjson v1.18.0/go.mod h1:/wbyibRr2FHMks5tjHJ5F8dMZh3AcwJEMf5vlfC0lxk=
+ github.com/tidwall/match v1.1.1 h1:+Ho715JplO36QYgwN9PGYNhgZvoUSc9X2c80KVTi+GA=
+@@ -959,6 +961,8 @@ kubevirt.io/api v1.6.0-beta.0.0.20250702170314-dd941825f5d3 h1:7DeToiNAgDlkShV0X
+ kubevirt.io/api v1.6.0-beta.0.0.20250702170314-dd941825f5d3/go.mod h1:NU90RB72PMMTfN6jN5ca1HLyBqW7aj6RypJlF9QYNhc=
+ kubevirt.io/containerized-data-importer-api v1.63.1-0.20251115214221-0b4e9b5c9c59 h1:dEVxWfRRNzrUzQKYjKQ9Olv2zAdnD+8hz5Y11vKvq88=
+ kubevirt.io/containerized-data-importer-api v1.63.1-0.20251115214221-0b4e9b5c9c59/go.mod h1:VGp35wxpLXU18b7cnEpmcThI3AjcZUSfg/Zfql44U4o=
++kubevirt.io/containerized-data-importer-api v1.66.1 h1:30b6xBXJPilLZykUabDjU0wV7rINlPTV2jySlye1P38=
++kubevirt.io/containerized-data-importer-api v1.66.1/go.mod h1:NKj7UdbTzu08JsBGeu3WxSu6qPZ4+w673Ha7Z55JvlA=
+ kubevirt.io/controller-lifecycle-operator-sdk/api v0.0.0-20220329064328-f3cc58c6ed90 h1:QMrd0nKP0BGbnxTqakhDZAUhGKxPiPiN5gSDqKUmGGc=
+ kubevirt.io/controller-lifecycle-operator-sdk/api v0.0.0-20220329064328-f3cc58c6ed90/go.mod h1:018lASpFYBsYN6XwmA2TIrPCx6e0gviTd/ZNtSitKgc=
+ libvirt.org/go/libvirt v1.10009.1 h1:Z79EnxEVE190MeULGoq1GY0tb+O18FpYzUNYDHgkrN8=

@@ -49,6 +49,16 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, configMap *cor
 	return nil, nil
 }
 
+// AdoptDownloadCookieSecretOwner is a no-op for EC2 - EC2 doesn't create CDI DataVolumes.
+func (r *Builder) AdoptDownloadCookieSecretOwner(_ *cdi.DataVolume) error {
+	return nil
+}
+
+// RefreshImportCredentials is a no-op for EC2 - EC2 doesn't create CDI DataVolumes.
+func (r *Builder) RefreshImportCredentials(_ *cdi.DataVolume) (bool, error) {
+	return false, nil
+}
+
 // ResolveDataVolumeIdentifier is a no-op for EC2 - EC2 doesn't create DataVolumes, so nothing to resolve.
 func (r *Builder) ResolveDataVolumeIdentifier(dv *cdi.DataVolume) string {
 	return ""
@@ -57,4 +67,9 @@ func (r *Builder) ResolveDataVolumeIdentifier(dv *cdi.DataVolume) string {
 // NO-OP
 func (r *Builder) SourceVMLabelsAndAnnotations(vmRef ref.Ref, tagMapping *api.TagMapping) (labels map[string]string, annotations map[string]string, sanitizationReport map[string]string, err error) {
 	return
+}
+
+// NO-OP
+func (r *Builder) DomainXML(vmRef ref.Ref, pvcs []*core.PersistentVolumeClaim) (string, error) {
+	return "", nil
 }

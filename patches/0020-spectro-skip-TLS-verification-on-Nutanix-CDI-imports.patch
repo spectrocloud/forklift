@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 22:56:16 -0800
+Subject: [PATCH] spectro: skip TLS verification on Nutanix CDI imports
+
+With insecureSkipVerify set, the Nutanix builder pinned Prism's leaf
+certificate in the CDI cert ConfigMap and left verification on. That
+cannot work against Prism's factory certificate: CN=*.nutanix.local with
+no SANs, which Go rejects for any host, so the importer failed with
+"x509: cannot validate certificate for <ip> because it doesn't contain
+any IP SANs".
+
+Set InsecureSkipVerify on the HTTP source instead, which CDI v1.66+
+honours for the data transfer. Pinning stays as the fallback for older
+CDI releases, which drop the unknown field.
+
+Resolves: None
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../plan/adapter/nutanix/builder.go           | 19 ++++++++++++++++---
+ .../plan/adapter/nutanix/builder_test.go      | 17 +++++++++++++++++
+ 2 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/pkg/controller/plan/adapter/nutanix/builder.go b/pkg/controller/plan/adapter/nutanix/builder.go
+index 82bda0fd7..c6347d4c8 100644
+--- a/pkg/controller/plan/adapter/nutanix/builder.go
++++ b/pkg/controller/plan/adapter/nutanix/builder.go
+@@ -104,9 +104,9 @@ func (r *Builder) Secret(_ ref.Ref, in, object *core.Secret) error {
+ // ConfigMap carries a CA certificate for CDI's HTTP importer to trust when
+ // downloading catalog images. In secure mode (no insecureSkipVerify), only
+ // ca.crt from the provider secret is copied; CDI verifies import TLS against
+-// that bundle. When insecureSkipVerify is set, DataVolumes() may fetch and
+-// pin leaf certificates from import endpoints (CDI HTTP import has no
+-// insecureSkipVerify field).
++// that bundle. When insecureSkipVerify is set, DataVolumes() turns off
++// verification on the HTTP source and also pins the import endpoints' leaf
++// certificates for CDI releases that predate that field.
+ func (r *Builder) ConfigMap(_ ref.Ref, in *core.Secret, object *core.ConfigMap) error {
+ 	if cacert, found := libutil.GetCACert(in); found && len(cacert) > 0 {
+ 		setCDICACerts(object, cacert)
+@@ -650,6 +650,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, configMap *cor
+ 		if err != nil {
+ 			return nil, liberr.Wrap(err, "vm", vmRef.String(), "disk", disk.UUID)
+ 		}
++		setInsecureSkipVerify(httpSource, r.Source.Secret)
+ 
+ 		dv := r.mapDataVolume(disk, destination, dvTemplate, httpSource, diskIndex)
+ 		dvs = append(dvs, *dv)
+@@ -659,6 +660,18 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, configMap *cor
+ 	return dvs, nil
+ }
+ 
++// setInsecureSkipVerify carries the provider's insecureSkipVerify onto the
++// CDI HTTP source. Pinning the endpoint certificate is not enough on its own:
++// Prism's factory certificate (CN=*.nutanix.local) has no SANs, so Go's
++// hostname check rejects it for any provider URL. CDI releases without this
++// field drop it and fall back to the pinned certificate.
++func setInsecureSkipVerify(source *cdi.DataVolumeSourceHTTP, secret *core.Secret) {
++	if providerbase.GetInsecureSkipVerifyFlag(secret) {
++		insecure := true
++		source.InsecureSkipVerify = &insecure
++	}
++}
++
+ // elementHTTPSource builds a DataVolumeSourceHTTP pointing at a Prism
+ // Element catalog image's v3 file download endpoint, authenticated with
+ // the same Basic Auth credentials as the rest of the provider's API.
+diff --git a/pkg/controller/plan/adapter/nutanix/builder_test.go b/pkg/controller/plan/adapter/nutanix/builder_test.go
+index 0dd60a6be..9a971ecdf 100644
+--- a/pkg/controller/plan/adapter/nutanix/builder_test.go
++++ b/pkg/controller/plan/adapter/nutanix/builder_test.go
+@@ -17,6 +17,7 @@ import (
+ 	core "k8s.io/api/core/v1"
+ 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	cnv "kubevirt.io/api/core/v1"
++	cdi "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
+ 	libvirtxml "libvirt.org/go/libvirtxml"
+ )
+ 
+@@ -369,6 +370,22 @@ func TestBuildImportCertBundleMergesProviderAndFetch(t *testing.T) {
+ 	}
+ }
+ 
++func TestSetInsecureSkipVerify(t *testing.T) {
++	insecure := &core.Secret{Data: map[string][]byte{"insecureSkipVerify": []byte("true")}}
++	source := &cdi.DataVolumeSourceHTTP{}
++	setInsecureSkipVerify(source, insecure)
++	if source.InsecureSkipVerify == nil || !*source.InsecureSkipVerify {
++		t.Fatalf("expected insecureSkipVerify on the HTTP source, got %v", source.InsecureSkipVerify)
++	}
++
++	secure := &core.Secret{Data: map[string][]byte{"ca.crt": []byte("ca")}}
++	source = &cdi.DataVolumeSourceHTTP{}
++	setInsecureSkipVerify(source, secure)
++	if source.InsecureSkipVerify != nil {
++		t.Fatalf("expected verification left on for a secure provider, got %v", *source.InsecureSkipVerify)
++	}
++}
++
+ func TestAppendUniqueImportCertURLByHost(t *testing.T) {
+ 	seen := map[string]struct{}{}
+ 	var urls []string
