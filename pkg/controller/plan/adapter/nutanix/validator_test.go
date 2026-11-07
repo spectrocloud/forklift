@@ -5,6 +5,8 @@ import (
 
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
+	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
+	invmodel "github.com/kubev2v/forklift/pkg/controller/provider/model/nutanix"
 	model "github.com/kubev2v/forklift/pkg/controller/provider/web/nutanix"
 )
 
@@ -56,5 +58,35 @@ func TestNICsMapped(t *testing.T) {
 	}
 	if !nicsMapped(&model.VM{}, networkMapFor()) {
 		t.Error("expected a VM without NICs to be mapped")
+	}
+}
+
+func TestStaticIPsPreserved(t *testing.T) {
+	ignored := api.NetworkPair{
+		Source:      api.NetworkSourceRef{Ref: ref.Ref{ID: "subnet-ignored"}},
+		Destination: api.DestinationNetwork{Type: "ignored"},
+	}
+	ctx := &plancontext.Context{Plan: &api.Plan{}}
+	ctx.Plan.Spec.PreserveStaticIPs = true
+	ctx.Map.Network = networkMapFor(ignored)
+
+	static := []invmodel.StaticIPConfig{{IP: "10.0.0.5", Prefix: 24, Gateway: "10.0.0.1"}}
+
+	dhcpOnly := &model.VM{}
+	dhcpOnly.NICs = []model.NIC{{SubnetUUID: "subnet-a", IPAddresses: []string{"10.0.0.7"}}}
+	if !staticIPsPreserved(dhcpOnly, ctx) {
+		t.Error("expected a DHCP-only VM to pass: there is nothing to preserve")
+	}
+
+	withStatic := &model.VM{}
+	withStatic.NICs = []model.NIC{{SubnetUUID: "subnet-a", StaticIPConfigs: static}}
+	if !staticIPsPreserved(withStatic, ctx) {
+		t.Error("expected a static IP on a migrated NIC to pass")
+	}
+
+	onlyIgnored := &model.VM{}
+	onlyIgnored.NICs = []model.NIC{{SubnetUUID: "subnet-ignored", StaticIPConfigs: static}}
+	if staticIPsPreserved(onlyIgnored, ctx) {
+		t.Error("expected static IPs only on an ignored NIC to be reported")
 	}
 }

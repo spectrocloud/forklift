@@ -97,15 +97,24 @@ func (r *Validator) StaticIPs(vmRef ref.Ref) (bool, error) {
 	if err := r.Source.Inventory.Find(vm, vmRef); err != nil {
 		return false, liberr.Wrap(err, "vm", vmRef.String())
 	}
+	return staticIPsPreserved(vm, r.Context), nil
+}
+
+// staticIPsPreserved reports whether the VM's static IPs can be preserved:
+// true when a preserved NIC carries them, and true when the VM has no static
+// IPs at all (DHCP only), since there is nothing to preserve.
+func staticIPsPreserved(vm *model.VM, ctx *plancontext.Context) bool {
+	hasStatic := false
 	for _, nic := range vm.NICs {
-		if !nicPreservesStaticIP(nic, r.Context) {
+		if len(nic.StaticIPConfigs) == 0 {
 			continue
 		}
-		if len(nic.StaticIPConfigs) > 0 {
-			return true, nil
+		hasStatic = true
+		if nicPreservesStaticIP(nic, ctx) {
+			return true
 		}
 	}
-	return false, nil
+	return !hasStatic
 }
 
 func (r *Validator) UdnStaticIPs(_ ref.Ref, _ client.Client) (bool, error) {
