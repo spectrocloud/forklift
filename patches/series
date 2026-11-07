@@ -25,3 +25,4 @@
 0021-spectro-fix-Nutanix-review-findings-in-the-conversio.patch
 0022-spectro-validate-Nutanix-storage-and-network-mapping.patch
 0023-spectro-skip-the-importer-restart-limit-after-a-cred.patch
+0024-spectro-stop-flagging-DHCP-only-Nutanix-VMs-for-miss.patch
