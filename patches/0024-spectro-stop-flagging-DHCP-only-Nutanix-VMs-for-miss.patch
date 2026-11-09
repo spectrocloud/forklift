@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 16:24:08 -0800
+Subject: [PATCH] spectro: stop flagging DHCP-only Nutanix VMs for missing
+ guest IPs
+
+With preserveStaticIPs set, the Nutanix StaticIPs validator returned
+false whenever no preserved NIC had a static IP. A VM that only uses
+DHCP has nothing to preserve, but plan validation still listed it under
+"Guest information on vNICs is missing".
+
+Return true when the VM has no static IPs at all, as the vSphere
+validator does. Static IPs that exist only on NICs mapped to "ignored"
+are still reported.
+
+Resolves: None
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../plan/adapter/nutanix/validator.go         | 17 +++++++---
+ .../plan/adapter/nutanix/validator_test.go    | 32 +++++++++++++++++++
+ 2 files changed, 45 insertions(+), 4 deletions(-)
+
+diff --git a/pkg/controller/plan/adapter/nutanix/validator.go b/pkg/controller/plan/adapter/nutanix/validator.go
+index a668532ec..f40b54195 100644
+--- a/pkg/controller/plan/adapter/nutanix/validator.go
++++ b/pkg/controller/plan/adapter/nutanix/validator.go
+@@ -97,15 +97,24 @@ func (r *Validator) StaticIPs(vmRef ref.Ref) (bool, error) {
+ 	if err := r.Source.Inventory.Find(vm, vmRef); err != nil {
+ 		return false, liberr.Wrap(err, "vm", vmRef.String())
+ 	}
++	return staticIPsPreserved(vm, r.Context), nil
++}
++
++// staticIPsPreserved reports whether the VM's static IPs can be preserved:
++// true when a preserved NIC carries them, and true when the VM has no static
++// IPs at all (DHCP only), since there is nothing to preserve.
++func staticIPsPreserved(vm *model.VM, ctx *plancontext.Context) bool {
++	hasStatic := false
+ 	for _, nic := range vm.NICs {
+-		if !nicPreservesStaticIP(nic, r.Context) {
++		if len(nic.StaticIPConfigs) == 0 {
+ 			continue
+ 		}
+-		if len(nic.StaticIPConfigs) > 0 {
+-			return true, nil
++		hasStatic = true
++		if nicPreservesStaticIP(nic, ctx) {
++			return true
+ 		}
+ 	}
+-	return false, nil
++	return !hasStatic
+ }
+ 
+ func (r *Validator) UdnStaticIPs(_ ref.Ref, _ client.Client) (bool, error) {
+diff --git a/pkg/controller/plan/adapter/nutanix/validator_test.go b/pkg/controller/plan/adapter/nutanix/validator_test.go
+index d1a3d4d04..fa02f38e5 100644
+--- a/pkg/controller/plan/adapter/nutanix/validator_test.go
++++ b/pkg/controller/plan/adapter/nutanix/validator_test.go
+@@ -5,6 +5,8 @@ import (
+ 
+ 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
+ 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
++	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
++	invmodel "github.com/kubev2v/forklift/pkg/controller/provider/model/nutanix"
+ 	model "github.com/kubev2v/forklift/pkg/controller/provider/web/nutanix"
+ )
+ 
+@@ -58,3 +60,33 @@ func TestNICsMapped(t *testing.T) {
+ 		t.Error("expected a VM without NICs to be mapped")
+ 	}
+ }
++
++func TestStaticIPsPreserved(t *testing.T) {
++	ignored := api.NetworkPair{
++		Source:      api.NetworkSourceRef{Ref: ref.Ref{ID: "subnet-ignored"}},
++		Destination: api.DestinationNetwork{Type: "ignored"},
++	}
++	ctx := &plancontext.Context{Plan: &api.Plan{}}
++	ctx.Plan.Spec.PreserveStaticIPs = true
++	ctx.Map.Network = networkMapFor(ignored)
++
++	static := []invmodel.StaticIPConfig{{IP: "10.0.0.5", Prefix: 24, Gateway: "10.0.0.1"}}
++
++	dhcpOnly := &model.VM{}
++	dhcpOnly.NICs = []model.NIC{{SubnetUUID: "subnet-a", IPAddresses: []string{"10.0.0.7"}}}
++	if !staticIPsPreserved(dhcpOnly, ctx) {
++		t.Error("expected a DHCP-only VM to pass: there is nothing to preserve")
++	}
++
++	withStatic := &model.VM{}
++	withStatic.NICs = []model.NIC{{SubnetUUID: "subnet-a", StaticIPConfigs: static}}
++	if !staticIPsPreserved(withStatic, ctx) {
++		t.Error("expected a static IP on a migrated NIC to pass")
++	}
++
++	onlyIgnored := &model.VM{}
++	onlyIgnored.NICs = []model.NIC{{SubnetUUID: "subnet-ignored", StaticIPConfigs: static}}
++	if staticIPsPreserved(onlyIgnored, ctx) {
++		t.Error("expected static IPs only on an ignored NIC to be reported")
++	}
++}

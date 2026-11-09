@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 10:18:50 -0800
+Subject: [PATCH] spectro: fix Nutanix re-review findings in ConfigMaps and
+ inventory
+
+- Label the libvirt domain-XML ConfigMap resource=vm-domain-xml instead
+  of inheriting vm-config from vmLabels. ensureConfigMap selects the CDI
+  cert ConfigMap by vmLabels and takes the first match, so a leftover
+  domain-XML ConfigMap could be handed to CDI as certConfigMap, which
+  has no ca.pem and fails a secure Prism import.
+- Return storage container listing errors from the Nutanix collector.
+  The error was logged and dropped, which marked the provider ready with
+  no storage inventory; plan validation then reported the disks as
+  unmapped instead of the inventory failure.
+
+Resolves: None
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../plan/domain_xml_configmap_test.go         | 48 +++++++++++++++++++
+ pkg/controller/plan/kubevirt.go               |  4 ++
+ .../provider/container/nutanix/collector.go   |  6 ++-
+ .../container/nutanix/collector_test.go       | 20 ++++++++
+ 4 files changed, 76 insertions(+), 2 deletions(-)
+ create mode 100644 pkg/controller/plan/domain_xml_configmap_test.go
+
+diff --git a/pkg/controller/plan/domain_xml_configmap_test.go b/pkg/controller/plan/domain_xml_configmap_test.go
+new file mode 100644
+index 000000000..9ec35ee96
+--- /dev/null
++++ b/pkg/controller/plan/domain_xml_configmap_test.go
+@@ -0,0 +1,48 @@
++package plan
++
++import (
++	"context"
++	"testing"
++
++	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
++	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
++	v1 "k8s.io/api/core/v1"
++	k8slabels "k8s.io/apimachinery/pkg/labels"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++)
++
++// The CDI cert ConfigMap is looked up by vmLabels; the domain-XML ConfigMap
++// for the same VM must never match that selector.
++func TestDomainXMLConfigMapNotSelectedAsCertConfigMap(t *testing.T) {
++	kv := createKubeVirtWithProvider(v1beta1.Nutanix)
++	vmRef := ref.Ref{ID: "vm-1"}
++
++	created, err := kv.ensureDomainXMLConfigMap(vmRef, "<domain/>")
++	if err != nil {
++		t.Fatalf("ensureDomainXMLConfigMap: %v", err)
++	}
++
++	list := &v1.ConfigMapList{}
++	err = kv.Destination.List(context.TODO(), list, &client.ListOptions{
++		LabelSelector: k8slabels.SelectorFromSet(kv.vmLabels(vmRef)),
++		Namespace:     kv.Plan.Spec.TargetNamespace,
++	})
++	if err != nil {
++		t.Fatalf("list: %v", err)
++	}
++	if len(list.Items) != 0 {
++		t.Fatalf("cert ConfigMap selector matched the domain-XML ConfigMap: %+v", list.Items[0].Labels)
++	}
++
++	// It still finds and updates its own ConfigMap.
++	updated, err := kv.ensureDomainXMLConfigMap(vmRef, "<domain type='kvm'/>")
++	if err != nil {
++		t.Fatalf("second ensureDomainXMLConfigMap: %v", err)
++	}
++	if updated.Name != created.Name {
++		t.Fatalf("expected the same ConfigMap, got %q then %q", created.Name, updated.Name)
++	}
++	if updated.Data["input.xml"] != "<domain type='kvm'/>" {
++		t.Fatalf("input.xml not updated: %q", updated.Data["input.xml"])
++	}
++}
+diff --git a/pkg/controller/plan/kubevirt.go b/pkg/controller/plan/kubevirt.go
+index 1f4424375..296dc5992 100644
+--- a/pkg/controller/plan/kubevirt.go
++++ b/pkg/controller/plan/kubevirt.go
+@@ -145,6 +145,7 @@ const (
+ // Resource labels
+ const (
+ 	ResourceVMConfig      = "vm-config"
++	ResourceVMDomainXML   = "vm-domain-xml"
+ 	ResourceVDDKConfig    = "vddk-config"
+ 	ResourceWaitForReboot = "wait-for-reboot"
+ )
+@@ -2073,6 +2074,9 @@ func (r *KubeVirt) ensureVddkConfigMap() (configMap *core.ConfigMap, err error)
+ // (/tmp/input.xml) inside the conversion pod.
+ func (r *KubeVirt) ensureDomainXMLConfigMap(vmRef ref.Ref, domainXML string) (configMap *core.ConfigMap, err error) {
+ 	labels := r.vmLabels(vmRef)
++	// Not vm-config: ensureConfigMap selects the CDI cert ConfigMap by
++	// vmLabels and must never pick up this one.
++	labels[kResource] = ResourceVMDomainXML
+ 	labels[AnnLibvirtDomainXML] = "true"
+ 
+ 	list := &core.ConfigMapList{}
+diff --git a/pkg/controller/provider/container/nutanix/collector.go b/pkg/controller/provider/container/nutanix/collector.go
+index 6748753e2..98c37971a 100644
+--- a/pkg/controller/provider/container/nutanix/collector.go
++++ b/pkg/controller/provider/container/nutanix/collector.go
+@@ -453,8 +453,10 @@ func (r *Collector) storageContainers() (err error) {
+ 
+ 	entities, err := r.client.listStorageContainers()
+ 	if err != nil {
+-		r.log.Error(err, "Storage container collection failed; continuing without storage inventory")
+-		return nil
++		// Fail the pass like the other resources do. Swallowing it marked
++		// the provider ready with no storage inventory, so plans then
++		// reported the VM's disks as unmapped instead of the real cause.
++		return liberr.Wrap(err)
+ 	}
+ 
+ 	tx, err := r.db.Begin()
+diff --git a/pkg/controller/provider/container/nutanix/collector_test.go b/pkg/controller/provider/container/nutanix/collector_test.go
+index ab9117e78..a0389ca55 100644
+--- a/pkg/controller/provider/container/nutanix/collector_test.go
++++ b/pkg/controller/provider/container/nutanix/collector_test.go
+@@ -424,6 +424,26 @@ func TestStorageContainers_DeletesStaleEntries(t *testing.T) {
+ 	}
+ }
+ 
++// TestStorageContainers_ReturnsListError verifies that a failure to list
++// storage containers fails the collection pass instead of leaving the
++// provider ready with no storage inventory.
++func TestStorageContainers_ReturnsListError(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == storageContainersV2Path {
++			w.WriteHeader(http.StatusInternalServerError)
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write([]byte(`{"entities":[]}`))
++	}))
++	defer server.Close()
++
++	collector, _ := newTestCollector(t, server.URL)
++	if err := collector.storageContainers(); err == nil {
++		t.Fatal("Expected an error when listing storage containers fails")
++	}
++}
++
+ // TestStorageContainers_NoChangesWhenSourceUnchanged verifies that a
+ // collection cycle with an unchanged source set does not delete anything.
+ func TestStorageContainers_NoChangesWhenSourceUnchanged(t *testing.T) {

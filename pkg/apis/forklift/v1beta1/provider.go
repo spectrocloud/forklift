@@ -45,6 +45,8 @@ const (
 
 	// HyperV
 	HyperV ProviderType = "hyperv"
+	// Nutanix
+	Nutanix ProviderType = "nutanix"
 )
 
 var ProviderTypes = []ProviderType{
@@ -55,6 +57,7 @@ var ProviderTypes = []ProviderType{
 	Ova,
 	EC2,
 	HyperV,
+	Nutanix,
 }
 
 func (t ProviderType) String() string {
@@ -78,6 +81,15 @@ const (
 	ESXiCloneMethod        = "esxiCloneMethod"
 	TargetAZ               = "target-az"
 	TargetRegion           = "target-region"
+	// Nutanix Prism endpoint settings.
+	NutanixPrismType   = "prismType"
+	NutanixClusterUUID = "clusterUuid"
+)
+
+// Nutanix Prism endpoint types.
+const (
+	NutanixPrismCentral = "central"
+	NutanixPrismElement = "element"
 )
 
 // ESXi clone method values.
@@ -172,7 +184,7 @@ func (p *Provider) Type() ProviderType {
 }
 
 func (p *Provider) SupportsPreserveStaticIps() bool {
-	return p.Type() == VSphere || p.Type() == HyperV
+	return p.Type() == VSphere || p.Type() == HyperV || p.Type() == Nutanix
 }
 
 // This provider is the `host` cluster.

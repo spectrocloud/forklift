@@ -166,6 +166,10 @@ type Builder interface {
 	VirtualMachine(vmRef ref.Ref, object *cnv.VirtualMachineSpec, persistentVolumeClaims []*core.PersistentVolumeClaim, usesInstanceType bool, sortVolumesByLibvirt bool) error
 	// Build DataVolumes.
 	DataVolumes(vmRef ref.Ref, secret *core.Secret, configMap *core.ConfigMap, dvTemplate *cdi.DataVolume, vddkConfigMap *core.ConfigMap) (dvs []cdi.DataVolume, err error)
+	// Adopt ownership of provider-specific HTTP download cookie Secrets on the DataVolume.
+	AdoptDownloadCookieSecretOwner(dv *cdi.DataVolume) error
+	// Refresh short-lived HTTP import credentials on auth failure (e.g. Nutanix PC cookies).
+	RefreshImportCredentials(dv *cdi.DataVolume) (refreshed bool, err error)
 	// Build tasks.
 	Tasks(vmRef ref.Ref) ([]*planapi.Task, error)
 	// Build template labels.
@@ -210,6 +214,8 @@ type Builder interface {
 	// SourceVMLabelsAndAnnotations returns provider-specific labels and annotations
 	// derived from source VM metadata (e.g. vSphere tags and custom attributes).
 	SourceVMLabelsAndAnnotations(vmRef ref.Ref, tagMapping *api.TagMapping) (labels map[string]string, annotations map[string]string, sanitizationReport map[string]string, err error)
+	// DomainXML generates a libvirt domain xml definition for the given vm and pvcs
+	DomainXML(vmRef ref.Ref, pvcs []*core.PersistentVolumeClaim) (string, error)
 }
 
 // Client API.
