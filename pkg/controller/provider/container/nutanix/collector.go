@@ -453,8 +453,10 @@ func (r *Collector) storageContainers() (err error) {
 
 	entities, err := r.client.listStorageContainers()
 	if err != nil {
-		r.log.Error(err, "Storage container collection failed; continuing without storage inventory")
-		return nil
+		// Fail the pass like the other resources do. Swallowing it marked
+		// the provider ready with no storage inventory, so plans then
+		// reported the VM's disks as unmapped instead of the real cause.
+		return liberr.Wrap(err)
 	}
 
 	tx, err := r.db.Begin()
