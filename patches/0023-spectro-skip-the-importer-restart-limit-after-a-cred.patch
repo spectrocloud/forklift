@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 15:07:48 -0800
+Subject: [PATCH] spectro: skip the importer restart limit after a credential
+ refresh
+
+maybeRefreshImportCredentials deletes the importer pod after rotating
+the Prism Central download cookie, but the caller then checked
+restartLimitExceeded on that same, now deleted, pod. If the importer
+had already restarted more than IMPORTER_RETRY times while earlier
+refresh attempts failed or were in their cooldown, the reconcile that
+finally refreshed the cookie also marked the disk copy failed with the
+old 401 message, although the new importer would have recovered.
+
+Have the helper report whether it restarted the importer and skip the
+limit check for that reconcile; the new pod starts with a fresh count.
+
+Resolves: None
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pkg/controller/plan/migration.go      | 10 ++++++++--
+ pkg/controller/plan/migration_test.go |  8 ++++----
+ 2 files changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/pkg/controller/plan/migration.go b/pkg/controller/plan/migration.go
+index d409f0d92..656eba5c2 100644
+--- a/pkg/controller/plan/migration.go
++++ b/pkg/controller/plan/migration.go
+@@ -1954,7 +1954,11 @@ func (r *Migration) updateCopyProgress(vm *plan.VMStatus, step *plan.Step) (err
+ 				if r.Plan.IsWarm() && len(importer.Status.ContainerStatuses) > 0 {
+ 					vm.Warm.Failures = int(importer.Status.ContainerStatuses[0].RestartCount)
+ 				}
+-				r.maybeRefreshImportCredentials(vm, dv.DataVolume, importer)
++				// A restarted importer starts with a fresh restart count; checking
++				// the deleted pod's count would fail the VM just as it recovers.
++				if r.maybeRefreshImportCredentials(vm, dv.DataVolume, importer) {
++					continue
++				}
+ 				if restartLimitExceeded(importer) {
+ 					task.MarkedCompleted()
+ 					msg, _ := terminationMessage(importer)
+@@ -2287,7 +2291,8 @@ func terminationMessage(pod *core.Pod) (msg string, ok bool) {
+ // (e.g. Nutanix Prism Central cookies) when the CDI importer fails with an
+ // auth error, then deletes the importer pod so CDI recreates it with the
+ // updated SecretExtraHeaders Secret mounted — without recreating the DV.
+-func (r *Migration) maybeRefreshImportCredentials(vm *plan.VMStatus, dv *cdi.DataVolume, importer *core.Pod) {
++// It reports whether the importer pod was restarted.
++func (r *Migration) maybeRefreshImportCredentials(vm *plan.VMStatus, dv *cdi.DataVolume, importer *core.Pod) (restarted bool) {
+ 	if !isImportAuthFailure(importer) {
+ 		return
+ 	}
+@@ -2348,6 +2353,7 @@ func (r *Migration) maybeRefreshImportCredentials(vm *plan.VMStatus, dv *cdi.Dat
+ 		"dv.name", dv.Name,
+ 		"dv.namespace", dv.Namespace,
+ 		"vm", vm.String())
++	return true
+ }
+ 
+ func isImportAuthFailure(pod *core.Pod) bool {
+diff --git a/pkg/controller/plan/migration_test.go b/pkg/controller/plan/migration_test.go
+index 9b42f25fa..0a674b5df 100644
+--- a/pkg/controller/plan/migration_test.go
++++ b/pkg/controller/plan/migration_test.go
+@@ -361,7 +361,7 @@ func TestMaybeRefreshImportCredentials(t *testing.T) {
+ 		VM: plan.VM{Ref: ref.Ref{ID: "vm-1", Name: "test-vm"}},
+ 	}
+ 
+-	m.maybeRefreshImportCredentials(vm, dv, importer)
++	g.Expect(m.maybeRefreshImportCredentials(vm, dv, importer)).To(gomega.BeTrue())
+ 
+ 	g.Expect(refresher.calls).To(gomega.Equal(1))
+ 	updated := &cdi.DataVolume{}
+@@ -375,7 +375,7 @@ func TestMaybeRefreshImportCredentials(t *testing.T) {
+ 	importer2 := importer.DeepCopy()
+ 	importer2.ResourceVersion = ""
+ 	g.Expect(client.Create(context.TODO(), importer2)).To(gomega.Succeed())
+-	m.maybeRefreshImportCredentials(vm, updated, importer2)
++	g.Expect(m.maybeRefreshImportCredentials(vm, updated, importer2)).To(gomega.BeFalse())
+ 	g.Expect(refresher.calls).To(gomega.Equal(0))
+ }
+ 
+@@ -407,7 +407,7 @@ func TestMaybeRefreshImportCredentials_NotRefreshed(t *testing.T) {
+ 		VM: plan.VM{Ref: ref.Ref{ID: "vm-1", Name: "test-vm"}},
+ 	}
+ 
+-	m.maybeRefreshImportCredentials(vm, dv, importer)
++	g.Expect(m.maybeRefreshImportCredentials(vm, dv, importer)).To(gomega.BeFalse())
+ 
+ 	g.Expect(refresher.calls).To(gomega.Equal(1))
+ 	updated := &cdi.DataVolume{}
+@@ -460,7 +460,7 @@ func TestMaybeRefreshImportCredentials_NonAuthFailure(t *testing.T) {
+ 		VM: plan.VM{Ref: ref.Ref{ID: "vm-1", Name: "test-vm"}},
+ 	}
+ 
+-	m.maybeRefreshImportCredentials(vm, dv, importer)
++	g.Expect(m.maybeRefreshImportCredentials(vm, dv, importer)).To(gomega.BeFalse())
+ 
+ 	g.Expect(refresher.calls).To(gomega.Equal(0))
+ 	err := client.Get(context.TODO(), types.NamespacedName{Namespace: importer.Namespace, Name: importer.Name}, &core.Pod{})

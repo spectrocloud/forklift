@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shphadnis <134159681+shphadnis@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 14:56:37 -0800
+Subject: [PATCH] spectro: validate Nutanix storage and network mappings
+
+StorageMapped and NetworksMapped were TODO stubs that always returned
+true, so a partially mapped plan validated clean. At migration time an
+unmapped disk failed late in DataVolumes ("no storage mapping for disk
+storage container"), and an unmapped NIC was silently dropped by
+mapNetworks, leaving the VM without that interface.
+
+Check every data disk's storage container and every NIC's subnet against
+the plan's maps. The check uses the map spec, as the builder does; a NIC
+mapped to "ignored" counts as mapped. CD-ROMs are not migrated and are
+skipped.
+
+Resolves: None
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../plan/adapter/nutanix/validator.go         | 51 ++++++++++++++--
+ .../plan/adapter/nutanix/validator_test.go    | 60 +++++++++++++++++++
+ 2 files changed, 105 insertions(+), 6 deletions(-)
+ create mode 100644 pkg/controller/plan/adapter/nutanix/validator_test.go
+
+diff --git a/pkg/controller/plan/adapter/nutanix/validator.go b/pkg/controller/plan/adapter/nutanix/validator.go
+index 161510617..a668532ec 100644
+--- a/pkg/controller/plan/adapter/nutanix/validator.go
++++ b/pkg/controller/plan/adapter/nutanix/validator.go
+@@ -27,18 +27,57 @@ func (r *Validator) MigrationType() bool {
+ 	}
+ }
+ 
+-func (r *Validator) StorageMapped(_ ref.Ref) (bool, error) {
+-	// TODO: validate storage container mappings against VM disks
+-	return true, nil
++func (r *Validator) StorageMapped(vmRef ref.Ref) (bool, error) {
++	if r.Plan.Referenced.Map.Storage == nil {
++		return false, nil
++	}
++	vm := &model.VM{}
++	if err := r.Source.Inventory.Find(vm, vmRef); err != nil {
++		return false, liberr.Wrap(err, "vm", vmRef.String())
++	}
++	return disksMapped(vm, r.Plan.Referenced.Map.Storage), nil
++}
++
++// disksMapped reports whether every data disk's storage container has a
++// storage map entry. It matches on the map's spec, as DataVolumes does.
++func disksMapped(vm *model.VM, storageMap *api.StorageMap) bool {
++	mapped := map[string]bool{}
++	for _, pair := range storageMap.Spec.Map {
++		mapped[pair.Source.ID] = true
++	}
++	for _, disk := range dataDisks(vm) {
++		if !mapped[disk.StorageContainerUUID] {
++			return false
++		}
++	}
++	return true
+ }
+ 
+ func (r *Validator) DirectStorage(_ ref.Ref) (bool, error) {
+ 	return true, nil
+ }
+ 
+-func (r *Validator) NetworksMapped(_ ref.Ref) (bool, error) {
+-	// TODO: validate subnet mappings against VM NICs
+-	return true, nil
++func (r *Validator) NetworksMapped(vmRef ref.Ref) (bool, error) {
++	if r.Plan.Referenced.Map.Network == nil {
++		return false, nil
++	}
++	vm := &model.VM{}
++	if err := r.Source.Inventory.Find(vm, vmRef); err != nil {
++		return false, liberr.Wrap(err, "vm", vmRef.String())
++	}
++	return nicsMapped(vm, r.Plan.Referenced.Map.Network), nil
++}
++
++// nicsMapped reports whether every NIC's subnet has a network map entry,
++// including entries that map it to "ignored". mapNetworks skips NICs
++// without one, so an unmapped NIC would otherwise be dropped silently.
++func nicsMapped(vm *model.VM, networkMap *api.NetworkMap) bool {
++	for _, nic := range vm.NICs {
++		if len(planbase.FindAllMappingsForNICRef(ref.Ref{ID: nic.SubnetUUID}, networkMap)) == 0 {
++			return false
++		}
++	}
++	return true
+ }
+ 
+ func (r *Validator) MaintenanceMode(_ ref.Ref) (bool, error) {
+diff --git a/pkg/controller/plan/adapter/nutanix/validator_test.go b/pkg/controller/plan/adapter/nutanix/validator_test.go
+new file mode 100644
+index 000000000..d1a3d4d04
+--- /dev/null
++++ b/pkg/controller/plan/adapter/nutanix/validator_test.go
+@@ -0,0 +1,60 @@
++package nutanix
++
++import (
++	"testing"
++
++	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
++	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
++	model "github.com/kubev2v/forklift/pkg/controller/provider/web/nutanix"
++)
++
++func storageMapFor(containers ...string) *api.StorageMap {
++	m := &api.StorageMap{}
++	for _, c := range containers {
++		m.Spec.Map = append(m.Spec.Map, api.StoragePair{Source: ref.Ref{ID: c}})
++	}
++	return m
++}
++
++func networkMapFor(pairs ...api.NetworkPair) *api.NetworkMap {
++	m := &api.NetworkMap{}
++	m.Spec.Map = pairs
++	return m
++}
++
++func TestDisksMapped(t *testing.T) {
++	vm := &model.VM{}
++	vm.Disks = []model.Disk{
++		{UUID: "d0", AdapterType: adapterSCSI, StorageContainerUUID: "sc-a"},
++		{UUID: "d1", AdapterType: adapterSCSI, StorageContainerUUID: "sc-b"},
++		// CD-ROMs are not migrated, so their container need not be mapped.
++		{UUID: "cd", IsCdrom: true, StorageContainerUUID: "sc-iso"},
++	}
++
++	if !disksMapped(vm, storageMapFor("sc-a", "sc-b")) {
++		t.Error("expected all disks mapped")
++	}
++	if disksMapped(vm, storageMapFor("sc-a")) {
++		t.Error("expected disk on sc-b to be reported unmapped")
++	}
++}
++
++func TestNICsMapped(t *testing.T) {
++	vm := &model.VM{}
++	vm.NICs = []model.NIC{
++		{MACAddress: "50:6b:8d:00:00:01", SubnetUUID: "subnet-a"},
++		{MACAddress: "50:6b:8d:00:00:02", SubnetUUID: "subnet-b"},
++	}
++	podPair := api.NetworkPair{Source: api.NetworkSourceRef{Ref: ref.Ref{ID: "subnet-a"}}, Destination: api.DestinationNetwork{Type: "pod"}}
++	ignoredPair := api.NetworkPair{Source: api.NetworkSourceRef{Ref: ref.Ref{ID: "subnet-b"}}, Destination: api.DestinationNetwork{Type: "ignored"}}
++
++	if !nicsMapped(vm, networkMapFor(podPair, ignoredPair)) {
++		t.Error("expected all NICs mapped, including one mapped to ignored")
++	}
++	if nicsMapped(vm, networkMapFor(podPair)) {
++		t.Error("expected NIC on subnet-b to be reported unmapped")
++	}
++	if !nicsMapped(&model.VM{}, networkMapFor()) {
++		t.Error("expected a VM without NICs to be mapped")
++	}
++}

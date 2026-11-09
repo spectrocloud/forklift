@@ -2943,6 +2943,14 @@ func (r *Builder) NetAppShiftPVCs(vmRef ref.Ref, labels map[string]string) (pvcs
 	return
 }
 
+func (r *Builder) AdoptDownloadCookieSecretOwner(_ *cdi.DataVolume) error {
+	return nil
+}
+
+func (r *Builder) RefreshImportCredentials(_ *cdi.DataVolume) (bool, error) {
+	return false, nil
+}
+
 // SourceVMLabelsAndAnnotations converts vSphere tags to labels and custom attributes to annotations.
 func (r *Builder) SourceVMLabelsAndAnnotations(vmRef ref.Ref, tagMapping *api.TagMapping) (labels map[string]string, annotations map[string]string, sanitizationReport map[string]string, err error) {
 	vm := &model.VM{}
@@ -3075,4 +3083,8 @@ func sanitizeForK8sMetadata(s string) string {
 		sanitized = strings.TrimRight(sanitized, "_.-")
 	}
 	return sanitized
+}
+
+func (r *Builder) DomainXML(vmRef ref.Ref, pvcs []*core.PersistentVolumeClaim) (string, error) {
+	return "", nil
 }
