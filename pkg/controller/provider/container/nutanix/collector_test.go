@@ -424,6 +424,26 @@ func TestStorageContainers_DeletesStaleEntries(t *testing.T) {
 	}
 }
 
+// TestStorageContainers_ReturnsListError verifies that a failure to list
+// storage containers fails the collection pass instead of leaving the
+// provider ready with no storage inventory.
+func TestStorageContainers_ReturnsListError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == storageContainersV2Path {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"entities":[]}`))
+	}))
+	defer server.Close()
+
+	collector, _ := newTestCollector(t, server.URL)
+	if err := collector.storageContainers(); err == nil {
+		t.Fatal("Expected an error when listing storage containers fails")
+	}
+}
+
 // TestStorageContainers_NoChangesWhenSourceUnchanged verifies that a
 // collection cycle with an unchanged source set does not delete anything.
 func TestStorageContainers_NoChangesWhenSourceUnchanged(t *testing.T) {

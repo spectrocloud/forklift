@@ -145,6 +145,7 @@ const (
 // Resource labels
 const (
 	ResourceVMConfig      = "vm-config"
+	ResourceVMDomainXML   = "vm-domain-xml"
 	ResourceVDDKConfig    = "vddk-config"
 	ResourceWaitForReboot = "wait-for-reboot"
 )
@@ -2073,6 +2074,9 @@ func (r *KubeVirt) ensureVddkConfigMap() (configMap *core.ConfigMap, err error) 
 // (/tmp/input.xml) inside the conversion pod.
 func (r *KubeVirt) ensureDomainXMLConfigMap(vmRef ref.Ref, domainXML string) (configMap *core.ConfigMap, err error) {
 	labels := r.vmLabels(vmRef)
+	// Not vm-config: ensureConfigMap selects the CDI cert ConfigMap by
+	// vmLabels and must never pick up this one.
+	labels[kResource] = ResourceVMDomainXML
 	labels[AnnLibvirtDomainXML] = "true"
 
 	list := &core.ConfigMapList{}
