@@ -5,6 +5,7 @@
   "targetPRLabels": ["ok-to-test"],
   "sourcePRLabels": ["was-backported"],
   "conflictResolution": "commit",
+  "mainline": 1,
   "autoMerge": false,
   "autoMergeMethod": "squash",
   "publishStatusCommentOnFailure": true,
