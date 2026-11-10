@@ -18,6 +18,7 @@ package v1beta1
 
 import (
 	"context"
+	"os"
 
 	k8snet "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
@@ -422,6 +423,10 @@ type PlanStatus struct {
 	// The most recent generation observed by the controller.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// NetAppShiftDestination indicates whether the plan's storage map resolves to a NetApp
+	// Shift/Trident destination StorageClass.
+	// +optional
+	NetAppShiftDestination bool `json:"netAppShiftDestination,omitempty"`
 	// Migration
 	Migration plan.MigrationStatus `json:"migration,omitempty"`
 }
@@ -456,18 +461,37 @@ func (p *Plan) IsWarm() bool {
 // just use virt-v2v directly to convert the vm while copying data over. In other
 // cases, we use CDI to transfer disks to the destination cluster and then use
 // virt-v2v-in-place to convert these disks after cutover.
-func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref, destinationClient k8sclient.Client) (bool, error) {
-	source := p.Referenced.Provider.Source
+//
+// Note: this is called once per VM from several places (adapters, scheduler, migrator,
+// kubevirt.go, migration.go) on every reconcile, so it must not perform any API/client calls itself.
+func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref) (bool, error) {
+	source := p.Provider.Source
 	if source == nil {
 		return false, liberr.New("Cannot analyze plan, source provider is missing.")
 	}
-	destination := p.Referenced.Provider.Destination
+	destination := p.Provider.Destination
 	if destination == nil {
 		return false, liberr.New("Cannot analyze plan, destination provider is missing.")
 	}
 
 	switch source.Type() {
 	case VSphere:
+		// Spectro: when a VDDK image is configured, CDI+VDDK always copies the
+		// disks and virt-v2v only converts in place, so this reports false.
+		// Returning false is what drives, via BasePredicate.Evaluate:
+		//   CDIDiskCopy      -> true  (PhaseCopyDisks runs)
+		//   VirtV2vDiskCopy  -> false (PhaseAllocateDisks + PhaseCopyDisksVirtV2V skipped)
+		// and, via KubeVirt.ResolveConversionType, api.InPlace (V2V_inPlace=1).
+		//
+		// Without a VDDK image, upstream's rules below apply: virt-v2v copies
+		// and converts the disks itself, reading them over HTTPS through
+		// vCenter. That needs Provider.Spec.ConvertDisk=true, which plan
+		// validation enforces.
+		//
+		// OVA/HyperV deliberately keep upstream behaviour below.
+		if vddkImageConfigured(source) {
+			return false, nil
+		}
 		// The virt-v2v transfers all disks attached to the VM. If we want to skip the shared disks so we don't transfer
 		// them multiple times we need to manage the transfer using KubeVirt CDI DataVolumes and v2v-in-place.
 		migrateSharedDisks := p.Spec.MigrateSharedDisks
@@ -483,14 +507,8 @@ func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref, destinationClient k8sclien
 			// virt-v2v copies every attached disk; skip excluded disks via CDI instead.
 			return false, nil
 		}
-		if p.Map.Storage != nil {
-			hasNetAppShift, err := p.Map.Storage.HasNetAppShiftDestination(destinationClient)
-			if err != nil {
-				return false, err
-			}
-			if hasNetAppShift {
-				return false, nil
-			}
+		if p.HasNetAppShiftDestination() {
+			return false, nil
 		}
 		if p.IsUsingOffloadPlugin() {
 			return false, nil
@@ -501,6 +519,17 @@ func (p *Plan) ShouldUseV2vForTransfer(vmRef ref.Ref, destinationClient k8sclien
 	default:
 		return false, nil
 	}
+}
+
+// Spectro: whether a VDDK image is configured for the source provider. Mirrors
+// settings.GetVDDKImage (provider setting, then the controller's VDDK_IMAGE),
+// which this package cannot import because pkg/settings imports it.
+func vddkImageConfigured(source *Provider) bool {
+	return source.Spec.Settings[VDDK] != "" || os.Getenv("VDDK_IMAGE") != ""
+}
+
+func (p *Plan) HasNetAppShiftDestination() bool {
+	return p.Status.NetAppShiftDestination
 }
 
 func (r *Plan) DestinationHasUdnNetwork(client k8sclient.Client) bool {
@@ -558,6 +587,10 @@ func (r *Plan) IsSourceProviderOCP() bool {
 }
 
 func (r *Plan) IsSourceProviderVSphere() bool { return r.Provider.Source.Type() == VSphere }
+
+func (r *Plan) IsSourceProviderOVA() bool {
+	return r.Provider.Source.Type() == Ova
+}
 
 func (r *Plan) ShouldRunPreflightInspection() bool {
 	return r.IsSourceProviderVSphere() &&
