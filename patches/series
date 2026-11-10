@@ -27,3 +27,4 @@
 0023-spectro-skip-the-importer-restart-limit-after-a-cred.patch
 0024-spectro-stop-flagging-DHCP-only-Nutanix-VMs-for-miss.patch
 0025-spectro-fix-Nutanix-re-review-findings-in-ConfigMaps.patch
+0026-spectro-sync-vsphere-copy-offload-populator-vendorin.patch
