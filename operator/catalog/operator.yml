@@ -8,3 +8,4 @@ package: forklift-operator
 name: ${CHANNELS}
 entries:
   - name: forklift-operator.v${VERSION}
+    skipRange: '>=0.0.0 <${VERSION}'
